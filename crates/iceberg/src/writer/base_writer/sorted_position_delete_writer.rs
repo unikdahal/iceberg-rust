@@ -473,4 +473,79 @@ mod test {
 
         Ok(())
     }
+
+    /// End-to-end check that multiple sorted-run files produced by this writer are correctly
+    /// unioned by iceberg-rust's own read path (`CachingDeleteFileLoader`). A low threshold
+    /// forces the same data file's deletes to be split across three separate delete files,
+    /// each fed with unsorted rows; the reader must still recover every position.
+    #[tokio::test]
+    async fn test_sorted_position_delete_writer_output_round_trips_through_reader() -> Result<()> {
+        use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+        use crate::runtime::Runtime;
+        use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
+        use crate::spec::Schema;
+
+        let (temp_dir, file_io, rolling_writer_builder) = setup("test_sorted_pos_delete_roundtrip");
+        let config = SortedPositionDeleteWriterConfig::new(2)?;
+        let mut writer = SortedPositionDeleteWriterBuilder::new(rolling_writer_builder, config)
+            .build(None)
+            .await?;
+
+        let data_file_path = format!("{}/data-1.parquet", temp_dir.path().to_str().unwrap());
+        // Threshold of 2: each of these two writes flushes immediately as its own sorted
+        // run; the third row stays buffered until close() flushes a third file.
+        writer
+            .write(position_delete_batch(
+                vec![&data_file_path, &data_file_path],
+                vec![5, 2],
+            ))
+            .await?;
+        writer
+            .write(position_delete_batch(
+                vec![&data_file_path, &data_file_path],
+                vec![9, 1],
+            ))
+            .await?;
+        writer
+            .write(position_delete_batch(vec![&data_file_path], vec![7]))
+            .await?;
+        let data_files = writer.close().await?;
+        assert_eq!(data_files.len(), 3, "expected three separate sorted runs");
+
+        let delete_tasks = data_files
+            .iter()
+            .map(|f| {
+                FileScanTaskDeleteFile::builder()
+                    .with_file_path(f.file_path().to_string())
+                    .with_file_size_in_bytes(f.file_size_in_bytes())
+                    .with_file_type(DataContentType::PositionDeletes)
+                    .with_partition_spec_id(0)
+                    .build()
+            })
+            .collect::<Vec<_>>();
+
+        let scan_task = FileScanTask::builder()
+            .with_file_size_in_bytes(0)
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(data_file_path)
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(Arc::new(Schema::builder().build()?))
+            .with_project_field_ids(vec![])
+            .with_deletes(delete_tasks)
+            .with_case_sensitive(false)
+            .build();
+
+        let delete_file_loader = CachingDeleteFileLoader::new(file_io, 10, Runtime::current());
+        let delete_filter = delete_file_loader
+            .load_deletes(&scan_task.deletes, scan_task.schema_ref())
+            .await
+            .unwrap()?;
+        let delete_vector = delete_filter.get_delete_vector(&scan_task).unwrap();
+        let mut positions: Vec<u64> = delete_vector.lock().unwrap().iter().collect();
+        positions.sort_unstable();
+        assert_eq!(positions, vec![1, 2, 5, 7, 9]);
+
+        Ok(())
+    }
 }
