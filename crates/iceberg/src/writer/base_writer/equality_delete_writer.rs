@@ -61,7 +61,7 @@ where
 }
 
 /// Config for `EqualityDeleteWriter`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EqualityDeleteWriterConfig {
     // Field ids used to determine row equality in equality delete files.
     equality_ids: Vec<i32>,
@@ -151,6 +151,19 @@ impl EqualityDeleteWriterConfig {
     /// Return projected Schema
     pub fn projected_arrow_schema_ref(&self) -> &ArrowSchemaRef {
         self.projector.projected_schema_ref()
+    }
+
+    /// Return the equality delete field ids.
+    pub fn equality_ids(&self) -> &[i32] {
+        &self.equality_ids
+    }
+
+    /// Project a batch shaped like the original table schema down to just the equality
+    /// delete identifier columns. Exposed crate-internally so callers that need the
+    /// identifier values directly (e.g. `DeltaWriter`'s insert index) don't have to
+    /// duplicate the identifier-field projection rules.
+    pub(crate) fn project_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        self.projector.project_batch(batch)
     }
 }
 
