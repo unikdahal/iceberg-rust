@@ -195,10 +195,6 @@ impl PopulatedDeleteFileIndex {
                 .for_each(|delete| results.push(delete.as_ref().into()));
         }
 
-        // TODO: the spec states that:
-        //     "The data file's file_path is equal to the delete file's referenced_data_file if it is non-null".
-        //     we're not yet doing that here. The referenced data file's name will also be present in the positional
-        //     delete file's file path column.
         if let Some(deletes) = self.pos_deletes_by_partition.get(data_file.partition()) {
             deletes
                 .iter()
@@ -208,6 +204,14 @@ impl PopulatedDeleteFileIndex {
                         .map(|seq_num| delete.manifest_entry.sequence_number() >= Some(seq_num))
                         .unwrap_or_else(|| true)
                         && data_file.partition_spec_id == delete.partition_spec_id
+                        // Per spec: "The data file's file_path is equal to the delete file's
+                        // referenced_data_file if it is non-null". A null referenced_data_file
+                        // means the delete file may apply to any data file in the partition.
+                        && delete
+                            .manifest_entry
+                            .data_file()
+                            .referenced_data_file()
+                            .is_none_or(|referenced| referenced == data_file.file_path())
                 })
                 .for_each(|delete| results.push(delete.as_ref().into()));
         }
@@ -416,6 +420,47 @@ mod tests {
         assert!(actual_paths_to_apply_for_different_spec.is_empty());
     }
 
+    #[test]
+    fn test_delete_file_index_partitioned_respects_referenced_data_file() {
+        let partition = Struct::from_iter([Some(Literal::long(100))]);
+        let spec_id = 1;
+
+        let data_file_a = build_partitioned_data_file(&partition, spec_id);
+        let data_file_b = build_partitioned_data_file(&partition, spec_id);
+
+        let deletes: Vec<ManifestEntry> = vec![
+            // Only applies to data_file_a, per its referenced_data_file
+            build_added_manifest_entry(
+                4,
+                &build_partitioned_pos_delete_referencing(
+                    &partition,
+                    spec_id,
+                    Some(data_file_a.file_path().to_string()),
+                ),
+            ),
+            // No referenced_data_file set: applies to any data file in the partition
+            build_added_manifest_entry(4, &build_partitioned_pos_delete(&partition, spec_id)),
+        ];
+
+        let delete_contexts: Vec<DeleteFileContext> = deletes
+            .into_iter()
+            .map(|entry| DeleteFileContext {
+                manifest_entry: entry.into(),
+                partition_spec_id: spec_id,
+            })
+            .collect();
+
+        let delete_file_index = PopulatedDeleteFileIndex::new(delete_contexts);
+
+        // data_file_a matches both the file-scoped delete and the partition-wide one
+        let deletes_for_a = delete_file_index.get_deletes_for_data_file(&data_file_a, Some(0));
+        assert_eq!(deletes_for_a.len(), 2);
+
+        // data_file_b only matches the partition-wide delete, not the one scoped to data_file_a
+        let deletes_for_b = delete_file_index.get_deletes_for_data_file(&data_file_b, Some(0));
+        assert_eq!(deletes_for_b.len(), 1);
+    }
+
     fn build_unpartitioned_eq_delete() -> DataFile {
         build_partitioned_eq_delete(&Struct::empty(), 0)
     }
@@ -439,12 +484,20 @@ mod tests {
     }
 
     fn build_partitioned_pos_delete(partition: &Struct, spec_id: i32) -> DataFile {
+        build_partitioned_pos_delete_referencing(partition, spec_id, None)
+    }
+
+    fn build_partitioned_pos_delete_referencing(
+        partition: &Struct,
+        spec_id: i32,
+        referenced_data_file: Option<String>,
+    ) -> DataFile {
         DataFileBuilder::default()
             .file_path(format!("{}-pos-delete.parquet", Uuid::new_v4()))
             .file_format(DataFileFormat::Parquet)
             .content(DataContentType::PositionDeletes)
             .record_count(1)
-            .referenced_data_file(Some("/some-data-file.parquet".to_string()))
+            .referenced_data_file(referenced_data_file)
             .partition(partition.clone())
             .partition_spec_id(spec_id)
             .file_size_in_bytes(100)
