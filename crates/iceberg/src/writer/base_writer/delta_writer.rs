@@ -492,4 +492,117 @@ mod test {
 
         Ok(())
     }
+
+    /// End-to-end check that an insert-then-delete pair resolved to a position delete is
+    /// correctly interpreted by iceberg-rust's own read path: the reader must mark exactly
+    /// the inserted row's position as deleted on the file DeltaWriter actually wrote it to.
+    #[tokio::test]
+    async fn test_delta_writer_position_delete_output_round_trips_through_reader() -> Result<()> {
+        use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+        use crate::runtime::Runtime;
+        use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
+
+        let (_temp_dir, file_io, schema, builder) = setup("test_delta_writer_pos_delete_roundtrip");
+        let mut writer = builder.build(None).await?;
+
+        writer.insert(row_batch(&schema, 1, "a")).await?;
+        writer.delete(row_batch(&schema, 1, "a")).await?;
+        let data_files = writer.close().await?;
+
+        let data_file = data_files
+            .iter()
+            .find(|f| f.content_type() == DataContentType::Data)
+            .unwrap();
+        let pos_delete_file = data_files
+            .iter()
+            .find(|f| f.content_type() == DataContentType::PositionDeletes)
+            .unwrap();
+
+        let delete_task = FileScanTaskDeleteFile::builder()
+            .with_file_path(pos_delete_file.file_path().to_string())
+            .with_file_size_in_bytes(pos_delete_file.file_size_in_bytes())
+            .with_file_type(DataContentType::PositionDeletes)
+            .with_partition_spec_id(0)
+            .build();
+
+        let scan_task = FileScanTask::builder()
+            .with_file_size_in_bytes(data_file.file_size_in_bytes())
+            .with_start(0)
+            .with_length(data_file.file_size_in_bytes())
+            .with_data_file_path(data_file.file_path().to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema.clone())
+            .with_project_field_ids(vec![])
+            .with_deletes(vec![delete_task])
+            .with_case_sensitive(false)
+            .build();
+
+        let delete_file_loader = CachingDeleteFileLoader::new(file_io, 10, Runtime::current());
+        let delete_filter = delete_file_loader
+            .load_deletes(&scan_task.deletes, scan_task.schema_ref())
+            .await
+            .unwrap()?;
+        let delete_vector = delete_filter.get_delete_vector(&scan_task).unwrap();
+        let positions: Vec<u64> = delete_vector.lock().unwrap().iter().collect();
+        assert_eq!(positions, vec![0]);
+
+        Ok(())
+    }
+
+    /// End-to-end check that a delete with no matching in-task insert, which DeltaWriter falls
+    /// back to writing as an equality delete, is correctly parsed back into an equivalent
+    /// exclusion predicate by iceberg-rust's own read path.
+    #[tokio::test]
+    async fn test_delta_writer_equality_delete_output_round_trips_through_reader() -> Result<()> {
+        use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+        use crate::runtime::Runtime;
+        use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
+
+        let (_temp_dir, file_io, schema, builder) = setup("test_delta_writer_eq_delete_roundtrip");
+        let mut writer = builder.build(None).await?;
+
+        writer.delete(row_batch(&schema, 5, "z")).await?;
+        let data_files = writer.close().await?;
+        assert_eq!(data_files.len(), 1);
+        let eq_delete_file = &data_files[0];
+        assert_eq!(
+            eq_delete_file.content_type(),
+            DataContentType::EqualityDeletes
+        );
+
+        let delete_task = FileScanTaskDeleteFile::builder()
+            .with_file_path(eq_delete_file.file_path().to_string())
+            .with_file_size_in_bytes(eq_delete_file.file_size_in_bytes())
+            .with_file_type(DataContentType::EqualityDeletes)
+            .with_partition_spec_id(0)
+            .with_equality_ids(Some(vec![1]))
+            .build();
+
+        // The referenced data file need not exist: with only an equality delete attached, the
+        // reader resolves a predicate without ever opening the data file itself.
+        let scan_task = FileScanTask::builder()
+            .with_file_size_in_bytes(0)
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path("unread.parquet".to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema)
+            .with_project_field_ids(vec![])
+            .with_deletes(vec![delete_task])
+            .with_case_sensitive(false)
+            .build();
+
+        let delete_file_loader = CachingDeleteFileLoader::new(file_io, 10, Runtime::current());
+        let delete_filter = delete_file_loader
+            .load_deletes(&scan_task.deletes, scan_task.schema_ref())
+            .await
+            .unwrap()?;
+        let predicate = delete_filter
+            .get_equality_delete_predicate_for_delete_file_path(eq_delete_file.file_path())
+            .await
+            .expect("equality delete predicate should have loaded");
+        assert_eq!(predicate.to_string(), "(id IS NULL) OR (id != 5)");
+
+        Ok(())
+    }
 }
