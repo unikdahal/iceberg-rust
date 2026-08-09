@@ -43,10 +43,15 @@ enum DeleteFileIndexState {
 struct PopulatedDeleteFileIndex {
     global_equality_deletes: Vec<Arc<DeleteFileContext>>,
     eq_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>>,
+    /// Position deletes whose manifest entry does not set `referenced_data_file`. These apply
+    /// to any data file in the same partition (and same partition spec id).
     pos_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>>,
-    // TODO: do we need this?
-    // pos_deletes_by_path: HashMap<String, Vec<Arc<DeleteFileContext>>>,
-
+    /// Position deletes (and deletion vectors, which always set this field) whose manifest
+    /// entry sets a non-null `referenced_data_file`. Per spec, such a delete file applies only
+    /// to the data file at that exact path. It's indexed by path rather than by partition so
+    /// that the match is independent of the delete file's own partition / partition spec id
+    /// (e.g. it still applies correctly across partition spec evolution).
+    pos_deletes_by_path: HashMap<String, Vec<Arc<DeleteFileContext>>>,
     // TODO: Deletion Vector support
 }
 
@@ -119,12 +124,17 @@ impl PopulatedDeleteFileIndex {
     ///
     /// 1. The partition information is extracted from each delete file's manifest entry.
     /// 2. If the partition is empty and the delete file is not a positional delete,
-    ///    it is added to the `global_equality_deletes` vector
-    /// 3. Otherwise, the delete file is added to one of two hash maps based on its content type.
+    ///    it is added to the `global_equality_deletes` vector.
+    /// 3. If the delete file is a position delete with a non-null `referenced_data_file`, it is
+    ///    added to `pos_deletes_by_path`, keyed by that path.
+    /// 4. Otherwise, the delete file is added to one of two hash maps (`eq_deletes_by_partition`
+    ///    or `pos_deletes_by_partition`), keyed by partition, based on its content type.
     fn new(files: Vec<DeleteFileContext>) -> PopulatedDeleteFileIndex {
         let mut eq_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>> =
             HashMap::default();
         let mut pos_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>> =
+            HashMap::default();
+        let mut pos_deletes_by_path: HashMap<String, Vec<Arc<DeleteFileContext>>> =
             HashMap::default();
 
         let mut global_equality_deletes: Vec<Arc<DeleteFileContext>> = vec![];
@@ -132,18 +142,33 @@ impl PopulatedDeleteFileIndex {
         files.into_iter().for_each(|ctx| {
             let arc_ctx = Arc::new(ctx);
 
-            let partition = arc_ctx.manifest_entry.data_file().partition();
+            let data_file = arc_ctx.manifest_entry.data_file();
+            let partition = data_file.partition();
+            let content_type = arc_ctx.manifest_entry.content_type();
 
             // The spec states that "Equality delete files stored with an unpartitioned spec are applied as global deletes".
             if partition.fields().is_empty() {
                 // TODO: confirm we're good to skip here if we encounter a pos del
-                if arc_ctx.manifest_entry.content_type() != DataContentType::PositionDeletes {
+                if content_type != DataContentType::PositionDeletes {
                     global_equality_deletes.push(arc_ctx);
                     return;
                 }
             }
 
-            let destination_map = match arc_ctx.manifest_entry.content_type() {
+            // Per spec: "The data file's file_path is equal to the delete file's
+            // referenced_data_file if it is non-null". Such a delete applies only to that one
+            // data file regardless of partition, so index it by path instead of by partition.
+            if content_type == DataContentType::PositionDeletes
+                && let Some(referenced_data_file) = data_file.referenced_data_file()
+            {
+                pos_deletes_by_path
+                    .entry(referenced_data_file)
+                    .or_default()
+                    .push(arc_ctx);
+                return;
+            }
+
+            let destination_map = match content_type {
                 DataContentType::PositionDeletes => &mut pos_deletes_by_partition,
                 DataContentType::EqualityDeletes => &mut eq_deletes_by_partition,
                 _ => unreachable!(),
@@ -151,16 +176,15 @@ impl PopulatedDeleteFileIndex {
 
             destination_map
                 .entry(partition.clone())
-                .and_modify(|entry| {
-                    entry.push(arc_ctx.clone());
-                })
-                .or_insert(vec![arc_ctx.clone()]);
+                .or_default()
+                .push(arc_ctx);
         });
 
         PopulatedDeleteFileIndex {
             global_equality_deletes,
             eq_deletes_by_partition,
             pos_deletes_by_partition,
+            pos_deletes_by_path,
         }
     }
 
@@ -195,6 +219,8 @@ impl PopulatedDeleteFileIndex {
                 .for_each(|delete| results.push(delete.as_ref().into()));
         }
 
+        // Position deletes with no referenced_data_file: these apply to any data file in the
+        // same partition (and partition spec).
         if let Some(deletes) = self.pos_deletes_by_partition.get(data_file.partition()) {
             deletes
                 .iter()
@@ -204,14 +230,22 @@ impl PopulatedDeleteFileIndex {
                         .map(|seq_num| delete.manifest_entry.sequence_number() >= Some(seq_num))
                         .unwrap_or_else(|| true)
                         && data_file.partition_spec_id == delete.partition_spec_id
-                        // Per spec: "The data file's file_path is equal to the delete file's
-                        // referenced_data_file if it is non-null". A null referenced_data_file
-                        // means the delete file may apply to any data file in the partition.
-                        && delete
-                            .manifest_entry
-                            .data_file()
-                            .referenced_data_file()
-                            .is_none_or(|referenced| referenced == data_file.file_path())
+                })
+                .for_each(|delete| results.push(delete.as_ref().into()));
+        }
+
+        // Position deletes (and deletion vectors) scoped to this exact data file via
+        // referenced_data_file. Per spec: "The data file's file_path is equal to the delete
+        // file's referenced_data_file if it is non-null". These are matched purely by path, so
+        // they apply regardless of the delete file's own partition / partition spec id.
+        if let Some(deletes) = self.pos_deletes_by_path.get(data_file.file_path()) {
+            deletes
+                .iter()
+                // filter that returns true if the provided delete file's sequence number is **greater than or equal to** `seq_num`
+                .filter(|&delete| {
+                    seq_num
+                        .map(|seq_num| delete.manifest_entry.sequence_number() >= Some(seq_num))
+                        .unwrap_or_else(|| true)
                 })
                 .for_each(|delete| results.push(delete.as_ref().into()));
         }
@@ -428,19 +462,23 @@ mod tests {
         let data_file_a = build_partitioned_data_file(&partition, spec_id);
         let data_file_b = build_partitioned_data_file(&partition, spec_id);
 
-        let deletes: Vec<ManifestEntry> = vec![
-            // Only applies to data_file_a, per its referenced_data_file
-            build_added_manifest_entry(
-                4,
-                &build_partitioned_pos_delete_referencing(
-                    &partition,
-                    spec_id,
-                    Some(data_file_a.file_path().to_string()),
-                ),
+        // Only applies to data_file_a, per its referenced_data_file
+        let scoped_delete = build_added_manifest_entry(
+            4,
+            &build_partitioned_pos_delete_referencing(
+                &partition,
+                spec_id,
+                Some(data_file_a.file_path().to_string()),
             ),
-            // No referenced_data_file set: applies to any data file in the partition
-            build_added_manifest_entry(4, &build_partitioned_pos_delete(&partition, spec_id)),
-        ];
+        );
+        let scoped_delete_path = scoped_delete.file_path().to_string();
+
+        // No referenced_data_file set: applies to any data file in the partition
+        let wildcard_delete =
+            build_added_manifest_entry(4, &build_partitioned_pos_delete(&partition, spec_id));
+        let wildcard_delete_path = wildcard_delete.file_path().to_string();
+
+        let deletes: Vec<ManifestEntry> = vec![scoped_delete, wildcard_delete];
 
         let delete_contexts: Vec<DeleteFileContext> = deletes
             .into_iter()
@@ -453,12 +491,143 @@ mod tests {
         let delete_file_index = PopulatedDeleteFileIndex::new(delete_contexts);
 
         // data_file_a matches both the file-scoped delete and the partition-wide one
-        let deletes_for_a = delete_file_index.get_deletes_for_data_file(&data_file_a, Some(0));
-        assert_eq!(deletes_for_a.len(), 2);
+        let mut paths_for_a = delete_paths(&delete_file_index, &data_file_a, Some(0));
+        paths_for_a.sort();
+        let mut expected_for_a = vec![scoped_delete_path, wildcard_delete_path.clone()];
+        expected_for_a.sort();
+        assert_eq!(paths_for_a, expected_for_a);
 
         // data_file_b only matches the partition-wide delete, not the one scoped to data_file_a
-        let deletes_for_b = delete_file_index.get_deletes_for_data_file(&data_file_b, Some(0));
-        assert_eq!(deletes_for_b.len(), 1);
+        let paths_for_b = delete_paths(&delete_file_index, &data_file_b, Some(0));
+        assert_eq!(paths_for_b, vec![wildcard_delete_path]);
+    }
+
+    #[test]
+    fn test_delete_file_index_referenced_data_file_match_ignores_partition_mismatch() {
+        // Per spec, a referenced_data_file match identifies the target data file on its own;
+        // it must apply even if the delete file's own manifest entry records a different
+        // partition / partition spec id than the data file (e.g. as can happen across
+        // partition spec evolution). Matching by path must not be additionally gated by
+        // partition equality.
+        let data_file_partition = Struct::from_iter([Some(Literal::long(100))]);
+        let data_file_spec_id = 2;
+        let data_file = build_partitioned_data_file(&data_file_partition, data_file_spec_id);
+
+        let delete_partition = Struct::from_iter([Some(Literal::long(200))]);
+        let delete_spec_id = 1;
+        let scoped_delete = build_added_manifest_entry(
+            4,
+            &build_partitioned_pos_delete_referencing(
+                &delete_partition,
+                delete_spec_id,
+                Some(data_file.file_path().to_string()),
+            ),
+        );
+        let scoped_delete_path = scoped_delete.file_path().to_string();
+
+        let delete_contexts: Vec<DeleteFileContext> = vec![DeleteFileContext {
+            manifest_entry: scoped_delete.into(),
+            partition_spec_id: delete_spec_id,
+        }];
+
+        let delete_file_index = PopulatedDeleteFileIndex::new(delete_contexts);
+
+        let paths = delete_paths(&delete_file_index, &data_file, Some(0));
+        assert_eq!(paths, vec![scoped_delete_path]);
+    }
+
+    #[test]
+    fn test_delete_file_index_unpartitioned_respects_referenced_data_file() {
+        let data_file_a = build_unpartitioned_data_file();
+        let data_file_b = build_unpartitioned_data_file();
+
+        let scoped_delete = build_added_manifest_entry(
+            4,
+            &build_partitioned_pos_delete_referencing(
+                &Struct::empty(),
+                0,
+                Some(data_file_a.file_path().to_string()),
+            ),
+        );
+        let scoped_delete_path = scoped_delete.file_path().to_string();
+
+        let wildcard_delete =
+            build_added_manifest_entry(4, &build_partitioned_pos_delete(&Struct::empty(), 0));
+        let wildcard_delete_path = wildcard_delete.file_path().to_string();
+
+        let deletes = vec![scoped_delete, wildcard_delete];
+        let delete_contexts: Vec<DeleteFileContext> = deletes
+            .into_iter()
+            .map(|entry| DeleteFileContext {
+                manifest_entry: entry.into(),
+                partition_spec_id: 0,
+            })
+            .collect();
+
+        let delete_file_index = PopulatedDeleteFileIndex::new(delete_contexts);
+
+        let mut paths_for_a = delete_paths(&delete_file_index, &data_file_a, Some(0));
+        paths_for_a.sort();
+        let mut expected_for_a = vec![scoped_delete_path, wildcard_delete_path.clone()];
+        expected_for_a.sort();
+        assert_eq!(paths_for_a, expected_for_a);
+
+        let paths_for_b = delete_paths(&delete_file_index, &data_file_b, Some(0));
+        assert_eq!(paths_for_b, vec![wildcard_delete_path]);
+    }
+
+    #[test]
+    fn test_delete_file_index_referenced_data_file_respects_sequence_number() {
+        // A path-scoped delete must still honor the position-delete sequence number rule: the
+        // delete's data sequence number must be >= the data file's.
+        let partition = Struct::from_iter([Some(Literal::long(100))]);
+        let spec_id = 1;
+        let data_file = build_partitioned_data_file(&partition, spec_id);
+
+        let scoped_delete = build_added_manifest_entry(
+            4,
+            &build_partitioned_pos_delete_referencing(
+                &partition,
+                spec_id,
+                Some(data_file.file_path().to_string()),
+            ),
+        );
+
+        let delete_contexts: Vec<DeleteFileContext> = vec![DeleteFileContext {
+            manifest_entry: scoped_delete.into(),
+            partition_spec_id: spec_id,
+        }];
+
+        let delete_file_index = PopulatedDeleteFileIndex::new(delete_contexts);
+
+        // The data file's own sequence number (5) is greater than the delete's (4), so the
+        // delete predates the data file and must not be applied.
+        assert!(
+            delete_file_index
+                .get_deletes_for_data_file(&data_file, Some(5))
+                .is_empty()
+        );
+
+        // The delete's sequence number (4) is >= the data file's (4), so it must apply.
+        assert_eq!(
+            delete_file_index
+                .get_deletes_for_data_file(&data_file, Some(4))
+                .len(),
+            1
+        );
+    }
+
+    /// Helper used by tests to collect the file paths of the deletes that apply to a data file.
+    fn delete_paths(
+        index: &PopulatedDeleteFileIndex,
+        data_file: &DataFile,
+        seq_num: Option<i64>,
+    ) -> Vec<String> {
+        index
+            .get_deletes_for_data_file(data_file, seq_num)
+            .into_iter()
+            .map(|file| file.file_path)
+            .collect()
     }
 
     fn build_unpartitioned_eq_delete() -> DataFile {
