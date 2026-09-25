@@ -641,6 +641,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_position_delete_index_loader_accepts_empty_valid_file() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("empty-pos-delete.parquet");
+        let path = path.to_str().unwrap();
+        let batch = position_delete_batch(Vec::new(), Vec::new());
+        write_plain_parquet(path, &batch);
+
+        let task = position_delete_task(path, Some(0), Some("data.parquet"));
+        let index = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
+            .load_file_scoped_positions(&task, "data.parquet")
+            .await
+            .unwrap();
+
+        assert!(index.is_empty());
+        assert_eq!(index.iter().count(), 0);
+    }
+
+    #[tokio::test]
     async fn test_position_delete_index_loader_validates_empty_file_schema() {
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().join("empty-pos-delete-bad-id.parquet");
