@@ -17,8 +17,11 @@
 
 use std::sync::Arc;
 
+use arrow_array::{Array, Int64Array, StringArray};
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
+use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use roaring::RoaringTreemap;
 
 use crate::arrow::ArrowReader;
 use crate::arrow::reader::ParquetReadOptions;
@@ -26,7 +29,7 @@ use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::ScanMetrics;
 use crate::io::FileIO;
 use crate::scan::{ArrowRecordBatchStream, FileScanTaskDeleteFile};
-use crate::spec::{Schema, SchemaRef};
+use crate::spec::{DataContentType, DataFileFormat, Schema, SchemaRef};
 use crate::{Error, ErrorKind, Result};
 
 /// Delete File Loader
@@ -138,6 +141,148 @@ impl DeleteFileLoader for BasicDeleteFileLoader {
         };
 
         Self::evolve_schema(raw_batch_stream, schema, &field_ids).await
+    }
+}
+
+/// Loads the positions from a single file-scoped V2 position-delete file.
+///
+/// This uses the same Parquet opening and encryption path as Iceberg scans. The caller supplies
+/// the target data file because FILE-granularity rewrite metadata asserts that every record in
+/// the delete file applies to that one path; a mismatching row is treated as corrupt input.
+#[derive(Clone, Debug)]
+pub struct PositionDeleteIndexLoader {
+    basic_loader: BasicDeleteFileLoader,
+}
+
+impl PositionDeleteIndexLoader {
+    /// Creates a loader for the given Iceberg `FileIO`.
+    pub fn new(file_io: FileIO) -> Self {
+        Self {
+            basic_loader: BasicDeleteFileLoader::new(file_io, ScanMetrics::new()),
+        }
+    }
+
+    /// Reads and validates all positions in `delete_file` for exactly `expected_data_file`.
+    pub async fn load_file_scoped_positions(
+        &self,
+        delete_file: &FileScanTaskDeleteFile,
+        expected_data_file: &str,
+    ) -> Result<RoaringTreemap> {
+        if delete_file.file_type != DataContentType::PositionDeletes
+            || delete_file.file_format != DataFileFormat::Parquet
+            || delete_file.equality_ids.is_some()
+        {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!(
+                    "Expected a V2 Parquet position-delete file, got {:?}/{:?} at {}",
+                    delete_file.file_type, delete_file.file_format, delete_file.file_path
+                ),
+            ));
+        }
+
+        let mut batches = self
+            .basic_loader
+            .parquet_to_batch_stream(
+                &delete_file.file_path,
+                delete_file.file_size_in_bytes,
+                delete_file.key_metadata.as_deref(),
+            )
+            .await?;
+        let mut positions = RoaringTreemap::new();
+        while let Some(batch) = batches.try_next().await? {
+            let schema = batch.schema();
+            let path_index = schema
+                .fields()
+                .iter()
+                .position(|field| {
+                    field.name() == "file_path"
+                        && field.metadata().get(PARQUET_FIELD_ID_META_KEY).is_some_and(|id| {
+                            id.parse::<i32>().ok()
+                                == Some(crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH)
+                        })
+                })
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Position-delete file {} has no `file_path` column with the Iceberg reserved field id",
+                            delete_file.file_path
+                        ),
+                    )
+                })?;
+            let position_index = schema
+                .fields()
+                .iter()
+                .position(|field| {
+                    field.name() == "pos"
+                        && field.metadata().get(PARQUET_FIELD_ID_META_KEY).is_some_and(|id| {
+                            id.parse::<i32>().ok()
+                                == Some(crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_POS)
+                        })
+                })
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Position-delete file {} has no `pos` column with the Iceberg reserved field id",
+                            delete_file.file_path
+                        ),
+                    )
+                })?;
+            let paths = batch
+                .column(path_index)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Position-delete file_path column must be Utf8",
+                    )
+                })?;
+            let row_positions = batch
+                .column(position_index)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Position-delete pos column must be Int64",
+                    )
+                })?;
+            if paths.null_count() != 0 || row_positions.null_count() != 0 {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Position-delete file {} contains nulls", delete_file.file_path),
+                ));
+            }
+
+            for row in 0..batch.num_rows() {
+                let data_file = paths.value(row);
+                if data_file != expected_data_file {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "File-scoped position-delete file {} contains target {data_file}, expected {expected_data_file}",
+                            delete_file.file_path
+                        ),
+                    ));
+                }
+                let position = row_positions.value(row);
+                if position < 0 {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Position-delete file {} contains a negative row position {position}",
+                            delete_file.file_path
+                        ),
+                    ));
+                }
+                positions.insert(position as u64);
+            }
+        }
+
+        Ok(positions)
     }
 }
 
