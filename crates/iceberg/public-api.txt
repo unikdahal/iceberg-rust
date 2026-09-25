@@ -5,10 +5,7 @@ pub trait iceberg::arrow::delete_file_loader::DeleteFileLoader
 pub fn iceberg::arrow::delete_file_loader::DeleteFileLoader::read_delete_file<'life0, 'life1, 'async_trait>(&'life0 self, task: &'life1 iceberg::scan::FileScanTaskDeleteFile, schema: iceberg::spec::SchemaRef) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = iceberg::Result<iceberg::scan::ArrowRecordBatchStream>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub struct iceberg::arrow::delete_file_loader::PositionDeleteIndex
 impl iceberg::arrow::delete_file_loader::PositionDeleteIndex
-pub fn iceberg::arrow::delete_file_loader::PositionDeleteIndex::contains(&self, position: u64) -> bool
-pub fn iceberg::arrow::delete_file_loader::PositionDeleteIndex::is_empty(&self) -> bool
 pub fn iceberg::arrow::delete_file_loader::PositionDeleteIndex::iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = u64> + '_
-pub fn iceberg::arrow::delete_file_loader::PositionDeleteIndex::len(&self) -> u64
 impl core::fmt::Debug for iceberg::arrow::delete_file_loader::PositionDeleteIndex
 pub fn iceberg::arrow::delete_file_loader::PositionDeleteIndex::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg::arrow::delete_file_loader::PositionDeleteIndexLoader
@@ -3385,7 +3382,6 @@ pub fn iceberg::writer::base_writer::sorting_position_only_delete_writer::Sortin
 pub struct iceberg::writer::base_writer::sorting_position_only_delete_writer::SortingPositionOnlyDeleteWriterBuilder<B: iceberg::writer::file_writer::FileWriterBuilder, L: iceberg::writer::file_writer::location_generator::LocationGenerator, F: iceberg::writer::file_writer::location_generator::FileNameGenerator>
 impl<B, L, F> iceberg::writer::base_writer::sorting_position_only_delete_writer::SortingPositionOnlyDeleteWriterBuilder<B, L, F> where B: iceberg::writer::file_writer::FileWriterBuilder, L: iceberg::writer::file_writer::location_generator::LocationGenerator, F: iceberg::writer::file_writer::location_generator::FileNameGenerator
 pub fn iceberg::writer::base_writer::sorting_position_only_delete_writer::SortingPositionOnlyDeleteWriterBuilder<B, L, F>::new(inner: iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder<B, L, F>) -> Self
-pub fn iceberg::writer::base_writer::sorting_position_only_delete_writer::SortingPositionOnlyDeleteWriterBuilder<B, L, F>::with_flush_rows(self, flush_rows: usize) -> Self
 impl<B: core::fmt::Debug + iceberg::writer::file_writer::FileWriterBuilder, L: core::fmt::Debug + iceberg::writer::file_writer::location_generator::LocationGenerator, F: core::fmt::Debug + iceberg::writer::file_writer::location_generator::FileNameGenerator> core::fmt::Debug for iceberg::writer::base_writer::position_delete_writer::PositionDeleteFileWriterBuilder<B, L, F>
 pub fn iceberg::writer::base_writer::position_delete_writer::PositionDeleteFileWriterBuilder<B, L, F>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub fn iceberg::writer::base_writer::position_delete_writer::position_delete_schema() -> iceberg::spec::SchemaRef
