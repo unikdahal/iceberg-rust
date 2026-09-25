@@ -547,7 +547,7 @@ mod tests {
 
         let base_schema = crate::arrow::delete_filter::tests::create_pos_del_schema();
         let schema = Arc::new(ArrowSchema::new(vec![
-            base_schema.field(0).as_ref().clone().with_nullable(true),
+            base_schema.field(0).clone().with_nullable(true),
             base_schema.field(1).clone(),
         ]));
         let batch = RecordBatch::try_new(
