@@ -112,6 +112,9 @@ where
 
 /// Buffers unordered position deletes, then writes sorted and de-duplicated delete records.
 ///
+/// Repeated `(file_path, position)` pairs are idempotent and are emitted once, matching the
+/// bitmap-backed behavior of Iceberg-Java's sorting position-delete writer.
+///
 /// The in-memory index is O(unique paths + unique positions). Each emitted Arrow batch is bounded
 /// to `flush_rows` records, while the path map retains all unique positions until close so
 /// duplicates are removed even when they arrive in different batches.
@@ -133,7 +136,9 @@ where
     L: LocationGenerator,
     F: FileNameGenerator,
 {
-    /// Adds one delete record. Negative row positions are invalid under the Iceberg spec.
+    /// Adds one delete record.
+    ///
+    /// Negative row positions are invalid. Re-adding the same path and position is a no-op.
     pub fn write_delete(&mut self, file_path: impl Into<String>, position: i64) -> Result<()> {
         self.ensure_open()?;
         if position < 0 {
