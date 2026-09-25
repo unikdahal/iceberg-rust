@@ -158,21 +158,6 @@ impl PositionDeleteIndex {
         }
     }
 
-    /// Returns the number of unique deleted row positions.
-    pub(crate) fn len(&self) -> u64 {
-        self.positions.len()
-    }
-
-    /// Returns whether the index contains no deleted row positions.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.positions.is_empty()
-    }
-
-    /// Returns whether `position` is present in the index.
-    pub(crate) fn contains(&self, position: u64) -> bool {
-        self.positions.contains(position)
-    }
-
     /// Iterates deleted row positions in ascending order.
     pub fn iter(&self) -> impl Iterator<Item = u64> + '_ {
         self.positions.iter()
@@ -909,10 +894,11 @@ mod tests {
         let table_location = tmp_dir.path().to_str().unwrap();
         let file_io = FileIO::new_with_fs();
 
-        let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false).with_metadata(
-                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
-            ),
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
         ]));
 
         let id_col = Arc::new(Int64Array::from(vec![100i64, 200, 300]));
