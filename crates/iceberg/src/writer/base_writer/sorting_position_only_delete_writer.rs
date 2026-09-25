@@ -21,10 +21,10 @@
 //! lexical path order and ascending position order. Its memory use is O(unique paths + unique
 //! positions); spilling is intentionally left to a future implementation.
 
-use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use arrow_array::builder::{Int64Builder, StringBuilder};
 use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use roaring::RoaringTreemap;
@@ -94,7 +94,7 @@ where
     async fn build(&self, partition_key: Option<PartitionKey>) -> Result<Self::R> {
         if self.flush_rows == 0 {
             return Err(Error::new(
-                ErrorKind::Unexpected,
+                ErrorKind::DataInvalid,
                 "Sorting position-only delete writer flush_rows must be greater than zero.",
             ));
         }
@@ -103,7 +103,7 @@ where
             .await?;
         Ok(SortingPositionOnlyDeleteWriter {
             inner: Some(inner),
-            positions: HashMap::new(),
+            positions: BTreeMap::new(),
             flush_rows: self.flush_rows,
             closed: false,
         })
@@ -122,7 +122,7 @@ pub struct SortingPositionOnlyDeleteWriter<
     F: FileNameGenerator,
 > {
     inner: Option<PositionDeleteFileWriter<B, L, F>>,
-    positions: HashMap<String, RoaringTreemap>,
+    positions: BTreeMap<String, RoaringTreemap>,
     flush_rows: usize,
     closed: bool,
 }
@@ -159,42 +159,23 @@ where
     }
 
     async fn flush_batch(
-        &mut self,
+        inner: &mut PositionDeleteFileWriter<B, L, F>,
         schema: &ArrowSchemaRef,
-        paths: &mut Vec<String>,
-        positions: &mut Vec<i64>,
+        paths: &mut StringBuilder,
+        positions: &mut Int64Builder,
+        buffered_rows: usize,
     ) -> Result<()> {
-        if paths.is_empty() {
+        if buffered_rows == 0 {
             return Ok(());
         }
 
-        let path_values = std::mem::replace(paths, Vec::with_capacity(self.flush_rows));
-        let position_values = std::mem::replace(positions, Vec::with_capacity(self.flush_rows));
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![
-                Arc::new(StringArray::from(path_values)),
-                Arc::new(Int64Array::from(position_values)),
-            ],
+            vec![Arc::new(paths.finish()), Arc::new(positions.finish())],
         )
         .map_err(|e| invalid_data!("Failed to build position-delete batch: {e}"))?;
-        self.inner
-            .as_mut()
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "Sorting position-only delete writer is already closed.",
-                )
-            })?
-            .write(batch)
-            .await
+        inner.write(batch).await
     }
-}
-
-/// Compares path strings the same way Java's `String`/Iceberg `CharSequence` comparison does.
-/// UTF-16 ordering differs from Unicode scalar ordering for supplementary-plane code points.
-fn compare_java_char_sequences(left: &str, right: &str) -> Ordering {
-    left.encode_utf16().cmp(right.encode_utf16())
 }
 
 #[async_trait::async_trait]
@@ -244,35 +225,72 @@ where
 
         let schema = Arc::new(schema_to_arrow_schema(&position_delete_schema())?);
         let positions_by_path = std::mem::take(&mut self.positions);
-        let mut sorted_paths: Vec<_> = positions_by_path.keys().collect();
-        sorted_paths.sort_by(|left, right| compare_java_char_sequences(left, right));
-        let mut paths = Vec::with_capacity(self.flush_rows);
-        let mut positions = Vec::with_capacity(self.flush_rows);
-        for path in sorted_paths {
-            for position in positions_by_path
-                .get(path)
-                .expect("sorted key must remain in position map")
-            {
-                paths.push(path.clone());
-                positions.push(position as i64);
-                if paths.len() == self.flush_rows {
-                    self.flush_batch(&schema, &mut paths, &mut positions).await?;
+        let flush_rows = self.flush_rows;
+        let mut inner = self.inner.take().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "Sorting position-only delete writer is already closed.",
+            )
+        })?;
+
+        let write_result = async {
+            let mut paths = StringBuilder::new();
+            let mut positions = Int64Builder::new();
+            let mut buffered_rows = 0usize;
+
+            // BTreeMap<String, _> yields the same scalar-value path ordering used by
+            // Iceberg-Java's Comparators.charSequences(). Each bitmap yields positions in
+            // ascending order, so the output is already sorted by (file_path, pos).
+            for (path, path_positions) in positions_by_path {
+                let mut path_positions = path_positions.into_iter().peekable();
+                while path_positions.peek().is_some() {
+                    let remaining = flush_rows - buffered_rows;
+                    let mut appended = 0usize;
+                    while appended < remaining {
+                        let Some(position) = path_positions.next() else {
+                            break;
+                        };
+                        positions.append_value(i64::try_from(position).map_err(|_| {
+                            invalid_data!("Position delete row position exceeds i64::MAX.")
+                        })?);
+                        appended += 1;
+                    }
+                    paths.append_value_n(path.as_str(), appended);
+                    buffered_rows += appended;
+
+                    if buffered_rows == flush_rows {
+                        Self::flush_batch(
+                            &mut inner,
+                            &schema,
+                            &mut paths,
+                            &mut positions,
+                            buffered_rows,
+                        )
+                        .await?;
+                        buffered_rows = 0;
+                    }
                 }
             }
-        }
-        self.flush_batch(&schema, &mut paths, &mut positions).await?;
 
-        // Preserve the rolling writer's complete file metadata and propagate close failures.
-        self.inner
-            .take()
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "Sorting position-only delete writer is already closed.",
-                )
-            })?
-            .close()
+            Self::flush_batch(
+                &mut inner,
+                &schema,
+                &mut paths,
+                &mut positions,
+                buffered_rows,
+            )
             .await
+        }
+        .await;
+
+        if let Err(err) = write_result {
+            // Finalize any underlying file handle even when materializing/writing sorted
+            // deletes fails. The partially written output must not be returned to the caller.
+            let _ = inner.close().await;
+            return Err(err);
+        }
+
+        inner.close().await
     }
 }
 
@@ -438,7 +456,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matches_java_utf16_path_order_and_accepts_large_positions() -> Result<()> {
+    async fn matches_iceberg_java_char_sequence_order_and_accepts_large_positions() -> Result<()> {
         let (_temp_dir, file_io, rolling_writer) = setup("lexical_pos_delete", usize::MAX);
         let mut writer =
             SortingPositionOnlyDeleteWriterBuilder::new(rolling_writer).build(None).await?;
@@ -448,9 +466,21 @@ mod tests {
         let files = writer.close().await?;
         let rows = read_rows(&file_io, &files[0]).await;
         assert_eq!(rows, vec![
-            ("\u{10000}.parquet".to_string(), i64::MAX),
             ("\u{e000}.parquet".to_string(), 0),
+            ("\u{10000}.parquet".to_string(), i64::MAX),
         ]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_zero_flush_rows() -> Result<()> {
+        let (_temp_dir, _file_io, rolling_writer) = setup("zero_flush_rows", usize::MAX);
+        let err = SortingPositionOnlyDeleteWriterBuilder::new(rolling_writer)
+            .with_flush_rows(0)
+            .build(None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
         Ok(())
     }
 
