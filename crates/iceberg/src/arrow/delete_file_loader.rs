@@ -596,7 +596,10 @@ mod tests {
             .expect("expected duplicate reserved field-id error");
 
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
-        assert!(err.message().contains("multiple columns with reserved field id"));
+        assert!(
+            err.message()
+                .contains("multiple columns with reserved field id")
+        );
     }
 
     #[tokio::test]
