@@ -206,14 +206,19 @@ impl PositionDeleteIndexLoader {
         logical_name: &str,
         delete_file_path: &str,
     ) -> Result<usize> {
-        let mut matches = schema.fields().iter().enumerate().filter_map(|(index, field)| {
-            field
-                .metadata()
-                .get(PARQUET_FIELD_ID_META_KEY)
-                .and_then(|id| id.parse::<i32>().ok())
-                .filter(|id| *id == field_id)
-                .map(|_| index)
-        });
+        let mut matches =
+            schema
+                .fields()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, field)| {
+                    field
+                        .metadata()
+                        .get(PARQUET_FIELD_ID_META_KEY)
+                        .and_then(|id| id.parse::<i32>().ok())
+                        .filter(|id| *id == field_id)
+                        .map(|_| index)
+                });
 
         let Some(index) = matches.next() else {
             return Err(Error::new(
@@ -239,20 +244,42 @@ impl PositionDeleteIndexLoader {
         schema: &arrow_schema::Schema,
         delete_file_path: &str,
     ) -> Result<(usize, usize)> {
-        Ok((
-            Self::reserved_field_index(
-                schema,
-                crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH,
-                "file_path",
-                delete_file_path,
-            )?,
-            Self::reserved_field_index(
-                schema,
-                crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_POS,
-                "pos",
-                delete_file_path,
-            )?,
-        ))
+        let path_index = Self::reserved_field_index(
+            schema,
+            crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH,
+            "file_path",
+            delete_file_path,
+        )?;
+        let position_index = Self::reserved_field_index(
+            schema,
+            crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_POS,
+            "pos",
+            delete_file_path,
+        )?;
+
+        let path_field = schema.field(path_index);
+        if path_field.data_type() != &arrow_schema::DataType::Utf8 || path_field.is_nullable() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Position-delete file {delete_file_path} requires non-nullable Utf8 file_path"
+                ),
+            ));
+        }
+
+        let position_field = schema.field(position_index);
+        if position_field.data_type() != &arrow_schema::DataType::Int64
+            || position_field.is_nullable()
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Position-delete file {delete_file_path} requires non-nullable Int64 pos"
+                ),
+            ));
+        }
+
+        Ok((path_index, position_index))
     }
 
     /// Reads and validates all positions in `delete_file` for exactly `expected_data_file`.
@@ -317,8 +344,10 @@ impl PositionDeleteIndexLoader {
             let (path_index, position_index) = match column_indexes {
                 Some(indexes) => indexes,
                 None => {
-                    let indexes =
-                        Self::position_delete_columns(batch.schema().as_ref(), &delete_file.file_path)?;
+                    let indexes = Self::position_delete_columns(
+                        batch.schema().as_ref(),
+                        &delete_file.file_path,
+                    )?;
                     column_indexes = Some(indexes);
                     indexes
                 }
@@ -508,6 +537,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(index.iter().collect::<Vec<_>>(), vec![7]);
+    }
+
+    #[tokio::test]
+    async fn test_position_delete_index_loader_requires_non_nullable_fields() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("pos-delete-nullable-schema.parquet");
+        let path = path.to_str().unwrap();
+
+        let base_schema = crate::arrow::delete_filter::tests::create_pos_del_schema();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            base_schema.field(0).as_ref().clone().with_nullable(true),
+            base_schema.field(1).clone(),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("data.parquet")])),
+                Arc::new(Int64Array::from(vec![1i64])),
+            ],
+        )
+        .unwrap();
+        write_plain_parquet(path, &batch);
+
+        let task = position_delete_task(path, Some(1), Some("data.parquet"));
+        let err = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
+            .load_file_scoped_positions(&task, "data.parquet")
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("non-nullable Utf8 file_path"));
     }
 
     #[tokio::test]
