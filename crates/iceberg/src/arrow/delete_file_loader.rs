@@ -19,8 +19,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array, StringArray};
 use futures::{StreamExt, TryStreamExt};
-use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
-use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask};
 use roaring::RoaringTreemap;
 
 use crate::arrow::ArrowReader;
@@ -210,19 +209,18 @@ impl PositionDeleteIndexLoader {
         logical_name: &str,
         delete_file_path: &str,
     ) -> Result<usize> {
-        let mut matches =
-            schema
-                .fields()
-                .iter()
-                .enumerate()
-                .filter_map(|(index, field)| {
-                    field
-                        .metadata()
-                        .get(PARQUET_FIELD_ID_META_KEY)
-                        .and_then(|id| id.parse::<i32>().ok())
-                        .filter(|id| *id == field_id)
-                        .map(|_| index)
-                });
+        let mut matches = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, field)| {
+                field
+                    .metadata()
+                    .get(PARQUET_FIELD_ID_META_KEY)
+                    .and_then(|id| id.parse::<i32>().ok())
+                    .filter(|id| *id == field_id)
+                    .map(|_| index)
+            });
 
         let Some(index) = matches.next() else {
             return Err(Error::new(
@@ -277,9 +275,7 @@ impl PositionDeleteIndexLoader {
         {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
-                format!(
-                    "Position-delete file {delete_file_path} requires non-nullable Int64 pos"
-                ),
+                format!("Position-delete file {delete_file_path} requires non-nullable Int64 pos"),
             ));
         }
 
@@ -355,10 +351,10 @@ impl PositionDeleteIndexLoader {
 
         // Only the two required columns are needed to construct the bitmap. In particular, do not
         // deserialize the optional deleted-row payload, which can be a wide struct.
-        let projection = ProjectionMask::roots(
-            stream_builder.parquet_schema(),
-            vec![path_root_index, position_root_index],
-        );
+        let projection = ProjectionMask::roots(stream_builder.parquet_schema(), vec![
+            path_root_index,
+            position_root_index,
+        ]);
         stream_builder = stream_builder.with_projection(projection);
 
         // Projection compacts the output schema. Resolve the columns from the built stream rather
@@ -405,7 +401,10 @@ impl PositionDeleteIndexLoader {
             if paths.null_count() != 0 || row_positions.null_count() != 0 {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
-                    format!("Position-delete file {} contains nulls", delete_file.file_path),
+                    format!(
+                        "Position-delete file {} contains nulls",
+                        delete_file.file_path
+                    ),
                 ));
             }
 
@@ -476,13 +475,10 @@ mod tests {
 
     fn position_delete_batch(paths: Vec<&str>, positions: Vec<i64>) -> RecordBatch {
         let schema = crate::arrow::delete_filter::tests::create_pos_del_schema();
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(paths)),
-                Arc::new(Int64Array::from(positions)),
-            ],
-        )
+        RecordBatch::try_new(schema, vec![
+            Arc::new(StringArray::from(paths)),
+            Arc::new(Int64Array::from(positions)),
+        ])
         .unwrap()
     }
 
@@ -511,10 +507,10 @@ mod tests {
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().join("pos-delete.parquet");
         let path = path.to_str().unwrap();
-        let batch = position_delete_batch(
-            vec!["data.parquet", "data.parquet", "data.parquet"],
-            vec![5, 1, 5],
-        );
+        let batch =
+            position_delete_batch(vec!["data.parquet", "data.parquet", "data.parquet"], vec![
+                5, 1, 5,
+            ]);
         write_plain_parquet(path, &batch);
 
         let task = position_delete_task(path, Some(3), Some("data.parquet"));
@@ -537,22 +533,20 @@ mod tests {
         let path = tmp_dir.path().join("pos-delete-with-row.parquet");
         let path = path.to_str().unwrap();
 
-        let row_value_field = Arc::new(
-            Field::new("id", DataType::Int64, true).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "1".to_string(),
-            )])),
-        );
+        let row_value_field = Arc::new(Field::new("id", DataType::Int64, true).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+        ));
         let row_array = StructArray::from(vec![(
             row_value_field,
             Arc::new(Int64Array::from(vec![42i64])) as ArrayRef,
         )]);
-        let row_field = Field::new("row", row_array.data_type().clone(), false).with_metadata(
-            HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                (i32::MAX - 103).to_string(),
-            )]),
-        );
+        let row_field =
+            Field::new("row", row_array.data_type().clone(), false).with_metadata(HashMap::from([
+                (
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    (i32::MAX - 103).to_string(),
+                ),
+            ]));
 
         let base_schema = crate::arrow::delete_filter::tests::create_pos_del_schema();
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -560,14 +554,11 @@ mod tests {
             base_schema.field(1).clone(),
             row_field,
         ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec!["data.parquet"])),
-                Arc::new(Int64Array::from(vec![7i64])),
-                Arc::new(row_array),
-            ],
-        )
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(StringArray::from(vec!["data.parquet"])),
+            Arc::new(Int64Array::from(vec![7i64])),
+            Arc::new(row_array),
+        ])
         .unwrap();
         write_plain_parquet(path, &batch);
 
@@ -591,13 +582,10 @@ mod tests {
             base_schema.field(0).clone().with_nullable(true),
             base_schema.field(1).clone(),
         ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec![Some("data.parquet")])),
-                Arc::new(Int64Array::from(vec![1i64])),
-            ],
-        )
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(StringArray::from(vec![Some("data.parquet")])),
+            Arc::new(Int64Array::from(vec![1i64])),
+        ])
         .unwrap();
         write_plain_parquet(path, &batch);
 
@@ -623,13 +611,10 @@ mod tests {
             Field::new("file_path", DataType::Utf8, false),
             base_schema.field(1).clone(),
         ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec!["data.parquet"])),
-                Arc::new(Int64Array::from(vec![1i64])),
-            ],
-        )
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(StringArray::from(vec!["data.parquet"])),
+            Arc::new(Int64Array::from(vec![1i64])),
+        ])
         .unwrap();
         write_plain_parquet(path, &batch);
 
@@ -674,13 +659,10 @@ mod tests {
             Field::new("file_path", DataType::Utf8, false),
             Field::new("pos", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(Vec::<String>::new())),
-                Arc::new(Int64Array::from(Vec::<i64>::new())),
-            ],
-        )
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(StringArray::from(Vec::<String>::new())),
+            Arc::new(Int64Array::from(Vec::<i64>::new())),
+        ])
         .unwrap();
         write_plain_parquet(path, &batch);
 
@@ -700,10 +682,7 @@ mod tests {
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().join("pos-delete.parquet");
         let path = path.to_str().unwrap();
-        write_plain_parquet(
-            path,
-            &position_delete_batch(vec!["data.parquet"], vec![1]),
-        );
+        write_plain_parquet(path, &position_delete_batch(vec!["data.parquet"], vec![1]));
 
         let task = position_delete_task(path, Some(1), Some("other.parquet"));
         let err = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
@@ -721,10 +700,7 @@ mod tests {
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().join("pos-delete.parquet");
         let path = path.to_str().unwrap();
-        write_plain_parquet(
-            path,
-            &position_delete_batch(vec!["other.parquet"], vec![1]),
-        );
+        write_plain_parquet(path, &position_delete_batch(vec!["other.parquet"], vec![1]));
 
         let task = position_delete_task(path, Some(1), None);
         let err = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
@@ -742,10 +718,7 @@ mod tests {
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().join("pos-delete.parquet");
         let path = path.to_str().unwrap();
-        write_plain_parquet(
-            path,
-            &position_delete_batch(vec!["data.parquet"], vec![-1]),
-        );
+        write_plain_parquet(path, &position_delete_batch(vec!["data.parquet"], vec![-1]));
 
         let task = position_delete_task(path, Some(1), Some("data.parquet"));
         let err = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
@@ -765,10 +738,7 @@ mod tests {
         let path = path.to_str().unwrap();
         write_plain_parquet(
             path,
-            &position_delete_batch(
-                vec!["data.parquet", "data.parquet"],
-                vec![1, 2],
-            ),
+            &position_delete_batch(vec!["data.parquet", "data.parquet"], vec![1, 2]),
         );
 
         let task = position_delete_task(path, Some(3), Some("data.parquet"));
@@ -787,10 +757,7 @@ mod tests {
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().join("pos-delete.parquet");
         let path = path.to_str().unwrap();
-        write_plain_parquet(
-            path,
-            &position_delete_batch(vec!["data.parquet"], vec![1]),
-        );
+        write_plain_parquet(path, &position_delete_batch(vec!["data.parquet"], vec![1]));
 
         let mut task = position_delete_task(path, Some(1), Some("data.parquet"));
         task.content_offset = Some(0);
@@ -803,7 +770,10 @@ mod tests {
             .expect("expected position-delete loader error");
 
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
-        assert!(err.message().contains("deletion-vector content coordinates"));
+        assert!(
+            err.message()
+                .contains("deletion-vector content coordinates")
+        );
     }
 
     #[tokio::test]
