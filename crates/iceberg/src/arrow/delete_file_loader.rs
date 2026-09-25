@@ -148,12 +148,18 @@ impl DeleteFileLoader for BasicDeleteFileLoader {
 ///
 /// The representation is intentionally hidden so callers do not depend on the bitmap
 /// implementation used by Iceberg Rust.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug)]
 pub struct PositionDeleteIndex {
     positions: RoaringTreemap,
 }
 
 impl PositionDeleteIndex {
+    fn new() -> Self {
+        Self {
+            positions: RoaringTreemap::new(),
+        }
+    }
+
     /// Returns the number of unique deleted row positions.
     pub fn len(&self) -> u64 {
         self.positions.len()
@@ -303,7 +309,7 @@ impl PositionDeleteIndexLoader {
             )
             .await?;
 
-        let mut index = PositionDeleteIndex::default();
+        let mut index = PositionDeleteIndex::new();
         let mut column_indexes = None;
         let mut rows_read = 0u64;
 
