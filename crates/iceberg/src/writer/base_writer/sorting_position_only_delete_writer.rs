@@ -75,6 +75,7 @@ where
     ///
     /// This only controls buffering at the Arrow boundary; it does not change file rolling or
     /// duplicate semantics.
+    #[cfg(test)]
     pub(crate) fn with_flush_rows(mut self, flush_rows: usize) -> Self {
         self.flush_rows = flush_rows;
         self
