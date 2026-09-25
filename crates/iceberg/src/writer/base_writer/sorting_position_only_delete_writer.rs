@@ -458,11 +458,9 @@ mod tests {
                 .into()])
                 .build()?,
         );
-        let partition_spec = Arc::new(
-            PartitionSpec::builder(table_schema.clone())
-                .with_spec_id(0)
-                .build()?,
-        );
+        let partition_spec = PartitionSpec::builder(table_schema.clone())
+            .with_spec_id(0)
+            .build()?;
         let manifest_path = temp_dir.path().join("roundtrip-delete-manifest.avro");
         let output = file_io.new_output(manifest_path.to_str().unwrap())?;
         let mut manifest_writer =
