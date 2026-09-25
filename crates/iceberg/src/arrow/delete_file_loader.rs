@@ -148,7 +148,6 @@ impl DeleteFileLoader for BasicDeleteFileLoader {
 ///
 /// The representation is intentionally hidden so callers do not depend on the bitmap
 /// implementation used by Iceberg Rust.
-#[derive(Debug)]
 pub struct PositionDeleteIndex {
     positions: RoaringTreemap,
 }
@@ -188,7 +187,6 @@ impl PositionDeleteIndex {
 /// caller-provided path; the required `file_path` and `pos` columns and their physical rows are
 /// validated so metadata/content disagreement is reported as corrupt input. Any optional deleted
 /// row payload is deliberately not decoded because it is not needed to build the position index.
-#[derive(Clone, Debug)]
 pub struct PositionDeleteIndexLoader {
     basic_loader: BasicDeleteFileLoader,
 }
@@ -603,7 +601,8 @@ mod tests {
         let err = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
             .load_file_scoped_positions(&task, "data.parquet")
             .await
-            .unwrap_err();
+            .err()
+            .expect("expected position-delete loader error");
 
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert!(err.message().contains("non-nullable Utf8 file_path"));
@@ -634,7 +633,8 @@ mod tests {
         let err = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
             .load_file_scoped_positions(&task, "data.parquet")
             .await
-            .unwrap_err();
+            .err()
+            .expect("expected position-delete loader error");
 
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert!(err.message().contains("reserved field id"));
@@ -666,7 +666,8 @@ mod tests {
         let err = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
             .load_file_scoped_positions(&task, "data.parquet")
             .await
-            .unwrap_err();
+            .err()
+            .expect("expected position-delete loader error");
 
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert!(err.message().contains("reserved field id"));
@@ -686,7 +687,8 @@ mod tests {
         let err = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
             .load_file_scoped_positions(&task, "data.parquet")
             .await
-            .unwrap_err();
+            .err()
+            .expect("expected position-delete loader error");
 
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert!(err.message().contains("references other.parquet"));
@@ -706,7 +708,8 @@ mod tests {
         let err = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
             .load_file_scoped_positions(&task, "data.parquet")
             .await
-            .unwrap_err();
+            .err()
+            .expect("expected position-delete loader error");
 
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert!(err.message().contains("contains target other.parquet"));
@@ -726,7 +729,8 @@ mod tests {
         let err = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
             .load_file_scoped_positions(&task, "data.parquet")
             .await
-            .unwrap_err();
+            .err()
+            .expect("expected position-delete loader error");
 
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert!(err.message().contains("negative row position"));
@@ -749,7 +753,8 @@ mod tests {
         let err = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
             .load_file_scoped_positions(&task, "data.parquet")
             .await
-            .unwrap_err();
+            .err()
+            .expect("expected position-delete loader error");
 
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert!(err.message().contains("expected 3 from record_count"));
@@ -772,7 +777,8 @@ mod tests {
         let err = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
             .load_file_scoped_positions(&task, "data.parquet")
             .await
-            .unwrap_err();
+            .err()
+            .expect("expected position-delete loader error");
 
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert!(err.message().contains("deletion-vector content coordinates"));
