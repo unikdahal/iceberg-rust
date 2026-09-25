@@ -371,7 +371,6 @@ impl PositionDeleteIndexLoader {
         let mut rows_read = 0u64;
 
         while let Some(batch) = batches.try_next().await? {
-
             let paths = batch
                 .column(path_index)
                 .as_any()
