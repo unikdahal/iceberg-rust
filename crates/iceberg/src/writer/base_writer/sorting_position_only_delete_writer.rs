@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_array::builder::{Int64Builder, StringBuilder};
-use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use roaring::RoaringTreemap;
 
@@ -171,7 +171,10 @@ where
 
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(paths.finish()), Arc::new(positions.finish())],
+            vec![
+                Arc::new(paths.finish()) as ArrayRef,
+                Arc::new(positions.finish()) as ArrayRef,
+            ],
         )
         .map_err(|e| invalid_data!("Failed to build position-delete batch: {e}"))?;
         inner.write(batch).await
@@ -242,7 +245,7 @@ where
             // Iceberg-Java's Comparators.charSequences(). Each bitmap yields positions in
             // ascending order, so the output is already sorted by (file_path, pos).
             for (path, path_positions) in positions_by_path {
-                let mut path_positions = path_positions.into_iter().peekable();
+                let mut path_positions = path_positions.iter().peekable();
                 while path_positions.peek().is_some() {
                     let remaining = flush_rows - buffered_rows;
                     let mut appended = 0usize;
