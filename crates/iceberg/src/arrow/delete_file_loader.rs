@@ -400,6 +400,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use parquet::arrow::ArrowWriter;
     use tempfile::TempDir;
 
@@ -469,6 +470,69 @@ mod tests {
         assert!(index.contains(1));
         assert!(index.contains(5));
         assert_eq!(index.iter().collect::<Vec<_>>(), vec![1, 5]);
+    }
+
+    #[tokio::test]
+    async fn test_position_delete_index_loader_accepts_additional_columns() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("pos-delete-with-row.parquet");
+        let path = path.to_str().unwrap();
+
+        let base_schema = crate::arrow::delete_filter::tests::create_pos_del_schema();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            base_schema.field(0).clone(),
+            base_schema.field(1).clone(),
+            Field::new("row_payload", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["data.parquet"])),
+                Arc::new(Int64Array::from(vec![7i64])),
+                Arc::new(Int64Array::from(vec![Some(42i64)])),
+            ],
+        )
+        .unwrap();
+        write_plain_parquet(path, &batch);
+
+        let task = position_delete_task(path, Some(1), Some("data.parquet"));
+        let index = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
+            .load_file_scoped_positions(&task, "data.parquet")
+            .await
+            .unwrap();
+
+        assert_eq!(index.iter().collect::<Vec<_>>(), vec![7]);
+    }
+
+    #[tokio::test]
+    async fn test_position_delete_index_loader_requires_reserved_field_ids() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("pos-delete-bad-id.parquet");
+        let path = path.to_str().unwrap();
+
+        let base_schema = crate::arrow::delete_filter::tests::create_pos_del_schema();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("file_path", DataType::Utf8, false),
+            base_schema.field(1).clone(),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["data.parquet"])),
+                Arc::new(Int64Array::from(vec![1i64])),
+            ],
+        )
+        .unwrap();
+        write_plain_parquet(path, &batch);
+
+        let task = position_delete_task(path, Some(1), Some("data.parquet"));
+        let err = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
+            .load_file_scoped_positions(&task, "data.parquet")
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("reserved field id"));
     }
 
     #[tokio::test]
