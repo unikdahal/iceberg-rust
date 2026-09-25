@@ -159,8 +159,11 @@ impl PositionDeleteIndex {
     }
 
     /// Iterates deleted row positions in ascending order.
-    pub fn iter(&self) -> impl Iterator<Item = u64> + '_ {
-        self.positions.iter()
+    ///
+    /// Position-delete rows use Iceberg `long` values. The bitmap stores only values that were
+    /// first validated as non-negative `i64`, so converting back to `i64` is lossless.
+    pub fn iter(&self) -> impl Iterator<Item = i64> + '_ {
+        self.positions.iter().map(|position| position as i64)
     }
 }
 
@@ -279,13 +282,22 @@ impl PositionDeleteIndexLoader {
     ) -> Result<PositionDeleteIndex> {
         if delete_file.file_type != DataContentType::PositionDeletes
             || delete_file.file_format != DataFileFormat::Parquet
-            || delete_file.equality_ids.is_some()
         {
             return Err(Error::new(
                 ErrorKind::FeatureUnsupported,
                 format!(
                     "Expected a V2 Parquet position-delete file, got {:?}/{:?} at {}",
                     delete_file.file_type, delete_file.file_format, delete_file.file_path
+                ),
+            ));
+        }
+
+        if delete_file.equality_ids.is_some() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Position-delete file {} must not carry equality_ids",
+                    delete_file.file_path
                 ),
             ));
         }
@@ -506,6 +518,85 @@ mod tests {
             .unwrap();
 
         assert_eq!(index.iter().collect::<Vec<_>>(), vec![1, 5]);
+    }
+
+    #[tokio::test]
+    async fn test_position_delete_index_loader_rejects_equality_ids_as_invalid_metadata() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("pos-delete-equality-ids.parquet");
+        let path = path.to_str().unwrap();
+        write_plain_parquet(path, &position_delete_batch(vec!["data.parquet"], vec![1]));
+
+        let mut task = position_delete_task(path, Some(1), Some("data.parquet"));
+        task.equality_ids = Some(vec![1]);
+
+        let err = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
+            .load_file_scoped_positions(&task, "data.parquet")
+            .await
+            .err()
+            .expect("expected invalid position-delete metadata");
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("must not carry equality_ids"));
+    }
+
+    #[tokio::test]
+    async fn test_position_delete_index_loader_rejects_unsupported_content_or_format() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("pos-delete-unsupported.parquet");
+        let path = path.to_str().unwrap();
+        write_plain_parquet(path, &position_delete_batch(vec!["data.parquet"], vec![1]));
+
+        let mut wrong_content = position_delete_task(path, Some(1), Some("data.parquet"));
+        wrong_content.file_type = DataContentType::EqualityDeletes;
+        let err = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
+            .load_file_scoped_positions(&wrong_content, "data.parquet")
+            .await
+            .err()
+            .expect("expected unsupported delete content");
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+
+        let mut wrong_format = position_delete_task(path, Some(1), Some("data.parquet"));
+        wrong_format.file_format = DataFileFormat::Avro;
+        let err = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
+            .load_file_scoped_positions(&wrong_format, "data.parquet")
+            .await
+            .err()
+            .expect("expected unsupported delete format");
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+    }
+
+    #[tokio::test]
+    async fn test_position_delete_index_loader_rejects_duplicate_reserved_field_ids() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("pos-delete-duplicate-id.parquet");
+        let path = path.to_str().unwrap();
+
+        let base_schema = crate::arrow::delete_filter::tests::create_pos_del_schema();
+        let duplicate_path = Field::new("duplicate_file_path", DataType::Utf8, false)
+            .with_metadata(base_schema.field(0).metadata().clone());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            base_schema.field(0).clone(),
+            duplicate_path,
+            base_schema.field(1).clone(),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(StringArray::from(vec!["data.parquet"])),
+            Arc::new(StringArray::from(vec!["data.parquet"])),
+            Arc::new(Int64Array::from(vec![1i64])),
+        ])
+        .unwrap();
+        write_plain_parquet(path, &batch);
+
+        let task = position_delete_task(path, Some(1), Some("data.parquet"));
+        let err = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
+            .load_file_scoped_positions(&task, "data.parquet")
+            .await
+            .err()
+            .expect("expected duplicate reserved field-id error");
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("multiple columns with reserved field id"));
     }
 
     #[tokio::test]
