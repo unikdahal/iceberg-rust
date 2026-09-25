@@ -187,6 +187,11 @@ impl PositionDeleteIndex {
 /// caller-provided path; the required `file_path` and `pos` columns and their physical rows are
 /// validated so metadata/content disagreement is reported as corrupt input. Any optional deleted
 /// row payload is deliberately not decoded because it is not needed to build the position index.
+///
+/// This is intentionally separate from the scan-oriented caching delete loader. That loader accepts
+/// partition-scoped position-delete files and groups their rows by target path. A rewrite caller
+/// instead needs a stronger invariant: every physical row in the supplied file must target exactly
+/// one expected data file before the old delete file can be safely replaced.
 pub struct PositionDeleteIndexLoader {
     basic_loader: BasicDeleteFileLoader,
 }
