@@ -358,14 +358,16 @@ impl PositionDeleteIndexLoader {
         );
         stream_builder = stream_builder.with_projection(projection);
 
-        // Projection compacts the output schema, so resolve the two columns again instead of
-        // assuming their physical root ordinals remain valid.
-        let (path_index, position_index) =
-            Self::position_delete_columns(stream_builder.schema().as_ref(), &delete_file.file_path)?;
-
-        let mut batches = stream_builder
-            .build()?
-            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("{e}")));
+        // Projection compacts the output schema. Resolve the columns from the built stream rather
+        // than reusing physical root ordinals, which may differ when a valid file contains other
+        // top-level fields.
+        let projected_stream = stream_builder.build()?;
+        let (path_index, position_index) = Self::position_delete_columns(
+            projected_stream.schema().as_ref(),
+            &delete_file.file_path,
+        )?;
+        let mut batches =
+            projected_stream.map_err(|e| Error::new(ErrorKind::Unexpected, format!("{e}")));
 
         let mut index = PositionDeleteIndex::new();
         let mut rows_read = 0u64;
