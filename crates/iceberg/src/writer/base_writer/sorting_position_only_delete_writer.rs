@@ -314,9 +314,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::arrow::delete_file_loader::PositionDeleteIndexLoader;
     use crate::arrow::schema_to_arrow_schema;
     use crate::io::FileIO;
-    use crate::spec::DataFileFormat;
+    use crate::scan::FileScanTaskDeleteFile;
+    use crate::spec::{DataContentType, DataFileFormat};
     use crate::writer::file_writer::ParquetWriterBuilder;
     use crate::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
@@ -417,6 +419,48 @@ mod tests {
             ("b.parquet".to_string(), 1),
             ("b.parquet".to_string(), 8),
         ]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writer_output_round_trips_through_file_scoped_loader() -> Result<()> {
+        let (_temp_dir, file_io, rolling_writer) = setup("roundtrip_pos_delete", usize::MAX);
+        let mut writer =
+            SortingPositionOnlyDeleteWriterBuilder::new(rolling_writer).build(None).await?;
+
+        writer
+            .write(delete_batch(
+                vec!["data.parquet", "data.parquet", "data.parquet"],
+                vec![5, 1, 5],
+            ))
+            .await?;
+
+        let files = writer.close().await?;
+        assert_eq!(files.len(), 1);
+        let file = &files[0];
+        assert_eq!(file.content_type(), DataContentType::PositionDeletes);
+        assert_eq!(file.file_format(), DataFileFormat::Parquet);
+        assert_eq!(file.record_count(), 2);
+
+        let task = FileScanTaskDeleteFile::builder()
+            .with_file_path(file.file_path().to_string())
+            .with_file_size_in_bytes(file.file_size_in_bytes())
+            .with_file_type(file.content_type())
+            .with_file_format(file.file_format())
+            .with_partition_spec_id(0)
+            .with_equality_ids(file.equality_ids())
+            .with_referenced_data_file(file.referenced_data_file())
+            .with_content_offset(file.content_offset())
+            .with_content_size_in_bytes(file.content_size_in_bytes())
+            .with_record_count(Some(file.record_count()))
+            .with_key_metadata(file.key_metadata().map(Box::from))
+            .build();
+
+        let index = PositionDeleteIndexLoader::new(file_io)
+            .load_file_scoped_positions(&task, "data.parquet")
+            .await?;
+
+        assert_eq!(index.iter().collect::<Vec<_>>(), vec![1, 5]);
         Ok(())
     }
 
