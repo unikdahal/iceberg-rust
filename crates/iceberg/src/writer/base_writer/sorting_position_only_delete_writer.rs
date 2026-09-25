@@ -214,19 +214,23 @@ where
 
         // Validate the complete batch before changing writer state.
         for index in 0..batch.num_rows() {
-            self.positions
-                .entry(paths.value(index).to_owned())
-                .or_default()
-                .insert(positions.value(index) as u64);
+            let path = paths.value(index);
+            let position = positions.value(index) as u64;
+            if let Some(path_positions) = self.positions.get_mut(path) {
+                path_positions.insert(position);
+            } else {
+                let mut path_positions = RoaringTreemap::new();
+                path_positions.insert(position);
+                self.positions.insert(path.to_owned(), path_positions);
+            }
         }
         Ok(())
     }
 
     async fn close(&mut self) -> Result<Vec<DataFile>> {
         self.ensure_open()?;
-        self.closed = true;
-
         let schema = Arc::new(schema_to_arrow_schema(&position_delete_schema())?);
+        self.closed = true;
         let positions_by_path = std::mem::take(&mut self.positions);
         let flush_rows = self.flush_rows;
         let mut inner = self.inner.take().ok_or_else(|| {
