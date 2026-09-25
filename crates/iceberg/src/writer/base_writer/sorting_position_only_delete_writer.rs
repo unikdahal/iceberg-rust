@@ -46,7 +46,6 @@ use crate::{Error, ErrorKind, Result};
 const DEFAULT_FLUSH_ROWS: usize = 8192;
 
 /// Builder for SortingPositionOnlyDeleteWriter.
-#[derive(Debug)]
 pub struct SortingPositionOnlyDeleteWriterBuilder<
     B: FileWriterBuilder,
     L: LocationGenerator,
@@ -118,7 +117,6 @@ where
 /// The in-memory index is O(unique paths + unique positions). Each emitted Arrow batch is bounded
 /// to `flush_rows` records, while the path map retains all unique positions until close so
 /// duplicates are removed even when they arrive in different batches.
-#[derive(Debug)]
 pub struct SortingPositionOnlyDeleteWriter<
     B: FileWriterBuilder,
     L: LocationGenerator,
@@ -491,7 +489,8 @@ mod tests {
             .with_flush_rows(0)
             .build(None)
             .await
-            .unwrap_err();
+            .err()
+            .expect("expected invalid flush_rows error");
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         Ok(())
     }
