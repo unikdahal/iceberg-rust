@@ -481,6 +481,21 @@ mod tests {
         );
         assert_eq!(manifest_file.record_count(), 2);
 
+        // Iceberg-Java's ContentFileUtil.isFileScoped also recognizes V2 position-delete
+        // files when the file_path lower/upper bounds are both present and equal. Keep that
+        // invariant explicit because native rewrite planning relies on those files remaining
+        // discoverable as file-scoped even when referenced_data_file is not populated.
+        let path_field_id = crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
+        let lower_path = manifest_file
+            .lower_bounds()
+            .get(&path_field_id)
+            .expect("single-target position delete must have a file_path lower bound");
+        let upper_path = manifest_file
+            .upper_bounds()
+            .get(&path_field_id)
+            .expect("single-target position delete must have a file_path upper bound");
+        assert_eq!(lower_path, upper_path);
+
         let task = FileScanTaskDeleteFile::builder()
             .with_file_path(manifest_file.file_path().to_string())
             .with_file_size_in_bytes(manifest_file.file_size_in_bytes())
