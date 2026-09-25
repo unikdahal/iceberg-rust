@@ -172,13 +172,10 @@ where
             return Ok(());
         }
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(paths.finish()) as ArrayRef,
-                Arc::new(positions.finish()) as ArrayRef,
-            ],
-        )
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(paths.finish()) as ArrayRef,
+            Arc::new(positions.finish()) as ArrayRef,
+        ])
         .map_err(|e| invalid_data!("Failed to build position-delete batch: {e}"))?;
         inner.write(batch).await
     }
@@ -364,13 +361,10 @@ mod tests {
 
     fn delete_batch(paths: Vec<&str>, row_positions: Vec<i64>) -> RecordBatch {
         let schema = Arc::new(schema_to_arrow_schema(&position_delete_schema()).unwrap());
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(paths)),
-                Arc::new(Int64Array::from(row_positions)),
-            ],
-        )
+        RecordBatch::try_new(schema, vec![
+            Arc::new(StringArray::from(paths)),
+            Arc::new(Int64Array::from(row_positions)),
+        ])
         .unwrap()
     }
 
@@ -388,8 +382,16 @@ mod tests {
         let mut rows = Vec::new();
         for batch in reader {
             let batch = batch.unwrap();
-            let paths = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-            let positions = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            let paths = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let positions = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
             rows.extend(
                 paths
                     .iter()
@@ -403,15 +405,17 @@ mod tests {
     #[tokio::test]
     async fn sorts_and_deduplicates_across_batches() -> Result<()> {
         let (_temp_dir, file_io, rolling_writer) = setup("sorted_pos_delete", usize::MAX);
-        let mut writer =
-            SortingPositionOnlyDeleteWriterBuilder::new(rolling_writer).build(None).await?;
+        let mut writer = SortingPositionOnlyDeleteWriterBuilder::new(rolling_writer)
+            .build(None)
+            .await?;
         writer
             .write(delete_batch(vec!["b.parquet", "a.parquet"], vec![8, 9]))
             .await?;
         writer
-            .write(delete_batch(vec!["a.parquet", "a.parquet", "b.parquet"], vec![
-                2, 9, 1,
-            ]))
+            .write(delete_batch(
+                vec!["a.parquet", "a.parquet", "b.parquet"],
+                vec![2, 9, 1],
+            ))
             .await?;
 
         let files = writer.close().await?;
@@ -429,8 +433,9 @@ mod tests {
     #[tokio::test]
     async fn writer_output_round_trips_through_file_scoped_loader() -> Result<()> {
         let (temp_dir, file_io, rolling_writer) = setup("roundtrip_pos_delete", usize::MAX);
-        let mut writer =
-            SortingPositionOnlyDeleteWriterBuilder::new(rolling_writer).build(None).await?;
+        let mut writer = SortingPositionOnlyDeleteWriterBuilder::new(rolling_writer)
+            .build(None)
+            .await?;
 
         writer
             .write(delete_batch(
@@ -450,12 +455,9 @@ mod tests {
         // regression covers the same metadata serialization boundary used by table commits.
         let table_schema = Arc::new(
             Schema::builder()
-                .with_fields(vec![NestedField::required(
-                    1,
-                    "id",
-                    Type::Primitive(PrimitiveType::Long),
-                )
-                .into()])
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
                 .build()?,
         );
         let partition_spec = PartitionSpec::builder(table_schema.clone())
@@ -503,8 +505,9 @@ mod tests {
     #[tokio::test]
     async fn close_without_rows_returns_no_files() -> Result<()> {
         let (_temp_dir, _file_io, rolling_writer) = setup("empty_pos_delete", usize::MAX);
-        let mut writer =
-            SortingPositionOnlyDeleteWriterBuilder::new(rolling_writer).build(None).await?;
+        let mut writer = SortingPositionOnlyDeleteWriterBuilder::new(rolling_writer)
+            .build(None)
+            .await?;
         assert!(writer.close().await?.is_empty());
         Ok(())
     }
@@ -512,12 +515,15 @@ mod tests {
     #[tokio::test]
     async fn rejects_negative_positions_before_mutating_the_batch() -> Result<()> {
         let (_temp_dir, _file_io, rolling_writer) = setup("negative_pos_delete", usize::MAX);
-        let mut writer =
-            SortingPositionOnlyDeleteWriterBuilder::new(rolling_writer).build(None).await?;
-        assert!(writer
-            .write(delete_batch(vec!["a.parquet", "b.parquet"], vec![1, -1]))
-            .await
-            .is_err());
+        let mut writer = SortingPositionOnlyDeleteWriterBuilder::new(rolling_writer)
+            .build(None)
+            .await?;
+        assert!(
+            writer
+                .write(delete_batch(vec!["a.parquet", "b.parquet"], vec![1, -1]))
+                .await
+                .is_err()
+        );
         assert!(writer.close().await?.is_empty());
         Ok(())
     }
@@ -548,8 +554,9 @@ mod tests {
     #[tokio::test]
     async fn matches_iceberg_java_char_sequence_order_and_accepts_large_positions() -> Result<()> {
         let (_temp_dir, file_io, rolling_writer) = setup("lexical_pos_delete", usize::MAX);
-        let mut writer =
-            SortingPositionOnlyDeleteWriterBuilder::new(rolling_writer).build(None).await?;
+        let mut writer = SortingPositionOnlyDeleteWriterBuilder::new(rolling_writer)
+            .build(None)
+            .await?;
         writer.write_delete("\u{e000}.parquet", 0)?;
         writer.write_delete("\u{10000}.parquet", i64::MAX)?;
 
@@ -578,8 +585,9 @@ mod tests {
     #[tokio::test]
     async fn close_is_one_shot() -> Result<()> {
         let (_temp_dir, _file_io, rolling_writer) = setup("one_shot_pos_delete", usize::MAX);
-        let mut writer =
-            SortingPositionOnlyDeleteWriterBuilder::new(rolling_writer).build(None).await?;
+        let mut writer = SortingPositionOnlyDeleteWriterBuilder::new(rolling_writer)
+            .build(None)
+            .await?;
         assert!(writer.close().await?.is_empty());
         assert!(writer.close().await.is_err());
         Ok(())
