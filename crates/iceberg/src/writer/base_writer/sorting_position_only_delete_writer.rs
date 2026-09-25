@@ -25,7 +25,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Int64Array, RecordBatch, StringArray};
+use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use roaring::RoaringTreemap;
 
@@ -254,7 +254,7 @@ where
                 .expect("sorted key must remain in position map")
             {
                 paths.push(path.clone());
-                positions.push(*position as i64);
+                positions.push(position as i64);
                 if paths.len() == self.flush_rows {
                     self.flush_batch(&schema, &mut paths, &mut positions).await?;
                 }
