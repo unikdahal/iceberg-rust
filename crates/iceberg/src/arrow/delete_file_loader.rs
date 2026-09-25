@@ -431,10 +431,11 @@ impl PositionDeleteIndexLoader {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs::File;
     use std::sync::Arc;
 
-    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, StructArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use parquet::arrow::ArrowWriter;
     use tempfile::TempDir;
@@ -508,23 +509,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_position_delete_index_loader_accepts_additional_columns() {
+    async fn test_position_delete_index_loader_accepts_optional_row_column() {
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().join("pos-delete-with-row.parquet");
         let path = path.to_str().unwrap();
+
+        let row_value_field = Arc::new(
+            Field::new("id", DataType::Int64, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        );
+        let row_array = StructArray::from(vec![(
+            row_value_field,
+            Arc::new(Int64Array::from(vec![42i64])) as ArrayRef,
+        )]);
+        let row_field = Field::new("row", row_array.data_type().clone(), false).with_metadata(
+            HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                (i32::MAX - 103).to_string(),
+            )]),
+        );
 
         let base_schema = crate::arrow::delete_filter::tests::create_pos_del_schema();
         let schema = Arc::new(ArrowSchema::new(vec![
             base_schema.field(0).clone(),
             base_schema.field(1).clone(),
-            Field::new("row_payload", DataType::Int64, true),
+            row_field,
         ]));
         let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(StringArray::from(vec!["data.parquet"])),
                 Arc::new(Int64Array::from(vec![7i64])),
-                Arc::new(Int64Array::from(vec![Some(42i64)])),
+                Arc::new(row_array),
             ],
         )
         .unwrap();
