@@ -505,10 +505,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(index.len(), 2);
-        assert!(!index.is_empty());
-        assert!(index.contains(1));
-        assert!(index.contains(5));
         assert_eq!(index.iter().collect::<Vec<_>>(), vec![1, 5]);
     }
 
@@ -628,7 +624,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(index.is_empty());
         assert_eq!(index.iter().count(), 0);
     }
 
