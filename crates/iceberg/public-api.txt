@@ -3,7 +3,7 @@ pub mod iceberg::arrow
 pub mod iceberg::arrow::delete_file_loader
 pub struct iceberg::arrow::delete_file_loader::PositionDeleteIndex
 impl iceberg::arrow::delete_file_loader::PositionDeleteIndex
-pub fn iceberg::arrow::delete_file_loader::PositionDeleteIndex::iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = u64> + '_
+pub fn iceberg::arrow::delete_file_loader::PositionDeleteIndex::iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = i64> + '_
 pub struct iceberg::arrow::delete_file_loader::PositionDeleteIndexLoader
 impl iceberg::arrow::delete_file_loader::PositionDeleteIndexLoader
 pub async fn iceberg::arrow::delete_file_loader::PositionDeleteIndexLoader::load_file_scoped_positions(&self, delete_file: &iceberg::scan::FileScanTaskDeleteFile, expected_data_file: &str) -> iceberg::Result<iceberg::arrow::delete_file_loader::PositionDeleteIndex>
