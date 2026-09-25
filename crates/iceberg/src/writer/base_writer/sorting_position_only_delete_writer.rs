@@ -306,6 +306,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::Arc;
 
     use arrow_array::{Int64Array, RecordBatch, StringArray};
@@ -318,7 +319,10 @@ mod tests {
     use crate::arrow::schema_to_arrow_schema;
     use crate::io::FileIO;
     use crate::scan::FileScanTaskDeleteFile;
-    use crate::spec::{DataContentType, DataFileFormat};
+    use crate::spec::{
+        DataContentType, DataFileFormat, Manifest, ManifestWriterBuilder, NestedField,
+        PartitionSpec, PrimitiveType, Schema, Type,
+    };
     use crate::writer::file_writer::ParquetWriterBuilder;
     use crate::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
@@ -424,7 +428,7 @@ mod tests {
 
     #[tokio::test]
     async fn writer_output_round_trips_through_file_scoped_loader() -> Result<()> {
-        let (_temp_dir, file_io, rolling_writer) = setup("roundtrip_pos_delete", usize::MAX);
+        let (temp_dir, file_io, rolling_writer) = setup("roundtrip_pos_delete", usize::MAX);
         let mut writer =
             SortingPositionOnlyDeleteWriterBuilder::new(rolling_writer).build(None).await?;
 
@@ -442,18 +446,52 @@ mod tests {
         assert_eq!(file.file_format(), DataFileFormat::Parquet);
         assert_eq!(file.record_count(), 2);
 
+        // Carry the writer-produced DataFile through an actual V2 delete manifest so this
+        // regression covers the same metadata serialization boundary used by table commits.
+        let table_schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )
+                .into()])
+                .build()?,
+        );
+        let partition_spec = Arc::new(
+            PartitionSpec::builder(table_schema.clone())
+                .with_spec_id(0)
+                .build()?,
+        );
+        let manifest_path = temp_dir.path().join("roundtrip-delete-manifest.avro");
+        let output = file_io.new_output(manifest_path.to_str().unwrap())?;
+        let mut manifest_writer =
+            ManifestWriterBuilder::new(output, Some(1), table_schema, partition_spec)
+                .build_v2_deletes();
+        manifest_writer.add_file(file.clone(), 0)?;
+        manifest_writer.write_manifest_file().await?;
+
+        let manifest = Manifest::parse_avro(&fs::read(manifest_path).unwrap())?;
+        assert_eq!(manifest.entries().len(), 1);
+        let manifest_file = manifest.entries()[0].data_file();
+        assert_eq!(
+            manifest_file.content_type(),
+            DataContentType::PositionDeletes
+        );
+        assert_eq!(manifest_file.record_count(), 2);
+
         let task = FileScanTaskDeleteFile::builder()
-            .with_file_path(file.file_path().to_string())
-            .with_file_size_in_bytes(file.file_size_in_bytes())
-            .with_file_type(file.content_type())
-            .with_file_format(file.file_format())
+            .with_file_path(manifest_file.file_path().to_string())
+            .with_file_size_in_bytes(manifest_file.file_size_in_bytes())
+            .with_file_type(manifest_file.content_type())
+            .with_file_format(manifest_file.file_format())
             .with_partition_spec_id(0)
-            .with_equality_ids(file.equality_ids())
-            .with_referenced_data_file(file.referenced_data_file())
-            .with_content_offset(file.content_offset())
-            .with_content_size_in_bytes(file.content_size_in_bytes())
-            .with_record_count(Some(file.record_count()))
-            .with_key_metadata(file.key_metadata().map(Box::from))
+            .with_equality_ids(manifest_file.equality_ids())
+            .with_referenced_data_file(manifest_file.referenced_data_file())
+            .with_content_offset(manifest_file.content_offset())
+            .with_content_size_in_bytes(manifest_file.content_size_in_bytes())
+            .with_record_count(Some(manifest_file.record_count()))
+            .with_key_metadata(manifest_file.key_metadata().map(Box::from))
             .build();
 
         let index = PositionDeleteIndexLoader::new(file_io)
