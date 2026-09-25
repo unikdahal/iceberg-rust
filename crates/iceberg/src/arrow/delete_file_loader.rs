@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array, StringArray};
 use futures::{StreamExt, TryStreamExt};
-use parquet::arrow::ParquetRecordBatchStreamBuilder;
+use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use roaring::RoaringTreemap;
 
@@ -161,17 +161,17 @@ impl PositionDeleteIndex {
     }
 
     /// Returns the number of unique deleted row positions.
-    pub fn len(&self) -> u64 {
+    pub(crate) fn len(&self) -> u64 {
         self.positions.len()
     }
 
     /// Returns whether the index contains no deleted row positions.
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.positions.is_empty()
     }
 
     /// Returns whether `position` is present in the index.
-    pub fn contains(&self, position: u64) -> bool {
+    pub(crate) fn contains(&self, position: u64) -> bool {
         self.positions.contains(position)
     }
 
@@ -185,8 +185,9 @@ impl PositionDeleteIndex {
 ///
 /// This uses the same Parquet opening and encryption path as Iceberg scans. The caller supplies
 /// the target data file. If the manifest entry carries `referenced_data_file`, it must match the
-/// caller-provided path; the physical rows are also validated so metadata/content disagreement is
-/// reported as corrupt input.
+/// caller-provided path; the required `file_path` and `pos` columns and their physical rows are
+/// validated so metadata/content disagreement is reported as corrupt input. Any optional deleted
+/// row payload is deliberately not decoded because it is not needed to build the position index.
 #[derive(Clone, Debug)]
 pub struct PositionDeleteIndexLoader {
     basic_loader: BasicDeleteFileLoader,
@@ -327,31 +328,49 @@ impl PositionDeleteIndexLoader {
             ));
         }
 
-        let mut batches = self
-            .basic_loader
-            .parquet_to_batch_stream(
-                &delete_file.file_path,
-                delete_file.file_size_in_bytes,
-                delete_file.key_metadata.as_deref(),
-            )
-            .await?;
+        let parquet_read_options = ParquetReadOptions::builder().build();
+        let (parquet_file_reader, arrow_metadata) = ArrowReader::open_parquet_file(
+            &delete_file.file_path,
+            self.basic_loader.file_io(),
+            delete_file.file_size_in_bytes,
+            parquet_read_options,
+            self.basic_loader.scan_metrics.bytes_read_counter(),
+            delete_file.key_metadata.as_deref(),
+        )
+        .await?;
+
+        let mut stream_builder =
+            ParquetRecordBatchStreamBuilder::new_with_metadata(parquet_file_reader, arrow_metadata);
+
+        // Validate the physical schema before reading any batches. An empty Parquet file yields no
+        // record batches, so validating lazily inside the loop would allow malformed empty delete
+        // files to bypass all reserved-field/type/nullability checks.
+        let (path_root_index, position_root_index) = Self::position_delete_columns(
+            stream_builder.schema().as_ref(),
+            &delete_file.file_path,
+        )?;
+
+        // Only the two required columns are needed to construct the bitmap. In particular, do not
+        // deserialize the optional deleted-row payload, which can be a wide struct.
+        let projection = ProjectionMask::roots(
+            stream_builder.parquet_schema(),
+            vec![path_root_index, position_root_index],
+        );
+        stream_builder = stream_builder.with_projection(projection);
+
+        // Projection compacts the output schema, so resolve the two columns again instead of
+        // assuming their physical root ordinals remain valid.
+        let (path_index, position_index) =
+            Self::position_delete_columns(stream_builder.schema().as_ref(), &delete_file.file_path)?;
+
+        let mut batches = stream_builder
+            .build()?
+            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("{e}")));
 
         let mut index = PositionDeleteIndex::new();
-        let mut column_indexes = None;
         let mut rows_read = 0u64;
 
         while let Some(batch) = batches.try_next().await? {
-            let (path_index, position_index) = match column_indexes {
-                Some(indexes) => indexes,
-                None => {
-                    let indexes = Self::position_delete_columns(
-                        batch.schema().as_ref(),
-                        &delete_file.file_path,
-                    )?;
-                    column_indexes = Some(indexes);
-                    indexes
-                }
-            };
 
             let paths = batch
                 .column(path_index)
@@ -610,6 +629,38 @@ mod tests {
         write_plain_parquet(path, &batch);
 
         let task = position_delete_task(path, Some(1), Some("data.parquet"));
+        let err = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
+            .load_file_scoped_positions(&task, "data.parquet")
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("reserved field id"));
+    }
+
+    #[tokio::test]
+    async fn test_position_delete_index_loader_validates_empty_file_schema() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("empty-pos-delete-bad-id.parquet");
+        let path = path.to_str().unwrap();
+
+        // No rows means the stream itself yields no batches. The loader must still reject the
+        // malformed physical schema rather than returning an empty index.
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(Vec::<String>::new())),
+                Arc::new(Int64Array::from(Vec::<i64>::new())),
+            ],
+        )
+        .unwrap();
+        write_plain_parquet(path, &batch);
+
+        let task = position_delete_task(path, Some(0), Some("data.parquet"));
         let err = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
             .load_file_scoped_positions(&task, "data.parquet")
             .await
