@@ -9,10 +9,6 @@ pub fn iceberg::arrow::delete_file_loader::PositionDeleteIndex::contains(&self, 
 pub fn iceberg::arrow::delete_file_loader::PositionDeleteIndex::is_empty(&self) -> bool
 pub fn iceberg::arrow::delete_file_loader::PositionDeleteIndex::iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = u64> + '_
 pub fn iceberg::arrow::delete_file_loader::PositionDeleteIndex::len(&self) -> u64
-impl core::clone::Clone for iceberg::arrow::delete_file_loader::PositionDeleteIndex
-pub fn iceberg::arrow::delete_file_loader::PositionDeleteIndex::clone(&self) -> iceberg::arrow::delete_file_loader::PositionDeleteIndex
-impl core::default::Default for iceberg::arrow::delete_file_loader::PositionDeleteIndex
-pub fn iceberg::arrow::delete_file_loader::PositionDeleteIndex::default() -> iceberg::arrow::delete_file_loader::PositionDeleteIndex
 impl core::fmt::Debug for iceberg::arrow::delete_file_loader::PositionDeleteIndex
 pub fn iceberg::arrow::delete_file_loader::PositionDeleteIndex::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg::arrow::delete_file_loader::PositionDeleteIndexLoader
