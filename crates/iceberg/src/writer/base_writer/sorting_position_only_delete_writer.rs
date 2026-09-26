@@ -46,6 +46,11 @@ use crate::{Error, ErrorKind, Result};
 const DEFAULT_FLUSH_ROWS: usize = 8192;
 
 /// Builder for SortingPositionOnlyDeleteWriter.
+///
+/// All deletes written through one built writer must belong to the same Iceberg
+/// partition/spec represented by the `PartitionKey` passed to `build`. The writer
+/// cannot validate partition ownership from a data-file path alone.
+#[derive(Debug)]
 pub struct SortingPositionOnlyDeleteWriterBuilder<
     B: FileWriterBuilder,
     L: LocationGenerator,
@@ -118,6 +123,10 @@ where
 /// The in-memory index is O(unique paths + unique positions). Each emitted Arrow batch is bounded
 /// to `flush_rows` records, while the path map retains all unique positions until close so
 /// duplicates are removed even when they arrive in different batches.
+///
+/// All deletes written through one instance must belong to the same Iceberg
+/// partition/spec represented by the `PartitionKey` used to build it.
+#[derive(Debug)]
 pub struct SortingPositionOnlyDeleteWriter<
     B: FileWriterBuilder,
     L: LocationGenerator,
@@ -421,6 +430,15 @@ mod tests {
 
         let files = writer.close().await?;
         assert_eq!(files.len(), 1);
+        for field_id in [
+            crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH,
+            crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_POS,
+        ] {
+            assert!(!files[0].value_counts().contains_key(&field_id));
+            assert!(!files[0].null_value_counts().contains_key(&field_id));
+            assert!(!files[0].lower_bounds().contains_key(&field_id));
+            assert!(!files[0].upper_bounds().contains_key(&field_id));
+        }
         let rows = read_rows(&file_io, &files[0]).await;
         assert_eq!(rows, vec![
             ("a.parquet".to_string(), 2),
@@ -495,6 +513,16 @@ mod tests {
             .get(&path_field_id)
             .expect("single-target position delete must have a file_path upper bound");
         assert_eq!(lower_path, upper_path);
+        assert!(
+            !manifest_file
+                .value_counts()
+                .contains_key(&crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH)
+        );
+        assert!(
+            !manifest_file
+                .null_value_counts()
+                .contains_key(&crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_POS)
+        );
 
         let task = FileScanTaskDeleteFile::builder()
             .with_file_path(manifest_file.file_path().to_string())
