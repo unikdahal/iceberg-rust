@@ -144,10 +144,11 @@ impl DeleteFileLoader for BasicDeleteFileLoader {
     }
 }
 
-/// An in-memory index of row positions from one file-scoped position-delete file.
+/// An in-memory index of row positions loaded from one file-scoped position-delete file.
 ///
 /// The representation is intentionally hidden so callers do not depend on the bitmap
-/// implementation used by Iceberg Rust.
+/// implementation used by Iceberg Rust. Iteration is canonicalized into ascending order and
+/// duplicate physical delete rows collapse to one position.
 pub struct PositionDeleteIndex {
     positions: DeleteVector,
 }
@@ -179,8 +180,16 @@ impl PositionDeleteIndex {
 /// This is intentionally separate from the scan-oriented caching delete loader. That loader accepts
 /// partition-scoped position-delete files and groups their rows by target path. A rewrite caller
 /// instead needs the stronger file-content invariant that every physical row in the supplied file
-/// targets exactly one expected data file. Applicability and replacement decisions, including
-/// sequence-number and partition checks, remain the caller's responsibility.
+/// targets exactly one expected data file.
+///
+/// Successful loading proves only that the physical rows target `expected_data_file`; it does not
+/// authorize removal or replacement of the delete-file manifest entry. Snapshot applicability,
+/// sequence-number, partition, and replacement rules remain the caller's responsibility.
+///
+/// Iceberg writers are required to sort position-delete rows by file path and position. For
+/// robustness, this loader does not depend on that physical ordering: non-conforming ordering and
+/// duplicate positions are canonicalized into the returned index, matching the tolerant behavior
+/// of the scan-oriented position-delete loader.
 pub struct PositionDeleteIndexLoader {
     basic_loader: BasicDeleteFileLoader,
 }
@@ -265,8 +274,10 @@ impl PositionDeleteIndexLoader {
     /// Reads and validates all positions in `delete_file` for exactly `expected_data_file`.
     ///
     /// Duplicate physical rows collapse to one position in the returned index, matching
-    /// Iceberg's bitmap-based position-delete handling. The manifest `record_count`, when
-    /// present, is validated against physical rows before de-duplication.
+    /// Iceberg's bitmap-based position-delete handling. Although Iceberg writers are required to
+    /// sort position deletes by file path and position, the reader deliberately tolerates
+    /// out-of-order rows and canonicalizes them into ascending index order. The manifest
+    /// `record_count`, when present, is validated against physical rows before de-duplication.
     pub async fn load_file_scoped_positions(
         &self,
         delete_file: &FileScanTaskDeleteFile,
@@ -452,6 +463,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
     use tempfile::TempDir;
 
     use super::*;
@@ -462,6 +474,19 @@ mod tests {
         let file = File::create(path).unwrap();
         let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
         writer.write(batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    fn write_plain_parquet_batches(path: &str, batches: &[RecordBatch], row_group_size: usize) {
+        let file = File::create(path).unwrap();
+        let properties = WriterProperties::builder()
+            .set_max_row_group_size(row_group_size)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(file, batches[0].schema(), Some(properties)).unwrap();
+        for batch in batches {
+            writer.write(batch).unwrap();
+        }
         writer.close().unwrap();
     }
 
@@ -518,6 +543,31 @@ mod tests {
             .unwrap();
 
         assert_eq!(index.iter().collect::<Vec<_>>(), vec![1, 5, i64::MAX]);
+    }
+
+    #[tokio::test]
+    async fn test_position_delete_index_loader_merges_overlapping_positions_across_row_groups() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("pos-delete-multi-row-group.parquet");
+        let path = path.to_str().unwrap();
+
+        let first = position_delete_batch(
+            vec!["data.parquet", "data.parquet", "data.parquet"],
+            vec![1, 5, 10],
+        );
+        let second = position_delete_batch(
+            vec!["data.parquet", "data.parquet", "data.parquet"],
+            vec![5, 11, 2],
+        );
+        write_plain_parquet_batches(path, &[first, second], 3);
+
+        let task = position_delete_task(path, Some(6), Some("data.parquet"));
+        let index = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
+            .load_file_scoped_positions(&task, "data.parquet")
+            .await
+            .unwrap();
+
+        assert_eq!(index.iter().collect::<Vec<_>>(), vec![1, 2, 5, 10, 11]);
     }
 
     #[tokio::test]
