@@ -480,7 +480,7 @@ mod tests {
     fn write_plain_parquet_batches(path: &str, batches: &[RecordBatch], row_group_size: usize) {
         let file = File::create(path).unwrap();
         let properties = WriterProperties::builder()
-            .set_max_row_group_size(row_group_size)
+            .set_max_row_group_row_count(row_group_size)
             .build();
         let mut writer = ArrowWriter::try_new(file, batches[0].schema(), Some(properties)).unwrap();
         for batch in batches {
