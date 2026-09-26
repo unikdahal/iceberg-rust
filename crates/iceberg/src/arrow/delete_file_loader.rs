@@ -20,12 +20,13 @@ use std::sync::Arc;
 use arrow_array::{Array, Int64Array, StringArray};
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask};
-use roaring::RoaringTreemap;
 
 use crate::arrow::ArrowReader;
 use crate::arrow::reader::ParquetReadOptions;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::ScanMetrics;
+use crate::delete_vector::DeleteVector;
+use crate::error::invalid_data;
 use crate::io::FileIO;
 use crate::scan::{ArrowRecordBatchStream, FileScanTaskDeleteFile};
 use crate::spec::{DataContentType, DataFileFormat, Schema, SchemaRef};
@@ -148,13 +149,13 @@ impl DeleteFileLoader for BasicDeleteFileLoader {
 /// The representation is intentionally hidden so callers do not depend on the bitmap
 /// implementation used by Iceberg Rust.
 pub struct PositionDeleteIndex {
-    positions: RoaringTreemap,
+    positions: DeleteVector,
 }
 
 impl PositionDeleteIndex {
     fn new() -> Self {
         Self {
-            positions: RoaringTreemap::new(),
+            positions: DeleteVector::default(),
         }
     }
 
@@ -177,8 +178,9 @@ impl PositionDeleteIndex {
 ///
 /// This is intentionally separate from the scan-oriented caching delete loader. That loader accepts
 /// partition-scoped position-delete files and groups their rows by target path. A rewrite caller
-/// instead needs a stronger invariant: every physical row in the supplied file must target exactly
-/// one expected data file before the old delete file can be safely replaced.
+/// instead needs the stronger file-content invariant that every physical row in the supplied file
+/// targets exactly one expected data file. Applicability and replacement decisions, including
+/// sequence-number and partition checks, remain the caller's responsibility.
 pub struct PositionDeleteIndexLoader {
     basic_loader: BasicDeleteFileLoader,
 }
@@ -211,19 +213,13 @@ impl PositionDeleteIndexLoader {
             });
 
         let Some(index) = matches.next() else {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Position-delete file {delete_file_path} has no `{logical_name}` column with reserved field id {field_id}"
-                ),
+            return Err(invalid_data!(
+                "Position-delete file {delete_file_path} has no `{logical_name}` column with reserved field id {field_id}"
             ));
         };
         if matches.next().is_some() {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Position-delete file {delete_file_path} has multiple columns with reserved field id {field_id}"
-                ),
+            return Err(invalid_data!(
+                "Position-delete file {delete_file_path} has multiple columns with reserved field id {field_id}"
             ));
         }
 
@@ -249,11 +245,8 @@ impl PositionDeleteIndexLoader {
 
         let path_field = schema.field(path_index);
         if path_field.data_type() != &arrow_schema::DataType::Utf8 || path_field.is_nullable() {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Position-delete file {delete_file_path} requires non-nullable Utf8 file_path"
-                ),
+            return Err(invalid_data!(
+                "Position-delete file {delete_file_path} requires non-nullable Utf8 file_path"
             ));
         }
 
@@ -261,9 +254,8 @@ impl PositionDeleteIndexLoader {
         if position_field.data_type() != &arrow_schema::DataType::Int64
             || position_field.is_nullable()
         {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!("Position-delete file {delete_file_path} requires non-nullable Int64 pos"),
+            return Err(invalid_data!(
+                "Position-delete file {delete_file_path} requires non-nullable Int64 pos"
             ));
         }
 
@@ -293,34 +285,25 @@ impl PositionDeleteIndexLoader {
         }
 
         if delete_file.equality_ids.is_some() {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Position-delete file {} must not carry equality_ids",
-                    delete_file.file_path
-                ),
+            return Err(invalid_data!(
+                "Position-delete file {} must not carry equality_ids",
+                delete_file.file_path
             ));
         }
 
         if delete_file.content_offset.is_some() || delete_file.content_size_in_bytes.is_some() {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "V2 Parquet position-delete file {} must not carry deletion-vector content coordinates",
-                    delete_file.file_path
-                ),
+            return Err(invalid_data!(
+                "V2 Parquet position-delete file {} must not carry deletion-vector content coordinates",
+                delete_file.file_path
             ));
         }
 
         if let Some(referenced_data_file) = delete_file.referenced_data_file.as_deref()
             && referenced_data_file != expected_data_file
         {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Position-delete file {} references {referenced_data_file}, expected {expected_data_file}",
-                    delete_file.file_path
-                ),
+            return Err(invalid_data!(
+                "Position-delete file {} references {referenced_data_file}, expected {expected_data_file}",
+                delete_file.file_path
             ));
         }
 
@@ -362,8 +345,13 @@ impl PositionDeleteIndexLoader {
             projected_stream.schema().as_ref(),
             &delete_file.file_path,
         )?;
-        let mut batches =
-            projected_stream.map_err(|e| Error::new(ErrorKind::Unexpected, format!("{e}")));
+        let mut batches = projected_stream.map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to read position-delete file {}", delete_file.file_path),
+            )
+            .with_source(e)
+        });
 
         let mut index = PositionDeleteIndex::new();
         let mut rows_read = 0u64;
@@ -374,12 +362,9 @@ impl PositionDeleteIndexLoader {
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Position-delete file {} has a non-Utf8 file_path column",
-                            delete_file.file_path
-                        ),
+                    invalid_data!(
+                        "Position-delete file {} has a non-Utf8 file_path column",
+                        delete_file.file_path
                     )
                 })?;
             let row_positions = batch
@@ -387,60 +372,65 @@ impl PositionDeleteIndexLoader {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Position-delete file {} has a non-Int64 pos column",
-                            delete_file.file_path
-                        ),
+                    invalid_data!(
+                        "Position-delete file {} has a non-Int64 pos column",
+                        delete_file.file_path
                     )
                 })?;
             if paths.null_count() != 0 || row_positions.null_count() != 0 {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Position-delete file {} contains nulls",
-                        delete_file.file_path
-                    ),
+                return Err(invalid_data!(
+                    "Position-delete file {} contains nulls",
+                    delete_file.file_path
                 ));
             }
 
             rows_read += batch.num_rows() as u64;
+            let mut batch_positions = Vec::with_capacity(batch.num_rows());
             for row in 0..batch.num_rows() {
                 let data_file = paths.value(row);
                 if data_file != expected_data_file {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "File-scoped position-delete file {} contains target {data_file}, expected {expected_data_file}",
-                            delete_file.file_path
-                        ),
+                    return Err(invalid_data!(
+                        "File-scoped position-delete file {} contains target {data_file}, expected {expected_data_file}",
+                        delete_file.file_path
                     ));
                 }
 
                 let position = row_positions.value(row);
                 if position < 0 {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Position-delete file {} contains a negative row position {position}",
-                            delete_file.file_path
-                        ),
+                    return Err(invalid_data!(
+                        "Position-delete file {} contains a negative row position {position}",
+                        delete_file.file_path
                     ));
                 }
-                index.positions.insert(position as u64);
+                batch_positions.push(position as u64);
+            }
+
+            // Spec-compliant file-scoped position deletes are ordered by position, so append the
+            // whole batch at once. The append precondition is intentionally stricter than the
+            // format: duplicates, out-of-order rows, or overlap with an earlier batch can make it
+            // fail after inserting a prefix. Re-inserting the batch one position at a time is
+            // idempotent and preserves the existing reader's tolerant behavior for such files.
+            if !batch_positions.is_empty()
+                && let Err(err) = index.positions.insert_positions(&batch_positions)
+            {
+                tracing::debug!(
+                    delete_file = %delete_file.file_path,
+                    batch_len = batch_positions.len(),
+                    error = %err,
+                    "position-delete batch fell back to per-position insert"
+                );
+                for position in batch_positions {
+                    index.positions.insert(position);
+                }
             }
         }
 
         if let Some(expected_count) = delete_file.record_count
             && rows_read != expected_count
         {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Position-delete file {} contains {rows_read} rows, expected {expected_count} from record_count",
-                    delete_file.file_path
-                ),
+            return Err(invalid_data!(
+                "Position-delete file {} contains {rows_read} rows, expected {expected_count} from record_count",
+                delete_file.file_path
             ));
         }
 
@@ -454,7 +444,9 @@ mod tests {
     use std::fs::File;
     use std::sync::Arc;
 
-    use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, StructArray};
+    use arrow_array::{
+        Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+    };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use parquet::arrow::ArrowWriter;
     use tempfile::TempDir;
@@ -504,20 +496,25 @@ mod tests {
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().join("pos-delete.parquet");
         let path = path.to_str().unwrap();
-        let batch =
-            position_delete_batch(vec!["data.parquet", "data.parquet", "data.parquet"], vec![
-                5, 1, 5,
-            ]);
+        let batch = position_delete_batch(
+            vec![
+                "data.parquet",
+                "data.parquet",
+                "data.parquet",
+                "data.parquet",
+            ],
+            vec![5, 1, 5, i64::MAX],
+        );
         write_plain_parquet(path, &batch);
 
-        let task = position_delete_task(path, Some(3), Some("data.parquet"));
+        let task = position_delete_task(path, Some(4), Some("data.parquet"));
         let loader = PositionDeleteIndexLoader::new(FileIO::new_with_fs());
         let index = loader
             .load_file_scoped_positions(&task, "data.parquet")
             .await
             .unwrap();
 
-        assert_eq!(index.iter().collect::<Vec<_>>(), vec![1, 5]);
+        assert_eq!(index.iter().collect::<Vec<_>>(), vec![1, 5, i64::MAX]);
     }
 
     #[tokio::test]
@@ -673,6 +670,66 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert!(err.message().contains("non-nullable Utf8 file_path"));
+    }
+
+    #[tokio::test]
+    async fn test_position_delete_index_loader_rejects_wrong_file_path_type() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("pos-delete-wrong-path-type.parquet");
+        let path = path.to_str().unwrap();
+
+        let base_schema = crate::arrow::delete_filter::tests::create_pos_del_schema();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("file_path", DataType::Int64, false)
+                .with_metadata(base_schema.field(0).metadata().clone()),
+            base_schema.field(1).clone(),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(Int64Array::from(vec![1i64])),
+            Arc::new(Int64Array::from(vec![1i64])),
+        ])
+        .unwrap();
+        write_plain_parquet(path, &batch);
+
+        let task = position_delete_task(path, Some(1), Some("data.parquet"));
+        let err = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
+            .load_file_scoped_positions(&task, "data.parquet")
+            .await
+            .err()
+            .expect("expected invalid file_path type");
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("non-nullable Utf8 file_path"));
+    }
+
+    #[tokio::test]
+    async fn test_position_delete_index_loader_rejects_wrong_position_type() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("pos-delete-wrong-pos-type.parquet");
+        let path = path.to_str().unwrap();
+
+        let base_schema = crate::arrow::delete_filter::tests::create_pos_del_schema();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            base_schema.field(0).clone(),
+            Field::new("pos", DataType::Int32, false)
+                .with_metadata(base_schema.field(1).metadata().clone()),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(StringArray::from(vec!["data.parquet"])),
+            Arc::new(Int32Array::from(vec![1i32])),
+        ])
+        .unwrap();
+        write_plain_parquet(path, &batch);
+
+        let task = position_delete_task(path, Some(1), Some("data.parquet"));
+        let err = PositionDeleteIndexLoader::new(FileIO::new_with_fs())
+            .load_file_scoped_positions(&task, "data.parquet")
+            .await
+            .err()
+            .expect("expected invalid pos type");
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("non-nullable Int64 pos"));
     }
 
     #[tokio::test]
