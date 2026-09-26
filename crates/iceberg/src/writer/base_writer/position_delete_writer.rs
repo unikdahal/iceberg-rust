@@ -309,10 +309,7 @@ where
     }
 }
 
-fn strip_position_delete_metrics(
-    data_file: &mut DataFile,
-    referenced_data_file_count: usize,
-) {
+fn strip_position_delete_metrics(data_file: &mut DataFile, referenced_data_file_count: usize) {
     for field_id in [
         RESERVED_FIELD_ID_DELETE_FILE_PATH,
         RESERVED_FIELD_ID_DELETE_FILE_POS,
