@@ -348,7 +348,10 @@ impl PositionDeleteIndexLoader {
         let mut batches = projected_stream.map_err(|e| {
             Error::new(
                 ErrorKind::Unexpected,
-                format!("Failed to read position-delete file {}", delete_file.file_path),
+                format!(
+                    "Failed to read position-delete file {}",
+                    delete_file.file_path
+                ),
             )
             .with_source(e)
         });
