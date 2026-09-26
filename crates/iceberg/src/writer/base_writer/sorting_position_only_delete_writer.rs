@@ -620,8 +620,7 @@ mod tests {
             .with_flush_rows(0)
             .build(None)
             .await
-            .err()
-            .expect("expected invalid flush_rows error");
+            .expect_err("expected invalid flush_rows error");
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         Ok(())
     }
