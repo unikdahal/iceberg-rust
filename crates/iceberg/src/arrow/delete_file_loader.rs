@@ -482,8 +482,7 @@ mod tests {
         let properties = WriterProperties::builder()
             .set_max_row_group_size(row_group_size)
             .build();
-        let mut writer =
-            ArrowWriter::try_new(file, batches[0].schema(), Some(properties)).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batches[0].schema(), Some(properties)).unwrap();
         for batch in batches {
             writer.write(batch).unwrap();
         }
@@ -551,14 +550,14 @@ mod tests {
         let path = tmp_dir.path().join("pos-delete-multi-row-group.parquet");
         let path = path.to_str().unwrap();
 
-        let first = position_delete_batch(
-            vec!["data.parquet", "data.parquet", "data.parquet"],
-            vec![1, 5, 10],
-        );
-        let second = position_delete_batch(
-            vec!["data.parquet", "data.parquet", "data.parquet"],
-            vec![5, 11, 2],
-        );
+        let first =
+            position_delete_batch(vec!["data.parquet", "data.parquet", "data.parquet"], vec![
+                1, 5, 10,
+            ]);
+        let second =
+            position_delete_batch(vec!["data.parquet", "data.parquet", "data.parquet"], vec![
+                5, 11, 2,
+            ]);
         write_plain_parquet_batches(path, &[first, second], 3);
 
         let task = position_delete_task(path, Some(6), Some("data.parquet"));
