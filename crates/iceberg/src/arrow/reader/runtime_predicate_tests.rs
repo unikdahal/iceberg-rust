@@ -147,7 +147,8 @@ async fn execute(
     provider: Option<Arc<dyn RuntimePredicateProvider>>,
 ) -> (Vec<RecordBatch>, ScanMetrics) {
     let mut builder = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
-        .with_data_file_concurrency_limit(1);
+        .with_data_file_concurrency_limit(1)
+        .with_row_selection_enabled(true);
     if let Some(provider) = provider {
         builder = builder.with_runtime_predicate_provider(provider);
     }
@@ -228,4 +229,26 @@ async fn runtime_predicate_is_anded_with_task_predicate() {
     assert_eq!(ids(&batches), vec![100, 101, 102, 103]);
     assert_eq!(metrics.runtime_predicate_tasks(), 1);
     assert_eq!(metrics.runtime_row_groups_pruned(), 1);
+}
+
+#[tokio::test]
+async fn invalid_runtime_predicate_fails_open() {
+    let temp = TempDir::new().unwrap();
+    let file_path =
+        write_three_row_group_file(temp.path().to_str().unwrap(), "runtime_invalid.parquet");
+    let schema = iceberg_schema();
+    let task = scan_task(file_path, schema, None);
+    let provider = Arc::new(FixedRuntimePredicate::new(
+        Reference::new("missing").equal_to(Datum::int(1)),
+    ));
+
+    let (batches, metrics) = execute(task, Some(provider.clone())).await;
+
+    assert_eq!(
+        ids(&batches),
+        vec![0, 1, 2, 3, 100, 101, 102, 103, 200, 201, 202, 203]
+    );
+    assert_eq!(provider.snapshots(), 1);
+    assert_eq!(metrics.runtime_predicate_tasks(), 0);
+    assert_eq!(metrics.runtime_row_groups_pruned(), 0);
 }

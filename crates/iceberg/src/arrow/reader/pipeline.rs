@@ -149,11 +149,29 @@ struct FileScanTaskReader {
 impl FileScanTaskReader {
     async fn process(self, task: FileScanTask) -> Result<ArrowRecordBatchStream> {
         let runtime_predicate = match self.runtime_predicate_provider.as_ref() {
-            Some(provider) => provider
-                .snapshot()?
-                .predicate()
-                .map(|predicate| predicate.bind(task.schema_ref(), task.case_sensitive()))
-                .transpose()?,
+            Some(provider) => match provider.snapshot() {
+                Ok(snapshot) => match snapshot
+                    .predicate()
+                    .map(|predicate| predicate.bind(task.schema_ref(), task.case_sensitive()))
+                    .transpose()
+                {
+                    Ok(predicate) => predicate,
+                    Err(error) => {
+                        tracing::debug!(
+                            "Skipping runtime predicate for {} because binding failed: {error}",
+                            task.data_file_path()
+                        );
+                        None
+                    }
+                },
+                Err(error) => {
+                    tracing::debug!(
+                        "Skipping runtime predicate for {} because snapshotting failed: {error}",
+                        task.data_file_path()
+                    );
+                    None
+                }
+            },
             None => None,
         };
         if runtime_predicate.is_some() {
