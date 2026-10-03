@@ -45,10 +45,10 @@ use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::encryption::StandardKeyMetadata;
 use crate::error::Result;
-use crate::expr::{Bind, BoundPredicate};
 use crate::expr::visitors::bloom_filter_evaluator::{
     BloomFilterEvaluator, ColumnBloomFilter, collect_bloom_filter_field_ids,
 };
+use crate::expr::{Bind, BoundPredicate};
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{
     RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_POS,
@@ -113,7 +113,10 @@ fn intersect_row_groups(current: Option<Vec<usize>>, next: Vec<usize>) -> Vec<us
     match current {
         Some(current) => {
             let next: HashSet<_> = next.into_iter().collect();
-            current.into_iter().filter(|idx| next.contains(idx)).collect()
+            current
+                .into_iter()
+                .filter(|idx| next.contains(idx))
+                .collect()
         }
         None => next,
     }
@@ -675,7 +678,9 @@ impl FileScanTaskReader {
                     ));
                 }
                 if let Some(runtime_predicate) = &runtime_predicate {
-                    let before_runtime = selected_row_group_indices.as_ref().map(Vec::len)
+                    let before_runtime = selected_row_group_indices
+                        .as_ref()
+                        .map(Vec::len)
                         .unwrap_or_else(|| record_batch_stream_builder.metadata().num_row_groups());
                     let runtime_filtered_row_groups = ArrowReader::get_selected_row_group_indices(
                         runtime_predicate,

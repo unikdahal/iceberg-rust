@@ -75,7 +75,8 @@ impl ScanMetrics {
     }
 
     pub(crate) fn record_runtime_row_groups_pruned(&self, count: usize) {
-        self.runtime_row_groups_pruned.fetch_add(count as u64, Ordering::Relaxed);
+        self.runtime_row_groups_pruned
+            .fetch_add(count as u64, Ordering::Relaxed);
     }
 
     /// Total bytes read from storage during this scan, including data files and delete files.
@@ -83,10 +84,13 @@ impl ScanMetrics {
         self.bytes_read.load(Ordering::Relaxed)
     }
 
+    /// Returns the number of data-file tasks that accepted a runtime predicate.
     pub fn runtime_predicate_tasks(&self) -> u64 {
         self.runtime_predicate_tasks.load(Ordering::Relaxed)
     }
 
+    /// Returns the additional row groups pruned by runtime statistics, after
+    /// task byte ranges and static or equality-delete predicates are applied.
     pub fn runtime_row_groups_pruned(&self) -> u64 {
         self.runtime_row_groups_pruned.load(Ordering::Relaxed)
     }

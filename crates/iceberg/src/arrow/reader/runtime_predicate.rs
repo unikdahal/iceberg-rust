@@ -28,7 +28,10 @@ pub struct RuntimePredicateSnapshot {
 impl RuntimePredicateSnapshot {
     /// Creates a runtime predicate snapshot.
     pub fn new(predicate: Option<Predicate>, generation: u64) -> Self {
-        Self { predicate, generation }
+        Self {
+            predicate,
+            generation,
+        }
     }
 
     /// Returns the predicate to apply, or None when no useful restriction is available.

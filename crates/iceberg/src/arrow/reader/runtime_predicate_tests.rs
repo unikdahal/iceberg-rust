@@ -372,3 +372,38 @@ async fn provider_error_keeps_static_filter() {
     assert_eq!(metrics.runtime_predicate_tasks(), 0);
     assert_eq!(metrics.runtime_row_groups_pruned(), 0);
 }
+
+#[tokio::test]
+async fn runtime_pruning_metrics_respect_task_byte_range() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "split.parquet");
+    let parquet = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
+    let start = 4 + parquet.metadata().row_group(0).compressed_size() as u64;
+    let file_size = std::fs::metadata(&path).unwrap().len();
+    let schema = iceberg_schema();
+    let static_predicate = Reference::new("id")
+        .greater_than_or_equal_to(Datum::int(100))
+        .bind(Arc::clone(&schema), false)
+        .unwrap();
+    let task = FileScanTask::builder()
+        .with_file_size_in_bytes(file_size)
+        .with_start(start)
+        .with_length(file_size - start)
+        .with_data_file_path(path)
+        .with_data_file_format(DataFileFormat::Parquet)
+        .with_schema(schema)
+        .with_project_field_ids(vec![1, 2])
+        .with_predicate(Some(static_predicate))
+        .with_case_sensitive(false)
+        .build()
+        .unwrap();
+    let provider = Arc::new(FixedRuntimePredicate::new(
+        Reference::new("id").greater_than_or_equal_to(Datum::int(200)),
+    ));
+    let (batches, metrics) = execute(task, Some(provider)).await;
+    assert_eq!(ids(&batches), vec![200, 201, 202, 203]);
+    // RG0 belongs to another split; only RG1 is attributed to runtime pruning.
+    assert_eq!(metrics.runtime_row_groups_pruned(), 1);
+}
