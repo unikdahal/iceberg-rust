@@ -36,5 +36,7 @@ jobs:
           cargo +nightly-2026-04-16 fmt --all -- --check
       - name: Run runtime predicate and delete tests
         run: cargo +stable test --locked -p iceberg --lib runtime_predicate -- --nocapture
+      - name: Run existing Arrow reader regressions
+        run: cargo +stable test --locked -p iceberg --lib arrow::reader
       - name: Check reader API and tests with clippy
         run: cargo +stable clippy --locked -p iceberg --tests
