@@ -53,12 +53,16 @@ impl<F: FileRead> FileRead for CountingFileRead<F> {
 #[derive(Clone, Debug)]
 pub struct ScanMetrics {
     bytes_read: Arc<AtomicU64>,
+    runtime_predicate_tasks: Arc<AtomicU64>,
+    runtime_row_groups_pruned: Arc<AtomicU64>,
 }
 
 impl ScanMetrics {
     pub(crate) fn new() -> Self {
         Self {
             bytes_read: Arc::new(AtomicU64::new(0)),
+            runtime_predicate_tasks: Arc::new(AtomicU64::new(0)),
+            runtime_row_groups_pruned: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -66,9 +70,28 @@ impl ScanMetrics {
         &self.bytes_read
     }
 
+    pub(crate) fn record_runtime_predicate_task(&self) {
+        self.runtime_predicate_tasks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_runtime_row_groups_pruned(&self, count: usize) {
+        self.runtime_row_groups_pruned
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
     /// Total bytes read from storage during this scan, including data files and delete files.
     pub fn bytes_read(&self) -> u64 {
         self.bytes_read.load(Ordering::Relaxed)
+    }
+
+    /// Number of data-file tasks where a runtime predicate was applied.
+    pub fn runtime_predicate_tasks(&self) -> u64 {
+        self.runtime_predicate_tasks.load(Ordering::Relaxed)
+    }
+
+    /// Number of additional row groups removed by runtime predicate statistics pruning.
+    pub fn runtime_row_groups_pruned(&self) -> u64 {
+        self.runtime_row_groups_pruned.load(Ordering::Relaxed)
     }
 }
 
