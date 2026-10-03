@@ -276,7 +276,8 @@ fn field(name: &str, data_type: DataType, id: i32) -> Field {
 
 #[tokio::test]
 async fn runtime_pruning_preserves_position_and_equality_deletes() {
-    use crate::spec::{FIELD_ID_POSITIONAL_DELETE_FILE_PATH, FIELD_ID_POSITIONAL_DELETE_POS};
+    const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: i32 = 2_147_483_546;
+    const FIELD_ID_POSITIONAL_DELETE_POS: i32 = 2_147_483_545;
 
     let temp = TempDir::new().unwrap();
     let dir = temp.path().to_str().unwrap();
