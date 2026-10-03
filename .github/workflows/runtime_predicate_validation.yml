@@ -30,6 +30,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - name: Check pinned nightly formatting
+        run: |
+          rustup toolchain install nightly-2026-04-16 --profile minimal --component rustfmt
+          cargo +nightly-2026-04-16 fmt --all -- --check
       - name: Run runtime predicate and delete tests
         run: cargo +stable test --locked -p iceberg --lib runtime_predicate -- --nocapture
       - name: Check reader API and tests with clippy

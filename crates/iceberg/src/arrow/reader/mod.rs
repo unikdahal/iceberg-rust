@@ -48,13 +48,13 @@ mod runtime_predicate;
 #[cfg(test)]
 mod runtime_predicate_tests;
 pub use file_reader::ArrowFileReader;
-pub use runtime_predicate::{RuntimePredicateProvider, RuntimePredicateSnapshot};
 pub(crate) use options::ParquetReadOptions;
 use predicate_visitor::{CollectFieldIdVisitor, PredicateConverter};
 use projection::{
     add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
     find_leaf_by_field_id,
 };
+pub use runtime_predicate::{RuntimePredicateProvider, RuntimePredicateSnapshot};
 
 /// Builder to create ArrowReader
 pub struct ArrowReaderBuilder {
