@@ -17,6 +17,8 @@
 
 //! Parquet file data reader
 
+use std::sync::Arc;
+
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::io::FileIO;
 use crate::runtime::Runtime;
@@ -42,6 +44,9 @@ mod predicate_visitor;
 mod projection;
 mod row_filter;
 mod row_lineage;
+mod runtime_predicate;
+#[cfg(test)]
+mod runtime_predicate_tests;
 pub use file_reader::ArrowFileReader;
 pub(crate) use options::ParquetReadOptions;
 use predicate_visitor::{CollectFieldIdVisitor, PredicateConverter};
@@ -49,6 +54,7 @@ use projection::{
     add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
     find_leaf_by_field_id,
 };
+pub use runtime_predicate::{RuntimePredicateProvider, RuntimePredicateSnapshot};
 
 /// Builder to create ArrowReader
 pub struct ArrowReaderBuilder {
@@ -59,6 +65,7 @@ pub struct ArrowReaderBuilder {
     row_selection_enabled: bool,
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
+    runtime_predicate_provider: Option<Arc<dyn RuntimePredicateProvider>>,
     runtime: Runtime,
 }
 
@@ -75,6 +82,7 @@ impl ArrowReaderBuilder {
             row_selection_enabled: false,
             bloom_filter_enabled: false,
             parquet_read_options: ParquetReadOptions::builder().build(),
+            runtime_predicate_provider: None,
             runtime,
         }
     }
@@ -119,6 +127,19 @@ impl ArrowReaderBuilder {
         self
     }
 
+    /// Supplies an execution-time predicate source sampled once for each data-file task.
+    ///
+    /// The sampled predicate is combined with the task and delete predicates before
+    /// row-group, page-index, bloom-filter, and row filtering. Returning no predicate leaves
+    /// the task unchanged.
+    pub fn with_runtime_predicate_provider(
+        mut self,
+        runtime_predicate_provider: Arc<dyn RuntimePredicateProvider>,
+    ) -> Self {
+        self.runtime_predicate_provider = Some(runtime_predicate_provider);
+        self
+    }
+
     /// Provide a hint as to the number of bytes to prefetch for parsing the Parquet metadata
     ///
     /// This hint can help reduce the number of fetch requests. For more details see the
@@ -160,6 +181,7 @@ impl ArrowReaderBuilder {
             row_selection_enabled: self.row_selection_enabled,
             bloom_filter_enabled: self.bloom_filter_enabled,
             parquet_read_options: self.parquet_read_options,
+            runtime_predicate_provider: self.runtime_predicate_provider,
         }
     }
 }
@@ -178,4 +200,5 @@ pub struct ArrowReader {
     row_selection_enabled: bool,
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
+    runtime_predicate_provider: Option<Arc<dyn RuntimePredicateProvider>>,
 }
