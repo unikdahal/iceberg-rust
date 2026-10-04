@@ -37,8 +37,9 @@ pub type FileScanTaskStream = BoxStream<'static, Result<FileScanTask>>;
 /// reads only a byte range. Missing column statistics never imply exclusion.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, Deserialize)]
 pub struct FileScanTaskMetrics {
-    /// Number of records in the entire data file.
-    pub record_count: u64,
+    /// Number of records in the entire data file, or None when unavailable.
+    #[serde(default)]
+    pub record_count: Option<u64>,
     /// Number of values, including nulls and NaNs, by Iceberg field ID.
     #[serde(default)]
     pub value_counts: std::collections::HashMap<i32, u64>,
@@ -59,7 +60,7 @@ pub struct FileScanTaskMetrics {
 impl From<&DataFile> for FileScanTaskMetrics {
     fn from(file: &DataFile) -> Self {
         Self {
-            record_count: file.record_count,
+            record_count: Some(file.record_count),
             value_counts: file.value_counts.clone(),
             null_value_counts: file.null_value_counts.clone(),
             nan_value_counts: file.nan_value_counts.clone(),

@@ -1219,7 +1219,7 @@ fn with_file_metrics(
 
 fn three_group_file_metrics() -> crate::scan::FileScanTaskMetrics {
     crate::scan::FileScanTaskMetrics {
-        record_count: 12,
+        record_count: Some(12),
         lower_bounds: HashMap::from([(1, Datum::int(0))]),
         upper_bounds: HashMap::from([(1, Datum::int(203))]),
         ..Default::default()
@@ -1283,12 +1283,14 @@ async fn runtime_predicate_file_bounds_keep_intersections_and_fail_open() {
     ));
     for file_metrics in [
         three_group_file_metrics(),
+        // Completely missing statistics must keep a nonempty physical file.
+        crate::scan::FileScanTaskMetrics::default(),
         crate::scan::FileScanTaskMetrics {
-            record_count: 12,
+            record_count: Some(12),
             ..Default::default()
         },
         crate::scan::FileScanTaskMetrics {
-            record_count: 12,
+            record_count: Some(12),
             // Wrong-type bounds cannot reject a correctly typed reader predicate.
             upper_bounds: HashMap::from([(1, Datum::long(0))]),
             ..Default::default()

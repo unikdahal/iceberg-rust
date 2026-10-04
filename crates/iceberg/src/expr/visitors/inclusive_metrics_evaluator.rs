@@ -69,7 +69,7 @@ impl<'a> InclusiveMetricsEvaluator<'a> {
         filter: &'a BoundPredicate,
         metrics: &'a FileScanTaskMetrics,
     ) -> crate::Result<bool> {
-        if metrics.record_count == 0 {
+        if metrics.record_count == Some(0) {
             return ROWS_CANNOT_MATCH;
         }
         let mut evaluator = Self {
