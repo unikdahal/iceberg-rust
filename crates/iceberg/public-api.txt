@@ -106,14 +106,10 @@ pub fn iceberg::arrow::RuntimePredicateSnapshot::fmt(&self, f: &mut core::fmt::F
 pub struct iceberg::arrow::ScanMetrics
 impl iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanMetrics::bytes_read(&self) -> u64
-pub fn iceberg::scan::ScanMetrics::runtime_file_tasks_considered(&self) -> u64
 pub fn iceberg::scan::ScanMetrics::runtime_file_tasks_pruned(&self) -> u64
-pub fn iceberg::scan::ScanMetrics::runtime_live_pruning_tasks(&self) -> u64
 pub fn iceberg::scan::ScanMetrics::runtime_predicate_refreshes(&self) -> u64
 pub fn iceberg::scan::ScanMetrics::runtime_predicate_tasks(&self) -> u64
-pub fn iceberg::scan::ScanMetrics::runtime_row_groups_considered(&self) -> u64
 pub fn iceberg::scan::ScanMetrics::runtime_row_groups_pruned(&self) -> u64
-pub fn iceberg::scan::ScanMetrics::runtime_row_groups_pruned_initial(&self) -> u64
 pub fn iceberg::scan::ScanMetrics::runtime_row_groups_pruned_live(&self) -> u64
 impl core::clone::Clone for iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanMetrics::clone(&self) -> iceberg::scan::ScanMetrics
@@ -1439,14 +1435,10 @@ pub fn iceberg::scan::FileScanTaskMetrics::deserialize<__D>(__deserializer: __D)
 pub struct iceberg::scan::ScanMetrics
 impl iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanMetrics::bytes_read(&self) -> u64
-pub fn iceberg::scan::ScanMetrics::runtime_file_tasks_considered(&self) -> u64
 pub fn iceberg::scan::ScanMetrics::runtime_file_tasks_pruned(&self) -> u64
-pub fn iceberg::scan::ScanMetrics::runtime_live_pruning_tasks(&self) -> u64
 pub fn iceberg::scan::ScanMetrics::runtime_predicate_refreshes(&self) -> u64
 pub fn iceberg::scan::ScanMetrics::runtime_predicate_tasks(&self) -> u64
-pub fn iceberg::scan::ScanMetrics::runtime_row_groups_considered(&self) -> u64
 pub fn iceberg::scan::ScanMetrics::runtime_row_groups_pruned(&self) -> u64
-pub fn iceberg::scan::ScanMetrics::runtime_row_groups_pruned_initial(&self) -> u64
 pub fn iceberg::scan::ScanMetrics::runtime_row_groups_pruned_live(&self) -> u64
 impl core::clone::Clone for iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanMetrics::clone(&self) -> iceberg::scan::ScanMetrics
@@ -1467,6 +1459,8 @@ pub fn iceberg::scan::TableScan::fmt(&self, f: &mut core::fmt::Formatter<'_>) ->
 pub struct iceberg::scan::TableScanBuilder<'a>
 impl<'a> iceberg::scan::TableScanBuilder<'a>
 pub fn iceberg::scan::TableScanBuilder<'a>::build(self) -> iceberg::Result<iceberg::scan::TableScan>
+pub fn iceberg::scan::TableScanBuilder<'a>::include_column_stats(self) -> Self
+pub fn iceberg::scan::TableScanBuilder<'a>::include_column_stats_for(self, column_names: impl core::iter::traits::collect::IntoIterator<Item = impl core::convert::Into<alloc::string::String>>) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select(self, column_names: impl core::iter::traits::collect::IntoIterator<Item = impl alloc::string::ToString>) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select_all(self) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select_empty(self) -> Self

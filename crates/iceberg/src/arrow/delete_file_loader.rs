@@ -370,7 +370,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_delete_size_still_reports_missing_and_empty_objects() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = TempDir::new().unwrap();
         let loader = BasicDeleteFileLoader::new(FileIO::new_with_fs(), ScanMetrics::new());
         let missing = temp.path().join("missing.parquet");
         let error = loader
