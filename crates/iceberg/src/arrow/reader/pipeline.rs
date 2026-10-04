@@ -33,6 +33,7 @@ use parquet::arrow::{
 use parquet::encryption::decrypt::FileDecryptionProperties;
 
 use super::row_lineage::synthesize_row_id_column;
+use super::runtime_predicate::RuntimePredicateState;
 use super::{
     ArrowFileReader, ArrowReader, ParquetReadOptions, RuntimePredicateProvider,
     add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
@@ -45,10 +46,10 @@ use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::encryption::StandardKeyMetadata;
 use crate::error::Result;
+use crate::expr::BoundPredicate;
 use crate::expr::visitors::bloom_filter_evaluator::{
     BloomFilterEvaluator, ColumnBloomFilter, collect_bloom_filter_field_ids,
 };
-use crate::expr::{Bind, BoundPredicate};
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{
     RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_POS,
@@ -151,32 +152,21 @@ struct FileScanTaskReader {
 
 impl FileScanTaskReader {
     async fn process(self, task: FileScanTask) -> Result<ArrowRecordBatchStream> {
-        let runtime_predicate = match self.runtime_predicate_provider.as_ref() {
-            Some(provider) => match provider.snapshot() {
-                Ok(snapshot) => match snapshot
-                    .predicate()
-                    .map(|predicate| predicate.bind(task.schema_ref(), task.case_sensitive()))
-                    .transpose()
-                {
-                    Ok(predicate) => predicate,
-                    Err(error) => {
-                        tracing::debug!(
-                            "Skipping runtime predicate for {} because binding failed: {error}",
-                            task.data_file_path()
-                        );
-                        None
-                    }
-                },
-                Err(error) => {
-                    tracing::debug!(
-                        "Skipping runtime predicate for {} because snapshotting failed: {error}",
-                        task.data_file_path()
-                    );
-                    None
-                }
-            },
-            None => None,
-        };
+        let mut runtime_state = self
+            .runtime_predicate_provider
+            .as_ref()
+            .map(|provider| RuntimePredicateState::new(Arc::clone(provider)));
+        if let Some(state) = runtime_state.as_mut()
+            && let Err(error) = state.refresh_if_changed(task.schema_ref(), task.case_sensitive())
+        {
+            tracing::debug!(
+                "Skipping runtime predicate for {} because refreshing failed: {error}",
+                task.data_file_path()
+            );
+        }
+        let runtime_predicate = runtime_state
+            .as_ref()
+            .and_then(|state| state.predicate().cloned());
         if runtime_predicate.is_some() {
             self.scan_metrics.record_runtime_predicate_task();
         }

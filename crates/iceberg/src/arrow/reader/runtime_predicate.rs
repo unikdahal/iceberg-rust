@@ -15,8 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
 use crate::Result;
-use crate::expr::Predicate;
+use crate::expr::{Bind, BoundPredicate, Predicate};
+use crate::spec::SchemaRef;
 
 /// An immutable view of a runtime predicate at one point in execution.
 #[derive(Clone, Debug)]
@@ -47,9 +50,67 @@ impl RuntimePredicateSnapshot {
 
 /// Supplies execution-time predicates to an Arrow reader.
 ///
-/// A snapshot is requested when a data-file task begins processing. Implementations
-/// must only return predicates that are safe to AND with the task's planned predicate.
+/// A snapshot is requested when a data-file task begins processing, and may be
+/// refreshed between row groups. Implementations must only return predicates
+/// that are safe to AND with the task's planned predicate for unread rows.
+/// Generations must increase when the predicate changes, including changes to
+/// or from `None`. Publish the predicate before its generation becomes visible.
+/// Each snapshot must pair a predicate with its own publication generation.
 pub trait RuntimePredicateProvider: Send + Sync {
+    /// Returns the current publication generation without cloning the predicate.
+    ///
+    /// This is called on the reader's hot path. Implementations should use a
+    /// cheap synchronized read, such as an atomic load with acquire ordering.
+    fn generation(&self) -> u64;
+
     /// Returns the current runtime predicate snapshot.
     fn snapshot(&self) -> Result<RuntimePredicateSnapshot>;
+}
+
+/// One task's bound runtime predicate. The task schema and case policy must stay
+/// fixed for the lifetime of this state.
+pub(super) struct RuntimePredicateState {
+    provider: Arc<dyn RuntimePredicateProvider>,
+    generation: Option<u64>,
+    predicate: Option<BoundPredicate>,
+}
+
+impl RuntimePredicateState {
+    pub(super) fn new(provider: Arc<dyn RuntimePredicateProvider>) -> Self {
+        Self {
+            provider,
+            generation: None,
+            predicate: None,
+        }
+    }
+
+    pub(super) fn predicate(&self) -> Option<&BoundPredicate> {
+        self.predicate.as_ref()
+    }
+
+    /// Snapshot and bind only on first use or after a publication change.
+    /// An advisory provider/binding failure clears the cached restriction; the
+    /// caller retains the planned predicate and delete processing.
+    pub(super) fn refresh_if_changed(
+        &mut self,
+        schema: SchemaRef,
+        case_sensitive: bool,
+    ) -> Result<bool> {
+        let observed = self.provider.generation();
+        if self.generation == Some(observed) {
+            return Ok(false);
+        }
+
+        // Cache failed publications too, avoiding repeated snapshots or binds
+        // for a permanently invalid predicate. A new generation can recover.
+        self.predicate = None;
+        self.generation = Some(observed);
+        let snapshot = self.provider.snapshot()?;
+        self.generation = Some(snapshot.generation());
+        self.predicate = snapshot
+            .predicate()
+            .map(|predicate| predicate.bind(schema, case_sensitive))
+            .transpose()?;
+        Ok(true)
+    }
 }

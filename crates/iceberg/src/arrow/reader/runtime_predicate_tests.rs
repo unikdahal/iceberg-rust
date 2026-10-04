@@ -17,8 +17,8 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
@@ -28,6 +28,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
+use super::runtime_predicate::RuntimePredicateState;
 use super::{ArrowReaderBuilder, RuntimePredicateProvider, RuntimePredicateSnapshot};
 use crate::arrow::ScanMetrics;
 use crate::expr::{Bind, Predicate, Reference};
@@ -60,6 +61,10 @@ impl FixedRuntimePredicate {
 }
 
 impl RuntimePredicateProvider for FixedRuntimePredicate {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
     fn snapshot(&self) -> Result<RuntimePredicateSnapshot> {
         self.snapshots.fetch_add(1, Ordering::Relaxed);
         Ok(RuntimePredicateSnapshot::new(
@@ -80,6 +85,116 @@ fn iceberg_schema() -> SchemaRef {
             .build()
             .unwrap(),
     )
+}
+
+struct ChangingRuntimePredicate {
+    generation: AtomicU64,
+    snapshot: Mutex<RuntimePredicateSnapshot>,
+    snapshots: AtomicU64,
+    fail: AtomicBool,
+}
+
+impl ChangingRuntimePredicate {
+    fn new(predicate: Option<Predicate>, generation: u64) -> Self {
+        Self {
+            generation: AtomicU64::new(generation),
+            snapshot: Mutex::new(RuntimePredicateSnapshot::new(predicate, generation)),
+            snapshots: AtomicU64::new(0),
+            fail: AtomicBool::new(false),
+        }
+    }
+
+    fn publish(&self, predicate: Option<Predicate>, generation: u64) {
+        *self.snapshot.lock().unwrap() = RuntimePredicateSnapshot::new(predicate, generation);
+        self.generation.store(generation, Ordering::Release);
+    }
+}
+
+impl RuntimePredicateProvider for ChangingRuntimePredicate {
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn snapshot(&self) -> Result<RuntimePredicateSnapshot> {
+        self.snapshots.fetch_add(1, Ordering::Relaxed);
+        if self.fail.load(Ordering::Acquire) {
+            return Err(crate::Error::new(
+                crate::ErrorKind::Unexpected,
+                "publication failed",
+            ));
+        }
+        Ok(self.snapshot.lock().unwrap().clone())
+    }
+}
+
+#[test]
+fn runtime_predicate_generation_zero_and_unchanged_do_not_resnapshot() {
+    let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let mut state = RuntimePredicateState::new(provider.clone());
+    assert!(state.refresh_if_changed(iceberg_schema(), false).unwrap());
+    for _ in 0..100 {
+        assert!(!state.refresh_if_changed(iceberg_schema(), false).unwrap());
+    }
+    assert_eq!(provider.snapshots.load(Ordering::Relaxed), 1);
+    assert!(state.predicate().is_none());
+    let predicate = Reference::new("id").greater_than_or_equal_to(Datum::int(100));
+    provider.publish(Some(predicate.clone()), 1);
+    assert!(state.refresh_if_changed(iceberg_schema(), false).unwrap());
+    assert_eq!(
+        state.predicate(),
+        Some(&predicate.bind(iceberg_schema(), false).unwrap())
+    );
+    provider.publish(None, 2);
+    assert!(state.refresh_if_changed(iceberg_schema(), false).unwrap());
+    assert!(state.predicate().is_none());
+    assert_eq!(provider.snapshots.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+fn runtime_predicate_caches_the_snapshot_generation_after_a_race() {
+    let predicate = Reference::new("id").less_than_or_equal_to(Datum::int(100));
+    let provider = Arc::new(ChangingRuntimePredicate::new(Some(predicate), 3));
+    // Publication advances between the cheap read and coherent snapshot.
+    provider.generation.store(2, Ordering::Release);
+    let mut state = RuntimePredicateState::new(provider.clone());
+    assert!(state.refresh_if_changed(iceberg_schema(), false).unwrap());
+    provider.generation.store(3, Ordering::Release);
+    assert!(!state.refresh_if_changed(iceberg_schema(), false).unwrap());
+    assert_eq!(provider.snapshots.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn runtime_predicate_invalid_binding_is_cached_and_can_recover() {
+    let provider = Arc::new(ChangingRuntimePredicate::new(
+        Some(Reference::new("ID").equal_to(Datum::int(100))),
+        1,
+    ));
+    let mut state = RuntimePredicateState::new(provider.clone());
+    assert!(state.refresh_if_changed(iceberg_schema(), true).is_err());
+    assert!(state.predicate().is_none());
+    assert!(!state.refresh_if_changed(iceberg_schema(), true).unwrap());
+    assert_eq!(provider.snapshots.load(Ordering::Relaxed), 1);
+    provider.publish(Some(Reference::new("id").equal_to(Datum::int(100))), 2);
+    assert!(state.refresh_if_changed(iceberg_schema(), true).unwrap());
+    assert!(state.predicate().is_some());
+}
+
+#[test]
+fn runtime_predicate_snapshot_failure_clears_old_restriction_and_recovers() {
+    let predicate = Reference::new("id").equal_to(Datum::int(100));
+    let provider = Arc::new(ChangingRuntimePredicate::new(Some(predicate.clone()), 1));
+    let mut state = RuntimePredicateState::new(provider.clone());
+    assert!(state.refresh_if_changed(iceberg_schema(), false).unwrap());
+    provider.fail.store(true, Ordering::Release);
+    provider.generation.store(2, Ordering::Release);
+    assert!(state.refresh_if_changed(iceberg_schema(), false).is_err());
+    assert!(state.predicate().is_none());
+    assert!(!state.refresh_if_changed(iceberg_schema(), false).unwrap());
+    provider.fail.store(false, Ordering::Release);
+    provider.publish(Some(predicate), 3);
+    assert!(state.refresh_if_changed(iceberg_schema(), false).unwrap());
+    assert!(state.predicate().is_some());
+    assert_eq!(provider.snapshots.load(Ordering::Relaxed), 3);
 }
 
 fn write_three_row_group_file(dir: &str, name: &str) -> String {
@@ -350,6 +465,10 @@ async fn runtime_pruning_preserves_position_and_equality_deletes() {
 
 struct FailedProvider;
 impl RuntimePredicateProvider for FailedProvider {
+    fn generation(&self) -> u64 {
+        0
+    }
+
     fn snapshot(&self) -> Result<RuntimePredicateSnapshot> {
         Err(crate::Error::new(
             crate::ErrorKind::Unexpected,
