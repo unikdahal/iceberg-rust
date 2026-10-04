@@ -27,6 +27,9 @@ jobs:
     if: github.repository == 'unikdahal/iceberg-rust'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      PARQUET_TEST_DATA: ${{ github.workspace }}/arrow/parquet-testing/data
+      ARROW_TEST_DATA: ${{ github.workspace }}/arrow/testing/data
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
