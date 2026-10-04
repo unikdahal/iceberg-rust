@@ -17,8 +17,14 @@
 
 //! Execution-time predicates published to the Arrow reader.
 
-use crate::Result;
-use crate::expr::Predicate;
+use arrow_schema::SchemaRef as ArrowSchemaRef;
+use parquet::basic::Type as PhysicalType;
+use parquet::schema::types::SchemaDescriptor;
+
+use super::ArrowReader;
+use crate::expr::{Bind, BoundPredicate, Predicate};
+use crate::spec::{PrimitiveType, Schema, SchemaRef};
+use crate::{Error, ErrorKind, Result};
 
 /// An immutable view of a runtime predicate at one point in execution.
 #[derive(Clone, Debug)]
@@ -136,4 +142,88 @@ pub trait RuntimePredicateProvider: Send + Sync {
 
     /// Returns the current runtime predicate snapshot.
     fn snapshot(&self) -> Result<RuntimePredicateSnapshot>;
+}
+
+/// Samples and binds a provider's current predicate for one task.
+///
+/// Like planned filters, NOT is pushed down to the leaves before binding:
+/// statistics evaluators cannot negate a "might match" result. Provider and
+/// binding failures are advisory and yield `None`.
+pub(super) fn sample_runtime_predicate(
+    provider: &dyn RuntimePredicateProvider,
+    schema: SchemaRef,
+    case_sensitive: bool,
+    data_file_path: &str,
+) -> Option<BoundPredicate> {
+    let bound = provider.snapshot().and_then(|snapshot| {
+        snapshot
+            .predicate()
+            .map(|predicate| predicate.clone().rewrite_not().bind(schema, case_sensitive))
+            .transpose()
+    });
+    match bound {
+        Ok(predicate) => predicate,
+        Err(error) => {
+            tracing::debug!("Skipping runtime predicate for {data_file_path}: {error}");
+            None
+        }
+    }
+}
+
+/// Checks that a file stores every column `predicate` references with the
+/// table's own physical type, so that physical pruning and row filtering see
+/// exactly the values the reader returns.
+///
+/// A column missing from the file is read as its initial default or null,
+/// which physical filters never see. A promoted column (for example INT read
+/// as BIGINT) would have literals cast to the narrower physical type, where an
+/// out-of-range literal becomes null and silently rejects every row. Either
+/// case makes the runtime predicate unusable for the file.
+pub(super) fn check_runtime_predicate_columns(
+    predicate: &BoundPredicate,
+    parquet_schema: &SchemaDescriptor,
+    arrow_schema: &ArrowSchemaRef,
+    table_schema: &Schema,
+    use_position_fallback: bool,
+) -> Result<()> {
+    let (field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
+        parquet_schema,
+        arrow_schema,
+        predicate,
+        use_position_fallback,
+    )?;
+    for field_id in field_ids {
+        let unusable = |reason: &str| {
+            Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!("Runtime predicate field {field_id} {reason}"),
+            )
+        };
+        let column = *field_id_map
+            .get(&field_id)
+            .ok_or_else(|| unusable("is not stored in this file"))?;
+        let field = table_schema
+            .field_by_id(field_id)
+            .ok_or_else(|| unusable("is not in the table schema"))?;
+        let expected = field
+            .field_type
+            .as_primitive_type()
+            .ok_or_else(|| unusable("is not a primitive column"))?;
+        let descriptor = parquet_schema.column(column);
+        let same_type = match expected {
+            PrimitiveType::Int => descriptor.physical_type() == PhysicalType::INT32,
+            PrimitiveType::Long => descriptor.physical_type() == PhysicalType::INT64,
+            PrimitiveType::Float => descriptor.physical_type() == PhysicalType::FLOAT,
+            PrimitiveType::Double => descriptor.physical_type() == PhysicalType::DOUBLE,
+            PrimitiveType::Decimal { precision, scale } => {
+                i64::from(descriptor.type_precision()) == i64::from(*precision)
+                    && i64::from(descriptor.type_scale()) == i64::from(*scale)
+            }
+            _ => true,
+        };
+        if !same_type {
+            return Err(unusable("is stored with a promoted physical type"));
+        }
+    }
+    Ok(())
 }

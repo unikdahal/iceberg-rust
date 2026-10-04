@@ -33,9 +33,11 @@ use parquet::arrow::{
 use parquet::encryption::decrypt::FileDecryptionProperties;
 
 use super::row_lineage::synthesize_row_id_column;
+use super::runtime_predicate::{check_runtime_predicate_columns, sample_runtime_predicate};
 use super::{
-    ArrowFileReader, ArrowReader, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
-    apply_name_mapping_to_arrow_schema, find_leaf_by_field_id,
+    ArrowFileReader, ArrowReader, ParquetReadOptions, RuntimePredicateProvider,
+    add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
+    find_leaf_by_field_id,
 };
 use crate::arrow::build_partition_constant;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
@@ -76,6 +78,7 @@ impl ArrowReader {
             row_selection_enabled: self.row_selection_enabled,
             bloom_filter_enabled: self.bloom_filter_enabled,
             parquet_read_options: self.parquet_read_options,
+            runtime_predicate_provider: self.runtime_predicate_provider,
             scan_metrics: scan_metrics.clone(),
         };
 
@@ -130,12 +133,26 @@ struct FileScanTaskReader {
     row_selection_enabled: bool,
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
+    runtime_predicate_provider: Option<Arc<dyn RuntimePredicateProvider>>,
     scan_metrics: ScanMetrics,
 }
 
 impl FileScanTaskReader {
     async fn process(self, task: FileScanTask) -> Result<ArrowRecordBatchStream> {
-        let should_load_page_index = (self.row_selection_enabled && task.predicate().is_some())
+        // Sample the execution-time predicate once, when the task starts.
+        let mut runtime_predicate =
+            self.runtime_predicate_provider
+                .as_deref()
+                .and_then(|provider| {
+                    sample_runtime_predicate(
+                        provider,
+                        task.schema_ref(),
+                        task.case_sensitive(),
+                        task.data_file_path(),
+                    )
+                });
+        let should_load_page_index = (self.row_selection_enabled
+            && (task.predicate().is_some() || runtime_predicate.is_some()))
             || !task.deletes().is_empty();
         let mut parquet_read_options = self.parquet_read_options;
         parquet_read_options.preload_page_index = should_load_page_index;
@@ -470,13 +487,40 @@ impl FileScanTaskReader {
         // we also have an optional predicate resulting from equality delete files.
         // If both are present, we logical-AND them together to form a single filter
         // predicate that we can pass to the `RecordBatchStreamBuilder`.
-        let final_predicate = match (task.predicate(), delete_predicate) {
+        let planned_predicate = match (task.predicate(), delete_predicate) {
             (None, None) => None,
             (Some(predicate), None) => Some(predicate.clone()),
             (None, Some(ref predicate)) => Some(predicate.clone()),
             (Some(filter_predicate), Some(delete_predicate)) => {
                 Some(filter_predicate.clone().and(delete_predicate))
             }
+        };
+
+        // A runtime predicate is advisory. Plan every use of it against this
+        // file first, so an unusable one leaves the planned and delete
+        // predicates in charge instead of failing the task.
+        if let Some(runtime) = &runtime_predicate
+            && let Err(error) = Self::check_runtime_predicate(
+                runtime,
+                planned_predicate.as_ref(),
+                &record_batch_stream_builder,
+                &task,
+                use_position_fallback,
+                self.row_group_filtering_enabled,
+                self.row_selection_enabled,
+                self.bloom_filter_enabled,
+            )
+        {
+            tracing::debug!(
+                "Skipping runtime predicate for {} because planning failed: {error}",
+                task.data_file_path()
+            );
+            runtime_predicate = None;
+        }
+        let final_predicate = match (planned_predicate, runtime_predicate) {
+            (None, None) => None,
+            (Some(predicate), None) | (None, Some(predicate)) => Some(predicate),
+            (Some(planned), Some(runtime)) => Some(planned.and(runtime)),
         };
 
         // There are three possible sources for potential lists of selected RowGroup indices,
@@ -695,6 +739,67 @@ impl FileScanTaskReader {
             )
             .with_source(e)
         })
+    }
+
+    /// Plans every use of a runtime predicate against this file without
+    /// changing the reader. An error means the predicate cannot be applied
+    /// exactly to this file; the caller then keeps only the planned and
+    /// delete predicates.
+    #[allow(clippy::too_many_arguments)]
+    fn check_runtime_predicate(
+        runtime_predicate: &BoundPredicate,
+        planned_predicate: Option<&BoundPredicate>,
+        builder: &ParquetRecordBatchStreamBuilder<ArrowFileReader>,
+        task: &FileScanTask,
+        use_position_fallback: bool,
+        row_group_filtering_enabled: bool,
+        row_selection_enabled: bool,
+        bloom_filter_enabled: bool,
+    ) -> Result<()> {
+        check_runtime_predicate_columns(
+            runtime_predicate,
+            builder.parquet_schema(),
+            builder.schema(),
+            task.schema(),
+            use_position_fallback,
+        )?;
+        let combined = match planned_predicate {
+            Some(planned) => planned.clone().and(runtime_predicate.clone()),
+            None => runtime_predicate.clone(),
+        };
+        let (field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
+            builder.parquet_schema(),
+            builder.schema(),
+            &combined,
+            use_position_fallback,
+        )?;
+        ArrowReader::get_row_filter(
+            &combined,
+            builder.parquet_schema(),
+            &field_ids,
+            &field_id_map,
+        )?;
+        if row_group_filtering_enabled {
+            ArrowReader::get_selected_row_group_indices(
+                runtime_predicate,
+                builder.metadata(),
+                &field_id_map,
+                task.schema(),
+            )?;
+        }
+        if row_selection_enabled {
+            ArrowReader::get_row_selection_for_filter_predicate(
+                runtime_predicate,
+                builder.metadata(),
+                &None,
+                &field_id_map,
+                task.schema(),
+            )?;
+        }
+        if bloom_filter_enabled {
+            collect_bloom_filter_field_ids(&combined)?;
+        }
+        Ok(())
     }
 
     /// Reads bloom filters for relevant columns and evaluates the predicate

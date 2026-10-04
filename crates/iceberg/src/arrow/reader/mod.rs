@@ -17,6 +17,8 @@
 
 //! Parquet file data reader
 
+use std::sync::Arc;
+
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::io::FileIO;
 use crate::runtime::Runtime;
@@ -43,6 +45,8 @@ mod projection;
 mod row_filter;
 mod row_lineage;
 mod runtime_predicate;
+#[cfg(test)]
+mod runtime_predicate_tests;
 pub use file_reader::ArrowFileReader;
 pub(crate) use options::ParquetReadOptions;
 use predicate_visitor::{CollectFieldIdVisitor, PredicateConverter};
@@ -60,6 +64,7 @@ pub struct ArrowReaderBuilder {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     bloom_filter_enabled: bool,
+    runtime_predicate_provider: Option<Arc<dyn RuntimePredicateProvider>>,
     parquet_read_options: ParquetReadOptions,
     runtime: Runtime,
 }
@@ -76,6 +81,7 @@ impl ArrowReaderBuilder {
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
             bloom_filter_enabled: false,
+            runtime_predicate_provider: None,
             parquet_read_options: ParquetReadOptions::builder().build(),
             runtime,
         }
@@ -121,6 +127,21 @@ impl ArrowReaderBuilder {
         self
     }
 
+    /// Supplies execution-time predicates, sampled when each data-file task starts.
+    ///
+    /// The sampled predicate is combined using AND with the task and
+    /// equality-delete predicates for row-group, page-index, bloom-filter and
+    /// row filtering. A provider that has nothing to publish, fails, or
+    /// publishes a predicate that cannot be applied exactly to a file leaves
+    /// that task unchanged. See [`RuntimePredicateProvider`] for the contract.
+    pub fn with_runtime_predicate_provider(
+        mut self,
+        runtime_predicate_provider: Arc<dyn RuntimePredicateProvider>,
+    ) -> Self {
+        self.runtime_predicate_provider = Some(runtime_predicate_provider);
+        self
+    }
+
     /// Provide a hint as to the number of bytes to prefetch for parsing the Parquet metadata
     ///
     /// This hint can help reduce the number of fetch requests. For more details see the
@@ -161,6 +182,7 @@ impl ArrowReaderBuilder {
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
             bloom_filter_enabled: self.bloom_filter_enabled,
+            runtime_predicate_provider: self.runtime_predicate_provider,
             parquet_read_options: self.parquet_read_options,
         }
     }
@@ -179,5 +201,6 @@ pub struct ArrowReader {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     bloom_filter_enabled: bool,
+    runtime_predicate_provider: Option<Arc<dyn RuntimePredicateProvider>>,
     parquet_read_options: ParquetReadOptions,
 }
