@@ -1646,3 +1646,80 @@ async fn runtime_predicate_with_bloom_filters_keeps_planned_equality() {
     assert_eq!(ids(&batches), vec![201]);
     assert_eq!(metrics.runtime_predicate_tasks(), 1);
 }
+
+/// Writes `groups` four-row groups of `(id, k)` with one page per row, where
+/// `k` cycles 0..4 inside every group.
+fn write_cycling_groups(path: &str, groups: i32) {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        field("id", DataType::Int32, 1),
+        field("k", DataType::Int32, 2),
+    ]));
+    let properties = WriterProperties::builder()
+        .set_compression(Compression::UNCOMPRESSED)
+        .set_max_row_group_row_count(Some(4))
+        .set_data_page_row_count_limit(1)
+        .set_write_batch_size(1)
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(path).unwrap(),
+        Arc::clone(&schema),
+        Some(properties),
+    )
+    .unwrap();
+    for group in 0..groups {
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![
+            Arc::new(Int32Array::from(
+                (group * 4..group * 4 + 4).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int32Array::from(vec![0, 1, 2, 3])),
+        ])
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.flush().unwrap();
+    }
+    writer.close().unwrap();
+}
+
+#[tokio::test]
+async fn runtime_predicate_cost_does_not_grow_with_row_groups_per_boundary() {
+    const GROUPS: i32 = 2000;
+    let temp = TempDir::new().unwrap();
+    let path = format!("{}/many-groups.parquet", temp.path().to_str().unwrap());
+    write_cycling_groups(&path, GROUPS);
+    let schema: SchemaRef = Arc::new(
+        Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "k", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let task = || scan_task(path.clone(), Arc::clone(&schema), None);
+    // `k >= 2` keeps every group (each spans 0..=3) but removes two pages of
+    // each one, the worst case for per-boundary page work.
+    let predicate = Reference::new("k").greater_than_or_equal_to(Datum::int(2));
+
+    // Stable generation from task open: no decoder rebuild at any boundary.
+    let provider = Arc::new(FixedRuntimePredicate::new(predicate.clone()));
+    let (stream, metrics) = start_runtime_scan(task(), Some(provider.clone()), true, true, 4);
+    let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    assert_eq!(ids(&batches).len(), GROUPS as usize * 2);
+    assert_eq!(provider.snapshots(), 1);
+    assert_eq!(metrics.runtime_decoder_rebuilds(), 0);
+    assert_eq!(metrics.runtime_row_groups_pruned(), 0);
+
+    // Each observed publication costs exactly one rebuild, however many
+    // boundaries follow it.
+    let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let (mut stream, metrics) = start_runtime_scan(task(), Some(provider.clone()), true, true, 4);
+    let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
+    provider.publish(Some(predicate), 1);
+    batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+    // The first group was read before the publication.
+    assert_eq!(ids(&batches).len(), 4 + (GROUPS as usize - 1) * 2);
+    assert_eq!(metrics.runtime_predicate_refreshes(), 1);
+    assert_eq!(metrics.runtime_decoder_rebuilds(), 1);
+    assert_eq!(provider.snapshots.load(Ordering::Relaxed), 2);
+}

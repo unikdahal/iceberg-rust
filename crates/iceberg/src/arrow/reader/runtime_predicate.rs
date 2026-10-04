@@ -67,13 +67,18 @@ impl RuntimePredicateSnapshot {
 ///   generations are published, so a later generation may only be equally or
 ///   more restrictive than an earlier one, or `None`. Never publish a
 ///   provisional predicate that a later generation would need to widen.
+///   `None` only stops applying an additional restriction to rows read
+///   later; it never restores row groups, pages or rows already skipped.
 /// * Generations: generations must increase whenever the predicate changes,
 ///   including changes to or from `None`. Publish the predicate before its
 ///   generation becomes visible, and pair each snapshot's predicate with its
 ///   own publication generation.
 /// * Failure: errors from [`Self::snapshot`] and predicates that cannot be bound
-///   to a task's schema are advisory. The reader then keeps the planned and
-///   delete predicates for the affected rows and never fails the scan.
+///   or applied to a file are advisory. The reader then keeps the planned and
+///   delete predicates for the affected rows and never fails the scan. A failed
+///   snapshot is cached for its generation: the reader does not retry it, and
+///   only tries again after the generation changes. Report a transient failure
+///   by publishing a new generation.
 pub trait RuntimePredicateProvider: Send + Sync {
     /// Returns the current publication generation without cloning the predicate.
     ///

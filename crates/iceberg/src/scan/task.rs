@@ -37,40 +37,23 @@ pub type FileScanTaskStream = BoxStream<'static, Result<FileScanTask>>;
 ///
 /// Bounds and counts describe the entire physical file, including when a task
 /// reads only a byte range. Missing column statistics never imply exclusion.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, Deserialize)]
+/// Infinite and NaN float bounds are dropped on construction: they are
+/// advisory, and every task serialization format can then carry the rest, so
+/// a deserialized task prunes exactly like the original.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FileScanTaskMetrics {
-    /// Number of records in the entire data file, or None when unavailable.
     #[serde(default)]
-    pub record_count: Option<u64>,
-    /// Number of values, including nulls and NaNs, by Iceberg field ID.
+    pub(crate) record_count: Option<u64>,
     #[serde(default)]
-    pub value_counts: HashMap<i32, u64>,
-    /// Number of null values by Iceberg field ID.
+    pub(crate) value_counts: HashMap<i32, u64>,
     #[serde(default)]
-    pub null_value_counts: HashMap<i32, u64>,
-    /// Number of NaN values by Iceberg field ID.
+    pub(crate) null_value_counts: HashMap<i32, u64>,
     #[serde(default)]
-    pub nan_value_counts: HashMap<i32, u64>,
-    /// Inclusive lower bounds by Iceberg field ID.
-    #[serde(default, serialize_with = "serialize_finite_bounds")]
-    pub lower_bounds: HashMap<i32, Datum>,
-    /// Inclusive upper bounds by Iceberg field ID.
-    #[serde(default, serialize_with = "serialize_finite_bounds")]
-    pub upper_bounds: HashMap<i32, Datum>,
-}
-
-/// Serializes only bounds every task format can carry. JSON has no
-/// representation for an infinite or NaN float, and a missing bound only
-/// weakens pruning, so such bounds are omitted rather than corrupted.
-fn serialize_finite_bounds<S: serde::Serializer>(
-    bounds: &HashMap<i32, Datum>,
-    serializer: S,
-) -> std::result::Result<S::Ok, S::Error> {
-    serializer.collect_map(bounds.iter().filter(|(_, bound)| match bound.literal() {
-        PrimitiveLiteral::Float(value) => value.0.is_finite(),
-        PrimitiveLiteral::Double(value) => value.0.is_finite(),
-        _ => true,
-    }))
+    pub(crate) nan_value_counts: HashMap<i32, u64>,
+    #[serde(default)]
+    pub(crate) lower_bounds: HashMap<i32, Datum>,
+    #[serde(default)]
+    pub(crate) upper_bounds: HashMap<i32, Datum>,
 }
 
 impl From<&DataFile> for FileScanTaskMetrics {
@@ -80,6 +63,64 @@ impl From<&DataFile> for FileScanTaskMetrics {
 }
 
 impl FileScanTaskMetrics {
+    /// Creates whole-file statistics keyed by Iceberg field ID. Value counts
+    /// include nulls and NaNs; bounds are inclusive.
+    pub fn new(
+        record_count: Option<u64>,
+        value_counts: HashMap<i32, u64>,
+        null_value_counts: HashMap<i32, u64>,
+        nan_value_counts: HashMap<i32, u64>,
+        lower_bounds: HashMap<i32, Datum>,
+        upper_bounds: HashMap<i32, Datum>,
+    ) -> Self {
+        fn finite(mut bounds: HashMap<i32, Datum>) -> HashMap<i32, Datum> {
+            bounds.retain(|_, bound| match bound.literal() {
+                PrimitiveLiteral::Float(value) => value.0.is_finite(),
+                PrimitiveLiteral::Double(value) => value.0.is_finite(),
+                _ => true,
+            });
+            bounds
+        }
+        Self {
+            record_count,
+            value_counts,
+            null_value_counts,
+            nan_value_counts,
+            lower_bounds: finite(lower_bounds),
+            upper_bounds: finite(upper_bounds),
+        }
+    }
+
+    /// Number of records in the entire data file, or None when unavailable.
+    pub fn record_count(&self) -> Option<u64> {
+        self.record_count
+    }
+
+    /// Number of values, including nulls and NaNs, by Iceberg field ID.
+    pub fn value_counts(&self) -> &HashMap<i32, u64> {
+        &self.value_counts
+    }
+
+    /// Number of null values by Iceberg field ID.
+    pub fn null_value_counts(&self) -> &HashMap<i32, u64> {
+        &self.null_value_counts
+    }
+
+    /// Number of NaN values by Iceberg field ID.
+    pub fn nan_value_counts(&self) -> &HashMap<i32, u64> {
+        &self.nan_value_counts
+    }
+
+    /// Inclusive lower bounds by Iceberg field ID.
+    pub fn lower_bounds(&self) -> &HashMap<i32, Datum> {
+        &self.lower_bounds
+    }
+
+    /// Inclusive upper bounds by Iceberg field ID.
+    pub fn upper_bounds(&self) -> &HashMap<i32, Datum> {
+        &self.upper_bounds
+    }
+
     /// Copies the record count and only the selected columns' statistics.
     pub(crate) fn from_data_file(file: &DataFile, selection: &ColumnStatsSelection) -> Self {
         fn select<V: Clone>(
@@ -95,14 +136,14 @@ impl FileScanTaskMetrics {
                     .collect(),
             }
         }
-        Self {
-            record_count: Some(file.record_count),
-            value_counts: select(&file.value_counts, selection),
-            null_value_counts: select(&file.null_value_counts, selection),
-            nan_value_counts: select(&file.nan_value_counts, selection),
-            lower_bounds: select(&file.lower_bounds, selection),
-            upper_bounds: select(&file.upper_bounds, selection),
-        }
+        Self::new(
+            Some(file.record_count),
+            select(&file.value_counts, selection),
+            select(&file.null_value_counts, selection),
+            select(&file.nan_value_counts, selection),
+            select(&file.lower_bounds, selection),
+            select(&file.upper_bounds, selection),
+        )
     }
 }
 
@@ -261,8 +302,8 @@ impl FileScanTask {
     }
 
     /// Returns whole-file manifest statistics, including for split tasks.
-    pub fn file_metrics(&self) -> Option<&Arc<FileScanTaskMetrics>> {
-        self.file_metrics.as_ref()
+    pub fn file_metrics(&self) -> Option<&FileScanTaskMetrics> {
+        self.file_metrics.as_deref()
     }
 
     /// Returns the first row id assigned to the data file.
@@ -701,20 +742,25 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let metrics = FileScanTaskMetrics {
-            record_count: Some(4),
-            lower_bounds: HashMap::from([
+        let metrics = FileScanTaskMetrics::new(
+            Some(4),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
                 (1, Datum::float(f32::NEG_INFINITY)),
                 (2, Datum::double(f64::NEG_INFINITY)),
                 (3, Datum::int(1)),
             ]),
-            upper_bounds: HashMap::from([
+            HashMap::from([
                 (1, Datum::float(f32::INFINITY)),
-                (2, Datum::double(f64::INFINITY)),
+                (2, Datum::double(f64::NAN)),
                 (3, Datum::int(9)),
             ]),
-            ..Default::default()
-        };
+        );
+        // Non-finite float bounds are advisory and dropped on construction.
+        assert_eq!(metrics.lower_bounds(), &HashMap::from([(3, Datum::int(1))]));
+        assert_eq!(metrics.upper_bounds(), &HashMap::from([(3, Datum::int(9))]));
         let task = FileScanTask::builder()
             .with_file_size_in_bytes(100)
             .with_start(0)
@@ -723,18 +769,16 @@ mod tests {
             .with_data_file_format(DataFileFormat::Parquet)
             .with_schema(schema)
             .with_project_field_ids(vec![1, 2, 3])
-            .with_file_metrics(Some(Arc::new(metrics)))
+            .with_file_metrics(Some(Arc::new(metrics.clone())))
             .with_case_sensitive(false)
             .build()
             .unwrap();
 
         let json = serde_json::to_string(&task).unwrap();
         let decoded: FileScanTask = serde_json::from_str(&json).unwrap();
-        let decoded = decoded.file_metrics().unwrap();
-        // Non-finite float bounds are advisory and dropped; finite ones survive.
-        assert_eq!(decoded.lower_bounds, HashMap::from([(3, Datum::int(1))]));
-        assert_eq!(decoded.upper_bounds, HashMap::from([(3, Datum::int(9))]));
-        assert_eq!(decoded.record_count, Some(4));
+        // Serialization is lossless: the round trip prunes like the original.
+        assert_eq!(decoded, task);
+        assert_eq!(decoded.file_metrics(), Some(&metrics));
     }
 
     #[test]

@@ -15,10 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Boundary-aware decoding with task-local generations. At each row-group
-//! boundary a newer runtime publication can prune the remaining row groups and
-//! refresh the next group's page selection and row filter before any of its
-//! column ranges are fetched.
+//! Boundary-aware decoding with task-local generations. At a row-group
+//! boundary after a newer runtime publication, the remaining row groups are
+//! pruned and their page selections and the row filter refreshed, before any
+//! further column ranges are fetched.
+//!
+//! Cost: a boundary with an unchanged generation costs one atomic load. Each
+//! accepted publication change costs one pass over the remaining row groups
+//! (statistics and page index) and one decoder rebuild, so a file with `R`
+//! row groups and `C` observed changes costs `O(R * C)`, independent of how
+//! many row groups a stable predicate prunes pages in.
 
 use arrow_array::RecordBatch;
 use parquet::DecodeResult;
@@ -39,9 +45,10 @@ pub(super) struct RuntimePrunedParquetStream {
     active_reader: Option<ParquetRecordBatchReader>,
     file_reader: ArrowFileReader,
     metadata: ArrowReaderMetadata,
-    /// Static page and positional-delete selections of the row groups not yet
-    /// started, in file order. Runtime page selections are never stored here,
-    /// so a later publication always starts from the static masks.
+    /// Selections installed in the decoder for the row groups not yet started,
+    /// in file order. They only ever narrow: every accepted publication stays
+    /// valid for the rest of the scan, so its page selections are intersected
+    /// into these and kept even if a later generation is `None`.
     selections: Vec<RowGroupSelection>,
     /// Planned and equality-delete predicate, built once at task open.
     base_predicate: Option<BoundPredicate>,
@@ -51,8 +58,6 @@ pub(super) struct RuntimePrunedParquetStream {
     use_position_fallback: bool,
     metrics: ScanMetrics,
     accepted_runtime: bool,
-    /// The next row group whose runtime page selection is already installed.
-    prepared_next: Option<usize>,
 }
 
 impl RuntimePrunedParquetStream {
@@ -90,34 +95,17 @@ impl RuntimePrunedParquetStream {
             use_position_fallback,
             metrics,
             accepted_runtime,
-            prepared_next: None,
         }
-    }
-
-    fn decoder(&self) -> &ParquetPushDecoder {
-        self.decoder
-            .as_ref()
-            .expect("decoder exists while streaming")
     }
 
     fn refresh_at_boundary(&mut self) -> Result<()> {
-        let decoder = self.decoder();
+        let decoder = self
+            .decoder
+            .as_ref()
+            .expect("decoder exists while streaming");
         if !decoder.is_at_row_group_boundary() || decoder.row_groups_remaining() == 0 {
             return Ok(());
         }
-        // The decoder may skip groups internally, for example when a static
-        // selection is empty. Keep the local plan in lock-step with it.
-        let Some(next) = decoder.peek_next_row_group()? else {
-            self.selections.clear();
-            return Ok(());
-        };
-        let started = self
-            .selections
-            .iter()
-            .take_while(|selection| selection.row_group_index() != next)
-            .count();
-        self.selections.drain(..started);
-
         let changed = match self
             .runtime
             .refresh_if_changed(self.task.schema_ref(), self.task.case_sensitive())
@@ -137,22 +125,44 @@ impl RuntimePrunedParquetStream {
                 true
             }
         };
-        if changed && let Some(predicate) = self.runtime.predicate().cloned() {
-            let usable = check_runtime_predicate_columns(
+        if !changed {
+            return Ok(());
+        }
+
+        // Bring the local plan in lock-step with the decoder, which may have
+        // skipped groups internally (for example an empty static selection).
+        let Some(next) = decoder.peek_next_row_group()? else {
+            self.selections.clear();
+            return Ok(());
+        };
+        let started = self
+            .selections
+            .iter()
+            .take_while(|selection| selection.row_group_index() != next)
+            .count();
+        self.selections.drain(..started);
+
+        if let Some(predicate) = self.runtime.predicate().cloned() {
+            let restricted = check_runtime_predicate_columns(
                 &predicate,
                 self.metadata.metadata().file_metadata().schema_descr(),
                 self.metadata.schema(),
                 self.task.schema(),
                 self.use_position_fallback,
             )
-            .and_then(|()| self.matching_row_groups(&predicate));
-            match usable {
-                Ok(keep) => {
+            .and_then(|()| self.restrict_remaining(&predicate));
+            match restricted {
+                Ok(selections) => {
                     if !self.accepted_runtime {
                         self.metrics.record_runtime_predicate_task();
                         self.accepted_runtime = true;
                     }
-                    self.prune_remaining(keep, next)?
+                    self.metrics
+                        .record_runtime_row_groups_considered(self.selections.len());
+                    self.metrics.record_runtime_row_groups_pruned_live(
+                        self.selections.len() - selections.len(),
+                    );
+                    self.selections = selections;
                 }
                 Err(error) => {
                     tracing::debug!(
@@ -163,19 +173,21 @@ impl RuntimePrunedParquetStream {
                 }
             }
         }
-        self.prepare_next_row_group(changed)
+        self.rebuild_decoder(next)
     }
 
-    /// Returns the remaining selections whose statistics might match
-    /// `predicate`. An error makes the predicate advisory-only for this task.
-    fn matching_row_groups(&self, predicate: &BoundPredicate) -> Result<Vec<RowGroupSelection>> {
+    /// Returns the remaining selections narrowed by `predicate`: row groups
+    /// whose statistics cannot match are dropped, and the page selections of
+    /// the rest are intersected with the predicate's page selections. An error
+    /// makes the predicate unusable for this file.
+    fn restrict_remaining(&self, predicate: &BoundPredicate) -> Result<Vec<RowGroupSelection>> {
         let (_, field_id_map) = ArrowReader::build_field_id_set_and_map(
             self.metadata.metadata().file_metadata().schema_descr(),
             self.metadata.schema(),
             predicate,
             self.use_position_fallback,
         )?;
-        let mut keep = Vec::with_capacity(self.selections.len());
+        let mut kept = Vec::with_capacity(self.selections.len());
         for selection in &self.selections {
             if RowGroupMetricsEvaluator::eval(
                 predicate,
@@ -185,111 +197,69 @@ impl RuntimePrunedParquetStream {
                 &field_id_map,
                 self.task.schema(),
             )? {
-                keep.push(selection.clone());
+                kept.push(selection.clone());
             }
         }
-        self.metrics
-            .record_runtime_row_groups_considered(self.selections.len());
-        Ok(keep)
+        if !self.row_selection_enabled || kept.is_empty() {
+            return Ok(kept);
+        }
+        let indices: Vec<usize> = kept
+            .iter()
+            .map(RowGroupSelection::row_group_index)
+            .collect();
+        let pages = match ArrowReader::get_row_group_selections_for_filter_predicate(
+            Some(predicate),
+            &self.metadata,
+            &indices,
+            self.task.schema(),
+            self.use_position_fallback,
+        ) {
+            Ok(pages) => pages,
+            Err(error) => {
+                // Row-group pruning stays valid without page refinement.
+                tracing::debug!(
+                    "Skipping live page pruning for {}: {error}",
+                    self.task.data_file_path()
+                );
+                return Ok(kept);
+            }
+        };
+        Ok(kept
+            .into_iter()
+            .zip(pages)
+            .map(|(current, runtime)| {
+                debug_assert_eq!(current.row_group_index(), runtime.row_group_index());
+                let combined = match (current.selection(), runtime.selection()) {
+                    (Some(current), Some(runtime)) => Some(current.intersection(runtime)),
+                    (Some(current), None) => Some(current.clone()),
+                    (None, runtime) => runtime.cloned(),
+                };
+                RowGroupSelection::new(current.row_group_index(), combined)
+            })
+            .collect())
     }
 
-    /// Rebuilds the decoder over `keep` when it removes any remaining group.
-    fn prune_remaining(&mut self, keep: Vec<RowGroupSelection>, next: usize) -> Result<()> {
-        let pruned = self.selections.len() - keep.len();
-        if pruned == 0 {
-            return Ok(());
-        }
-        let next_pruned = keep
+    /// Rebuilds the decoder once with the current selections and the row
+    /// filter for the current publication.
+    fn rebuild_decoder(&mut self, next: usize) -> Result<()> {
+        // Compile before taking the decoder, so an error cannot lose it.
+        let row_filter = self.compile_row_filter()?;
+        let next_pruned = self
+            .selections
             .first()
             .is_none_or(|selection| selection.row_group_index() != next);
         let decoder = self.decoder.take().expect("decoder exists while streaming");
         let mut decoder = decoder
             .into_builder()?
-            .with_row_group_selections(keep.clone())
+            .with_row_group_selections(self.selections.clone())
+            .with_row_filter(row_filter)
             .build()?;
         if next_pruned {
             // Only the next group's ranges can be buffered at a boundary.
             decoder.clear_all_ranges();
         }
         self.decoder = Some(decoder);
-        self.selections = keep;
-        self.prepared_next = None;
-        self.metrics.record_runtime_row_groups_pruned_live(pruned);
-        Ok(())
-    }
-
-    /// Installs the next row group's runtime page selection and, after a
-    /// publication change, the matching row filter. Rebuilding passes every
-    /// remaining selection, so each rebuild is linear in the remaining groups;
-    /// rebuilds happen only on a publication change or a page reduction.
-    fn prepare_next_row_group(&mut self, changed: bool) -> Result<()> {
-        let Some(next) = self
-            .selections
-            .first()
-            .map(RowGroupSelection::row_group_index)
-        else {
-            return Ok(());
-        };
-        if !changed
-            && (!self.row_selection_enabled
-                || self.prepared_next == Some(next)
-                || self.runtime.predicate().is_none())
-        {
-            return Ok(());
-        }
-        let runtime_selection = match self.runtime.predicate() {
-            Some(predicate) if self.row_selection_enabled => {
-                // Evaluate only the next group's pages. A stable predicate with no
-                // page reduction keeps the existing decoder.
-                match ArrowReader::get_row_group_selections_for_filter_predicate(
-                    Some(predicate),
-                    &self.metadata,
-                    &[next],
-                    self.task.schema(),
-                    self.use_position_fallback,
-                ) {
-                    Ok(runtime) => runtime[0].selection().cloned(),
-                    Err(error) => {
-                        tracing::debug!(
-                            "Skipping live page pruning for {}: {error}",
-                            self.task.data_file_path()
-                        );
-                        None
-                    }
-                }
-            }
-            _ => None,
-        };
-        if !changed
-            && runtime_selection
-                .as_ref()
-                .is_none_or(|selection| selection.skipped_row_count() == 0)
-        {
-            self.prepared_next = Some(next);
-            return Ok(());
-        }
-        let mut selections = self.selections.clone();
-        if let Some(runtime) = runtime_selection {
-            let combined = match selections[0].selection() {
-                Some(base) => base.intersection(&runtime),
-                None => runtime,
-            };
-            selections[0] = RowGroupSelection::new(next, Some(combined));
-        }
-        let row_filter = if changed {
-            Some(self.compile_row_filter()?)
-        } else {
-            None
-        };
-        let decoder = self.decoder.take().expect("decoder exists while streaming");
-        let mut builder = decoder
-            .into_builder()?
-            .with_row_group_selections(selections);
-        if let Some(filter) = row_filter {
-            builder = builder.with_row_filter(filter);
-        }
-        self.decoder = Some(builder.build()?);
-        self.prepared_next = Some(next);
+        self.metrics.record_runtime_decoder_rebuild();
         Ok(())
     }
 
@@ -347,10 +317,7 @@ impl RuntimePrunedParquetStream {
                     let bytes = self.file_reader.get_byte_ranges(ranges.clone()).await?;
                     decoder.push_ranges(ranges, bytes)?;
                 }
-                DecodeResult::Data(reader) => {
-                    // The next boundary drops this group from the unstarted plan.
-                    self.active_reader = Some(reader);
-                }
+                DecodeResult::Data(reader) => self.active_reader = Some(reader),
                 DecodeResult::Finished => return Ok(None),
             }
         }

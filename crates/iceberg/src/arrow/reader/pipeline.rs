@@ -747,8 +747,10 @@ impl FileScanTaskReader {
             // Positional-delete masks and live pruning walk groups in file order.
             remaining.sort_unstable();
             remaining.dedup();
+            // Page selections for the task-open snapshot are installed once
+            // here; later publications only narrow them.
             let mut selections = ArrowReader::get_row_group_selections_for_filter_predicate(
-                base_predicate
+                final_predicate
                     .as_ref()
                     .filter(|_| self.row_selection_enabled),
                 &metadata,

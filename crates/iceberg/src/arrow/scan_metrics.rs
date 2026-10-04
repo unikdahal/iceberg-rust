@@ -62,6 +62,7 @@ pub struct ScanMetrics {
     runtime_live_pruning_tasks: Arc<AtomicU64>,
     runtime_predicate_refreshes: Arc<AtomicU64>,
     runtime_row_groups_pruned_live: Arc<AtomicU64>,
+    runtime_decoder_rebuilds: Arc<AtomicU64>,
 }
 
 impl ScanMetrics {
@@ -77,6 +78,7 @@ impl ScanMetrics {
             runtime_live_pruning_tasks: Arc::new(AtomicU64::new(0)),
             runtime_predicate_refreshes: Arc::new(AtomicU64::new(0)),
             runtime_row_groups_pruned_live: Arc::new(AtomicU64::new(0)),
+            runtime_decoder_rebuilds: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -131,6 +133,17 @@ impl ScanMetrics {
     pub(crate) fn record_runtime_predicate_refresh(&self) {
         self.runtime_predicate_refreshes
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_runtime_decoder_rebuild(&self) {
+        self.runtime_decoder_rebuilds
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Decoder rebuilds after runtime publication changes.
+    #[cfg(test)]
+    pub(crate) fn runtime_decoder_rebuilds(&self) -> u64 {
+        self.runtime_decoder_rebuilds.load(Ordering::Relaxed)
     }
 
     pub(crate) fn record_runtime_row_groups_pruned_live(&self, count: usize) {
