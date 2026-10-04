@@ -48,6 +48,10 @@ jobs:
       - name: Check Iceberg formatting
         working-directory: iceberg
         run: cargo +nightly-2026-04-16 fmt --all -- --check
+      - name: Resolve the exact backported Parquet version
+        working-directory: iceberg
+        run: |
+          cargo +stable --config "patch.crates-io.parquet.path=\"$GITHUB_WORKSPACE/arrow/parquet\"" update -p parquet --precise 59.2.0
       - name: Run live runtime and delete tests with local selections
         working-directory: iceberg
         run: |
