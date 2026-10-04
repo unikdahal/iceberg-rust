@@ -106,6 +106,9 @@ pub fn iceberg::arrow::RuntimePredicateSnapshot::fmt(&self, f: &mut core::fmt::F
 pub struct iceberg::arrow::ScanMetrics
 impl iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanMetrics::bytes_read(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::runtime_live_pruning_tasks(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::runtime_live_row_groups_pruned(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::runtime_predicate_refreshes(&self) -> u64
 pub fn iceberg::scan::ScanMetrics::runtime_predicate_tasks(&self) -> u64
 pub fn iceberg::scan::ScanMetrics::runtime_row_groups_pruned(&self) -> u64
 impl core::clone::Clone for iceberg::scan::ScanMetrics
@@ -1355,6 +1358,9 @@ pub fn iceberg::scan::FileScanTaskDeleteFile::deserialize<__D>(__deserializer: _
 pub struct iceberg::scan::ScanMetrics
 impl iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanMetrics::bytes_read(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::runtime_live_pruning_tasks(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::runtime_live_row_groups_pruned(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::runtime_predicate_refreshes(&self) -> u64
 pub fn iceberg::scan::ScanMetrics::runtime_predicate_tasks(&self) -> u64
 pub fn iceberg::scan::ScanMetrics::runtime_row_groups_pruned(&self) -> u64
 impl core::clone::Clone for iceberg::scan::ScanMetrics

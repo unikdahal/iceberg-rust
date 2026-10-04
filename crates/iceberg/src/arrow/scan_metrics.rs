@@ -55,6 +55,9 @@ pub struct ScanMetrics {
     bytes_read: Arc<AtomicU64>,
     runtime_predicate_tasks: Arc<AtomicU64>,
     runtime_row_groups_pruned: Arc<AtomicU64>,
+    runtime_live_pruning_tasks: Arc<AtomicU64>,
+    runtime_predicate_refreshes: Arc<AtomicU64>,
+    runtime_live_row_groups_pruned: Arc<AtomicU64>,
 }
 
 impl ScanMetrics {
@@ -63,6 +66,9 @@ impl ScanMetrics {
             bytes_read: Arc::new(AtomicU64::new(0)),
             runtime_predicate_tasks: Arc::new(AtomicU64::new(0)),
             runtime_row_groups_pruned: Arc::new(AtomicU64::new(0)),
+            runtime_live_pruning_tasks: Arc::new(AtomicU64::new(0)),
+            runtime_predicate_refreshes: Arc::new(AtomicU64::new(0)),
+            runtime_live_row_groups_pruned: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -76,6 +82,22 @@ impl ScanMetrics {
 
     pub(crate) fn record_runtime_row_groups_pruned(&self, count: usize) {
         self.runtime_row_groups_pruned
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_runtime_live_pruning_task(&self) {
+        self.runtime_live_pruning_tasks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_runtime_predicate_refresh(&self) {
+        self.runtime_predicate_refreshes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_runtime_live_row_groups_pruned(&self, count: usize) {
+        self.record_runtime_row_groups_pruned(count);
+        self.runtime_live_row_groups_pruned
             .fetch_add(count as u64, Ordering::Relaxed);
     }
 
@@ -93,6 +115,22 @@ impl ScanMetrics {
     /// task byte ranges and static or equality-delete predicates are applied.
     pub fn runtime_row_groups_pruned(&self) -> u64 {
         self.runtime_row_groups_pruned.load(Ordering::Relaxed)
+    }
+
+    /// Number of tasks using boundary-aware live pruning rather than snapshot fallback.
+    pub fn runtime_live_pruning_tasks(&self) -> u64 {
+        self.runtime_live_pruning_tasks.load(Ordering::Relaxed)
+    }
+
+    /// Successful post-start runtime publication refreshes, including `None` predicates.
+    pub fn runtime_predicate_refreshes(&self) -> u64 {
+        self.runtime_predicate_refreshes.load(Ordering::Relaxed)
+    }
+
+    /// Additional row groups removed at live boundaries. Also included in
+    /// [`Self::runtime_row_groups_pruned`].
+    pub fn runtime_live_row_groups_pruned(&self) -> u64 {
+        self.runtime_live_row_groups_pruned.load(Ordering::Relaxed)
     }
 }
 

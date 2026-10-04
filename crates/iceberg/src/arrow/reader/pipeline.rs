@@ -27,6 +27,7 @@ use std::sync::atomic::AtomicU64;
 use arrow_schema::{DataType, Field};
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::arrow::push_decoder::ParquetPushDecoderBuilder;
 use parquet::arrow::{
     PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask, RowNumber,
 };
@@ -34,6 +35,7 @@ use parquet::encryption::decrypt::FileDecryptionProperties;
 
 use super::row_lineage::synthesize_row_id_column;
 use super::runtime_predicate::RuntimePredicateState;
+use super::runtime_stream::RuntimePrunedParquetStream;
 use super::{
     ArrowFileReader, ArrowReader, ParquetReadOptions, RuntimePredicateProvider,
     add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
@@ -321,6 +323,14 @@ impl FileScanTaskReader {
         };
 
         // Build the stream reader, reusing the already-opened file reader
+        let (parquet_file_reader, live_file_reader) =
+            if runtime_state.is_some() && self.row_group_filtering_enabled {
+                let (planning, live) = parquet_file_reader.into_shared();
+                (planning, Some(live))
+            } else {
+                (parquet_file_reader, None)
+            };
+        let live_metadata = live_file_reader.as_ref().map(|_| arrow_metadata.clone());
         let mut record_batch_stream_builder =
             ParquetRecordBatchStreamBuilder::new_with_metadata(parquet_file_reader, arrow_metadata);
 
@@ -626,6 +636,7 @@ impl FileScanTaskReader {
         // by using a `RowSelection`.
         let mut selected_row_group_indices = None;
         let mut row_selection = None;
+        let mut planned_row_filter = None;
 
         // Filter row groups based on byte range from task.start and task.length.
         // If both start and length are 0, read the entire file (backwards compatibility).
@@ -652,7 +663,7 @@ impl FileScanTaskReader {
                 &iceberg_field_ids,
                 &field_id_map,
             )?;
-            record_batch_stream_builder = record_batch_stream_builder.with_row_filter(row_filter);
+            planned_row_filter = Some(row_filter);
 
             if self.row_group_filtering_enabled {
                 if let Some(base_predicate) = &base_predicate {
@@ -747,23 +758,58 @@ impl FileScanTaskReader {
             };
         }
 
-        if let Some(row_selection) = row_selection {
-            record_batch_stream_builder =
-                record_batch_stream_builder.with_row_selection(row_selection);
-        }
-
-        if let Some(selected_row_group_indices) = selected_row_group_indices {
-            record_batch_stream_builder =
-                record_batch_stream_builder.with_row_groups(selected_row_group_indices);
-        }
-
         // Build the batch stream and send all the RecordBatches that it generates
         // to the requester. When `_row_id` is projected, synthesize it over the raw parquet
         // batches (using the reader-produced `_pos` position) before the transformer, which
         // then passes it through as a virtual field.
         let first_row_id = task.first_row_id();
-        let record_batch_stream = record_batch_stream_builder.build()?.map(move |batch| {
-            let mut batch = batch.map_err(|err| -> Error { err.into() })?;
+        let raw_stream: ArrowRecordBatchStream = if runtime_state.is_some()
+            && self.row_group_filtering_enabled
+            && row_selection.is_none()
+        {
+            let metadata = live_metadata.expect("metadata retained for live-capable task");
+            let remaining = selected_row_group_indices
+                .unwrap_or_else(|| (0..metadata.metadata().num_row_groups()).collect());
+            let mut builder = ParquetPushDecoderBuilder::new_with_metadata(metadata.clone())
+                .with_projection(projection_mask)
+                .with_row_groups(remaining.clone());
+            if let Some(batch_size) = self.batch_size {
+                builder = builder.with_batch_size(batch_size);
+            }
+            if let Some(row_filter) = planned_row_filter {
+                builder = builder.with_row_filter(row_filter);
+            }
+            RuntimePrunedParquetStream::new(
+                builder.build()?,
+                live_file_reader.expect("reader retained for live-capable task"),
+                metadata,
+                remaining,
+                runtime_state.expect("provider checked for live-capable task"),
+                task,
+                use_position_fallback,
+                self.scan_metrics.clone(),
+            )
+            .into_stream()
+        } else {
+            // A flattened page/position selection has coordinates in the
+            // original selected groups. Keep task-open pruning until the
+            // selection is represented per row group.
+            if let Some(row_selection) = row_selection {
+                record_batch_stream_builder =
+                    record_batch_stream_builder.with_row_selection(row_selection);
+            }
+            if let Some(row_groups) = selected_row_group_indices {
+                record_batch_stream_builder =
+                    record_batch_stream_builder.with_row_groups(row_groups);
+            }
+            if let Some(row_filter) = planned_row_filter {
+                record_batch_stream_builder =
+                    record_batch_stream_builder.with_row_filter(row_filter);
+            }
+            Box::pin(record_batch_stream_builder.build()?.map_err(Error::from))
+        };
+        let record_batch_stream = raw_stream.map(move |batch| {
+            let mut batch = batch?;
             if project_row_id {
                 batch = synthesize_row_id_column(batch, first_row_id)?;
             }

@@ -47,6 +47,7 @@ mod row_lineage;
 mod runtime_predicate;
 #[cfg(test)]
 mod runtime_predicate_tests;
+mod runtime_stream;
 pub use file_reader::ArrowFileReader;
 pub(crate) use options::ParquetReadOptions;
 use predicate_visitor::{CollectFieldIdVisitor, PredicateConverter};
@@ -127,11 +128,14 @@ impl ArrowReaderBuilder {
         self
     }
 
-    /// Supplies an execution-time predicate source sampled once for each data-file task.
+    /// Supplies an execution-time predicate source sampled when each data-file task starts.
     ///
     /// The sampled predicate is combined using AND with task and delete predicates before
     /// row-group, page-index, bloom-filter, and row filtering. Returning no predicate leaves
     /// the task unchanged.
+    /// When row-group filtering is enabled and no page or positional-delete
+    /// `RowSelection` is active, newer generations can prune unread row groups.
+    /// Otherwise the task keeps its start-time snapshot for the whole stream.
     pub fn with_runtime_predicate_provider(
         mut self,
         runtime_predicate_provider: Arc<dyn RuntimePredicateProvider>,
