@@ -73,6 +73,28 @@ impl BasicDeleteFileLoader {
            Essentially a super-cut-down ArrowReader. We can't use ArrowReader directly
            as that introduces a circular dependency.
         */
+        // Some execution engines omit delete-file sizes and require the real
+        // object size, rather than the occasionally inaccurate manifest size.
+        // Resolve it lazily inside the cached loader, after runtime file pruning.
+        let file_size_in_bytes = if file_size_in_bytes == 0 {
+            let size = self
+                .file_io
+                .new_input(data_file_path)?
+                .metadata()
+                .await?
+                .size;
+            if size < 8 {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Delete file '{data_file_path}' has {size} bytes, below the Parquet footer minimum"
+                    ),
+                ));
+            }
+            size
+        } else {
+            file_size_in_bytes
+        };
         let parquet_read_options = ParquetReadOptions::builder().build();
 
         let (parquet_file_reader, arrow_metadata) = ArrowReader::open_parquet_file(
@@ -334,5 +356,31 @@ mod tests {
         let batches: Vec<_> = result.try_collect().await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);
+    }
+}
+
+#[cfg(test)]
+mod lazy_size_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unknown_delete_size_still_reports_missing_and_empty_objects() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let loader = BasicDeleteFileLoader::new(FileIO::new_with_fs(), ScanMetrics::new());
+        let missing = temp.path().join("missing.parquet");
+        assert!(
+            loader
+                .parquet_to_batch_stream(missing.to_str().unwrap(), 0, None)
+                .await
+                .is_err()
+        );
+        let empty = temp.path().join("empty.parquet");
+        std::fs::write(&empty, []).unwrap();
+        let error = loader
+            .parquet_to_batch_stream(empty.to_str().unwrap(), 0, None)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("footer minimum"));
     }
 }
