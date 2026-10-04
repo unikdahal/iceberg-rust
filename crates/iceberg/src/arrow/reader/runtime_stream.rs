@@ -228,20 +228,12 @@ impl RuntimePrunedParquetStream {
         {
             return Ok(());
         }
-        let mut selections: Vec<_> = base_selections
-            .iter()
-            .filter(|selection| {
-                self.remaining
-                    .iter()
-                    .any(|&idx| idx == selection.row_group_index())
-            })
-            .cloned()
-            .collect();
-        if self.row_selection_enabled
+        let runtime_selection = if self.row_selection_enabled
             && let Some(predicate) = self.runtime.predicate()
         {
-            // Evaluate pages only for the next group, using its local coordinates.
-            // A missing/unsupported page index leaves the static/delete mask intact.
+            // Evaluate only the next group's pages before cloning remaining
+            // static/delete masks. A stable predicate with no page reduction
+            // can keep the existing decoder and its next static selection.
             match ArrowReader::get_row_group_selections_for_filter_predicate(
                 Some(predicate),
                 &self.metadata,
@@ -249,24 +241,47 @@ impl RuntimePrunedParquetStream {
                 self.task.schema(),
                 self.use_position_fallback,
             ) {
-                Ok(runtime) => {
-                    let selection = selections
-                        .iter_mut()
-                        .find(|selection| selection.row_group_index() == next)
-                        .expect("remaining group has its static selection");
-                    let combined = match (selection.selection(), runtime[0].selection()) {
-                        (Some(base), Some(runtime)) => Some(base.intersection(runtime)),
-                        (None, Some(runtime)) => Some(runtime.clone()),
-                        (Some(base), None) => Some(base.clone()),
-                        (None, None) => None,
-                    };
-                    *selection = RowGroupSelection::new(next, combined);
+                Ok(runtime) => runtime[0].selection().cloned(),
+                Err(error) => {
+                    tracing::debug!(
+                        "Skipping live page pruning for {}: {error}",
+                        self.task.data_file_path()
+                    );
+                    None
                 }
-                Err(error) => tracing::debug!(
-                    "Skipping live page pruning for {}: {error}",
-                    self.task.data_file_path()
-                ),
             }
+        } else {
+            None
+        };
+        if !changed
+            && runtime_selection
+                .as_ref()
+                .is_none_or(|selection| selection.skipped_row_count() == 0)
+        {
+            self.prepared_next = Some(next);
+            return Ok(());
+        }
+        let mut selections: Vec<_> = base_selections
+            .iter()
+            .filter(|selection| {
+                // Task candidates are produced in file order; pruning and
+                // prefix consumption preserve that order in the deque.
+                self.remaining
+                    .binary_search(&selection.row_group_index())
+                    .is_ok()
+            })
+            .cloned()
+            .collect();
+        if let Some(runtime) = runtime_selection {
+            let selection = selections
+                .iter_mut()
+                .find(|selection| selection.row_group_index() == next)
+                .expect("remaining group has its static selection");
+            let combined = match selection.selection() {
+                Some(base) => base.intersection(&runtime),
+                None => runtime,
+            };
+            *selection = RowGroupSelection::new(next, Some(combined));
         }
         let row_filter = if changed {
             let effective = match (&self.base_predicate, self.runtime.predicate()) {

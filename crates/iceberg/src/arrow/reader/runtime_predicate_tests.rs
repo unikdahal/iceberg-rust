@@ -961,6 +961,19 @@ async fn runtime_predicate_live_preserves_delete_and_position_matrix() {
         );
         let (baseline, baseline_metrics) = start_runtime_scan(task.clone(), None, true, true, 1);
         let full = baseline.try_collect::<Vec<_>>().await.unwrap();
+        // A stable bound covering every row should preserve the already
+        // installed static page/delete masks without rebuilding the decoder.
+        let stable_provider = Arc::new(ChangingRuntimePredicate::new(
+            Some(Reference::new("id").greater_than_or_equal_to(Datum::int(0))),
+            0,
+        ));
+        let (stable_stream, stable_metrics) =
+            start_runtime_scan(task.clone(), Some(stable_provider.clone()), true, true, 1);
+        let stable = stable_stream.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(stable, full);
+        assert_eq!(stable_provider.snapshots.load(Ordering::Relaxed), 1);
+        assert_eq!(stable_metrics.runtime_predicate_refreshes(), 0);
+        assert_eq!(stable_metrics.runtime_row_groups_pruned(), 0);
         let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
         let (mut stream, metrics) = start_runtime_scan(task, Some(provider.clone()), true, true, 1);
         let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
