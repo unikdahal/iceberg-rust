@@ -1,8 +1,8 @@
 # Parquet row-group-local selection backport
 
 This patch carries the generic Arrow 60 row-group-local selection API onto
-Arrow/Parquet 59.2.0, based on Arrow commit
-`782e5a685501a9db6cc8e9a3b7cbff894940c47a`.
+Arrow/Parquet 59.3.0, based on Arrow commit
+`f90e061326bd821a7af09281d9e92de6f3b603d9`.
 DataFusion 55.1 requires Arrow 59.2, so upgrading only Parquet to 60 would
 introduce incompatible Arrow types.
 
@@ -17,7 +17,7 @@ groups, bitmap and RLE selections, empty selections, row filters, offset/limit,
 invalid group indices and lengths, conflicting builder options, and rebuilding
 with unconsumed local selections.
 
-Parquet's manifest uses the registry dependencies from the published 59.2.0
+Parquet's manifest uses the registry dependencies from the published 59.3.0
 crate. This prevents a git-patched Parquet dependency from pulling a second
 copy of the Arrow types used by DataFusion and Iceberg.
 
