@@ -80,13 +80,24 @@ impl BasicDeleteFileLoader {
                 .file_io
                 .new_input(data_file_path)?
                 .metadata()
-                .await?
+                .await
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!("Failed to stat delete file '{data_file_path}'"),
+                    )
+                    .with_source(error)
+                })?
                 .size;
+            // A store can report 0 for a HEAD without Content-Length; never read
+            // such a file as if it had no deletes.
             if size < 8 {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     format!(
-                        "Delete file '{data_file_path}' has {size} bytes, below the Parquet footer minimum"
+                        "Delete file '{data_file_path}' has {size} bytes, below the Parquet footer \
+                         minimum. The object is empty or truncated, or its stat returned no \
+                         Content-Length."
                     ),
                 ));
             }
@@ -362,12 +373,12 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let loader = BasicDeleteFileLoader::new(FileIO::new_with_fs(), ScanMetrics::new());
         let missing = temp.path().join("missing.parquet");
-        assert!(
-            loader
-                .parquet_to_batch_stream(missing.to_str().unwrap(), 0, None)
-                .await
-                .is_err()
-        );
+        let error = loader
+            .parquet_to_batch_stream(missing.to_str().unwrap(), 0, None)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("Failed to stat delete file"));
         let empty = temp.path().join("empty.parquet");
         std::fs::write(&empty, []).unwrap();
         let error = loader
