@@ -1353,7 +1353,7 @@ pub fn iceberg::scan::FileScanTask::data_file_format(&self) -> iceberg::spec::Da
 pub fn iceberg::scan::FileScanTask::data_file_path(&self) -> &str
 pub fn iceberg::scan::FileScanTask::data_sequence_number(&self) -> core::option::Option<i64>
 pub fn iceberg::scan::FileScanTask::deletes(&self) -> &[iceberg::scan::FileScanTaskDeleteFile]
-pub fn iceberg::scan::FileScanTask::file_metrics(&self) -> core::option::Option<&alloc::sync::Arc<iceberg::scan::FileScanTaskMetrics>>
+pub fn iceberg::scan::FileScanTask::file_metrics(&self) -> core::option::Option<&iceberg::scan::FileScanTaskMetrics>
 pub fn iceberg::scan::FileScanTask::file_size_in_bytes(&self) -> u64
 pub fn iceberg::scan::FileScanTask::first_row_id(&self) -> core::option::Option<i64>
 pub fn iceberg::scan::FileScanTask::key_metadata(&self) -> core::option::Option<&[u8]>
@@ -1411,12 +1411,14 @@ pub fn iceberg::scan::FileScanTaskDeleteFile::serialize<__S>(&self, __serializer
 impl<'de> serde_core::de::Deserialize<'de> for iceberg::scan::FileScanTaskDeleteFile
 pub fn iceberg::scan::FileScanTaskDeleteFile::deserialize<__D>(__deserializer: __D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 pub struct iceberg::scan::FileScanTaskMetrics
-pub iceberg::scan::FileScanTaskMetrics::lower_bounds: std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>
-pub iceberg::scan::FileScanTaskMetrics::nan_value_counts: std::collections::hash::map::HashMap<i32, u64>
-pub iceberg::scan::FileScanTaskMetrics::null_value_counts: std::collections::hash::map::HashMap<i32, u64>
-pub iceberg::scan::FileScanTaskMetrics::record_count: core::option::Option<u64>
-pub iceberg::scan::FileScanTaskMetrics::upper_bounds: std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>
-pub iceberg::scan::FileScanTaskMetrics::value_counts: std::collections::hash::map::HashMap<i32, u64>
+impl iceberg::scan::FileScanTaskMetrics
+pub fn iceberg::scan::FileScanTaskMetrics::lower_bounds(&self) -> &std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>
+pub fn iceberg::scan::FileScanTaskMetrics::nan_value_counts(&self) -> &std::collections::hash::map::HashMap<i32, u64>
+pub fn iceberg::scan::FileScanTaskMetrics::new(record_count: core::option::Option<u64>, value_counts: std::collections::hash::map::HashMap<i32, u64>, null_value_counts: std::collections::hash::map::HashMap<i32, u64>, nan_value_counts: std::collections::hash::map::HashMap<i32, u64>, lower_bounds: std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>, upper_bounds: std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>) -> Self
+pub fn iceberg::scan::FileScanTaskMetrics::null_value_counts(&self) -> &std::collections::hash::map::HashMap<i32, u64>
+pub fn iceberg::scan::FileScanTaskMetrics::record_count(&self) -> core::option::Option<u64>
+pub fn iceberg::scan::FileScanTaskMetrics::upper_bounds(&self) -> &std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>
+pub fn iceberg::scan::FileScanTaskMetrics::value_counts(&self) -> &std::collections::hash::map::HashMap<i32, u64>
 impl core::clone::Clone for iceberg::scan::FileScanTaskMetrics
 pub fn iceberg::scan::FileScanTaskMetrics::clone(&self) -> iceberg::scan::FileScanTaskMetrics
 impl core::cmp::PartialEq for iceberg::scan::FileScanTaskMetrics
