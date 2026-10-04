@@ -1132,7 +1132,7 @@ async fn runtime_predicate_live_pages_save_key_bytes_without_pruning_groups() {
     for pages in [false, true] {
         let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
         let (mut stream, metrics) =
-            start_runtime_scan(task.clone(), Some(provider.clone()), pages, true, 4096);
+            start_runtime_scan(task.clone(), Some(provider.clone()), pages, true, 128);
         let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
         provider.publish(
             Some(Reference::new("id").greater_than_or_equal_to(Datum::int(3072))),
@@ -1147,7 +1147,9 @@ async fn runtime_predicate_live_pages_save_key_bytes_without_pruning_groups() {
         results.push(metrics.bytes_read());
     }
     // Both executions install the same changing row filter and retain every RG.
-    // Only page-index selection can save physical key-column reads here.
+    // Align decoder batches with pages: predicate-cache reads expand selected
+    // output keys to batch boundaries, so a whole-RG batch would hide page I/O
+    // savings. Only page-index selection saves physical key-column reads here.
     assert!(
         results[1] < results[0],
         "pages={} rows-only={}",
