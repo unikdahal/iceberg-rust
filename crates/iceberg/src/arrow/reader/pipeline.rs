@@ -781,7 +781,7 @@ impl FileScanTaskReader {
             #[cfg(feature = "runtime-row-group-selections")]
             let mut local_selections = if use_local_selections {
                 Some(ArrowReader::get_row_group_selections_for_filter_predicate(
-                    final_predicate
+                    base_predicate
                         .as_ref()
                         .filter(|_| self.row_selection_enabled),
                     &metadata,
@@ -842,7 +842,11 @@ impl FileScanTaskReader {
             );
             #[cfg(feature = "runtime-row-group-selections")]
             let stream = if let Some(selections) = local_selections {
-                stream.with_row_group_selections(selections)
+                stream.with_row_group_selections(
+                    selections,
+                    base_predicate,
+                    self.row_selection_enabled,
+                )
             } else {
                 stream
             };

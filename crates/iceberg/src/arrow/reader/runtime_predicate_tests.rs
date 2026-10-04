@@ -1073,3 +1073,121 @@ async fn runtime_pruning_metrics_respect_task_byte_range() {
     // RG0 belongs to another split; only RG1 is attributed to runtime pruning.
     assert_eq!(metrics.runtime_row_groups_pruned(), 1);
 }
+
+#[cfg(feature = "runtime-row-group-selections")]
+fn write_wide_runtime_file(dir: &str, name: &str, statistics: bool) -> String {
+    use parquet::file::properties::EnabledStatistics;
+    let schema = Arc::new(ArrowSchema::new(vec![
+        field("id", DataType::Int32, 1),
+        field("payload", DataType::Utf8, 2),
+    ]));
+    let path = format!("{dir}/{name}");
+    let properties = WriterProperties::builder()
+        .set_compression(Compression::UNCOMPRESSED)
+        .set_dictionary_enabled(false)
+        .set_statistics_enabled(if statistics {
+            EnabledStatistics::Page
+        } else {
+            EnabledStatistics::None
+        })
+        .set_max_row_group_row_count(Some(4096))
+        .set_data_page_row_count_limit(128)
+        .set_write_batch_size(128)
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(&path).unwrap(),
+        schema.clone(),
+        Some(properties),
+    )
+    .unwrap();
+    for base in if statistics { [0, 0, 0] } else { [10000, 0, 0] } {
+        let keys: Vec<i32> = (base..base + 4096).collect();
+        let payloads: Vec<String> = keys
+            .iter()
+            .map(|id| format!("{id:08}{}", "x".repeat(504)))
+            .collect();
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(Int32Array::from(keys)),
+            Arc::new(StringArray::from(payloads)),
+        ])
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.flush().unwrap();
+    }
+    writer.close().unwrap();
+    path
+}
+
+#[tokio::test]
+#[cfg(feature = "runtime-row-group-selections")]
+async fn runtime_predicate_live_pages_save_key_bytes_without_pruning_groups() {
+    let temp = TempDir::new().unwrap();
+    let path = write_wide_runtime_file(
+        temp.path().to_str().unwrap(),
+        "live-key-pages.parquet",
+        true,
+    );
+    let task = scan_task_with_deletes_and_projection(path, iceberg_schema(), None, vec![], vec![1]);
+    let mut results = Vec::new();
+    for pages in [false, true] {
+        let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+        let (mut stream, metrics) =
+            start_runtime_scan(task.clone(), Some(provider.clone()), pages, true, 4096);
+        let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
+        provider.publish(
+            Some(Reference::new("id").greater_than_or_equal_to(Datum::int(3072))),
+            1,
+        );
+        batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+        let expected: Vec<i32> = (0..4096).chain(3072..4096).chain(3072..4096).collect();
+        assert_eq!(ids(&batches), expected);
+        assert_eq!(metrics.runtime_row_groups_pruned_live(), 0);
+        assert_eq!(metrics.runtime_predicate_refreshes(), 1);
+        assert_eq!(provider.snapshots.load(Ordering::Relaxed), 2);
+        results.push(metrics.bytes_read());
+    }
+    // Both executions install the same changing row filter and retain every RG.
+    // Only page-index selection can save physical key-column reads here.
+    assert!(
+        results[1] < results[0],
+        "pages={} rows-only={}",
+        results[1],
+        results[0]
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "runtime-row-group-selections")]
+async fn runtime_predicate_live_row_filter_avoids_payload_reads_without_statistics() {
+    let temp = TempDir::new().unwrap();
+    let path = write_wide_runtime_file(
+        temp.path().to_str().unwrap(),
+        "live-late-payload.parquet",
+        false,
+    );
+    let task = scan_task(path, iceberg_schema(), None);
+    let (baseline, baseline_metrics) = start_runtime_scan(task.clone(), None, false, true, 4096);
+    let baseline = baseline.try_collect::<Vec<_>>().await.unwrap();
+    assert_eq!(ids(&baseline).len(), 12288);
+    let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let (mut stream, metrics) = start_runtime_scan(task, Some(provider.clone()), false, true, 4096);
+    let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
+    provider.publish(
+        Some(Reference::new("id").greater_than_or_equal_to(Datum::int(10000))),
+        1,
+    );
+    batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+    assert_eq!(ids(&batches), (10000..14096).collect::<Vec<_>>());
+    assert_eq!(metrics.runtime_row_groups_pruned_live(), 0);
+    assert_eq!(metrics.runtime_row_groups_pruned_initial(), 0);
+    assert_eq!(metrics.runtime_predicate_refreshes(), 1);
+    // There are no row-group statistics or page selections to save these bytes.
+    // Parquet's existing key-first RowFilter rejects the later groups before
+    // requesting their projected payload ranges.
+    assert!(
+        metrics.bytes_read() * 2 < baseline_metrics.bytes_read(),
+        "late={} full={}",
+        metrics.bytes_read(),
+        baseline_metrics.bytes_read()
+    );
+}

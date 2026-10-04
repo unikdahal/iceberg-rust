@@ -18,7 +18,7 @@
 name: Fork Runtime Row Group Selection Validation
 on:
   push:
-    branches: [feat/runtime-row-group-selection, feat/runtime-position-delete-selection, feat/iceberg-runtime-page-pruning]
+    branches: [feat/runtime-row-group-selection, feat/runtime-position-delete-selection, feat/runtime-page-pruning]
   workflow_dispatch:
 permissions:
   contents: read
