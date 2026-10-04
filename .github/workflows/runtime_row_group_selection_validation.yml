@@ -54,6 +54,11 @@ jobs:
         working-directory: iceberg
         run: |
           cargo +stable test --locked -p iceberg --features runtime-row-group-selections --lib arrow::reader
+      - name: Run inclusive metrics and lazy delete loader regressions
+        working-directory: iceberg
+        run: |
+          cargo +stable test --locked -p iceberg --lib expr::visitors::inclusive_metrics_evaluator
+          cargo +stable test --locked -p iceberg --lib arrow::delete_file_loader
       - name: Strict clippy for the selection-enabled reader
         working-directory: iceberg
         run: |
