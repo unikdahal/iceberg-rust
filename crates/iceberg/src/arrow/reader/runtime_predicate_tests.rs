@@ -561,7 +561,9 @@ async fn runtime_predicate_live_removal_preserves_local_page_selections() {
     // pages of RG0 and the first two pages of RG2, giving distinct local masks.
     let planned = Reference::new("id")
         .greater_than_or_equal_to(Datum::int(2))
-        .and(Reference::new("id").less_than_or_equal_to(Datum::int(201)));
+        .and(Reference::new("id").less_than_or_equal_to(Datum::int(201)))
+        .bind(iceberg_schema(), false)
+        .unwrap();
     let task = scan_task(path, iceberg_schema(), Some(planned));
     let (baseline, baseline_metrics) = start_runtime_scan(task.clone(), None, true, true, 1);
     let full = baseline.try_collect::<Vec<_>>().await.unwrap();
