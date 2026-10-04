@@ -51,6 +51,7 @@ use crate::expr::BoundPredicate;
 use crate::expr::visitors::bloom_filter_evaluator::{
     BloomFilterEvaluator, ColumnBloomFilter, collect_bloom_filter_field_ids,
 };
+use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{
     RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_POS,
@@ -58,7 +59,7 @@ use crate::metadata_columns::{
     RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_PARTITION,
     RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, RESERVED_FIELD_ID_SPEC_ID, is_metadata_field,
 };
-use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
+use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskMetrics, FileScanTaskStream};
 use crate::spec::{Datum, PartitionSpec, Struct};
 use crate::{Error, ErrorKind};
 
@@ -160,6 +161,16 @@ impl FileScanTaskReader {
                 task.data_file_path(),
             )
         });
+
+        // Reject the task before opening its data file or loading its deletes
+        // when whole-file statistics prove no row can match. The statistics
+        // cover the entire file, so this holds for every byte-range split.
+        if let (Some(predicate), Some(metrics)) = (&runtime_predicate, task.file_metrics())
+            && !Self::file_might_match(predicate, metrics, &task)
+        {
+            return Ok(Box::pin(futures::stream::empty()));
+        }
+
         let should_load_page_index = (self.row_selection_enabled
             && (task.predicate().is_some() || runtime_predicate.is_some()))
             || !task.deletes().is_empty();
@@ -783,6 +794,37 @@ impl FileScanTaskReader {
             )
             .with_source(e)
         })
+    }
+
+    /// Whether a file's whole-file statistics allow a row to match `predicate`.
+    /// Statistics whose type does not match the task schema, for example after
+    /// a column was promoted, and evaluation errors keep the file.
+    fn file_might_match(
+        predicate: &BoundPredicate,
+        metrics: &FileScanTaskMetrics,
+        task: &FileScanTask,
+    ) -> bool {
+        let bounds_match_schema = metrics
+            .lower_bounds()
+            .iter()
+            .chain(metrics.upper_bounds())
+            .all(|(id, bound)| {
+                task.schema().field_by_id(*id).is_some_and(|field| {
+                    field.field_type.as_primitive_type() == Some(bound.data_type())
+                })
+            });
+        if !bounds_match_schema {
+            return true;
+        }
+        InclusiveMetricsEvaluator::eval_metrics(predicate, metrics.into(), false).unwrap_or_else(
+            |error| {
+                tracing::debug!(
+                    "Skipping runtime file pruning for {}: {error}",
+                    task.data_file_path()
+                );
+                true
+            },
+        )
     }
 
     /// Resolves `predicate` against the file and plans its row-group selection.
