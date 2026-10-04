@@ -34,8 +34,9 @@ use parquet::encryption::decrypt::FileDecryptionProperties;
 
 use super::row_lineage::synthesize_row_id_column;
 use super::{
-    ArrowFileReader, ArrowReader, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
-    apply_name_mapping_to_arrow_schema, find_leaf_by_field_id,
+    ArrowFileReader, ArrowReader, ParquetReadOptions, RuntimePredicateProvider,
+    add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
+    find_leaf_by_field_id,
 };
 use crate::arrow::build_partition_constant;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
@@ -44,10 +45,10 @@ use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::encryption::StandardKeyMetadata;
 use crate::error::{Result, invalid_data};
-use crate::expr::BoundPredicate;
 use crate::expr::visitors::bloom_filter_evaluator::{
     BloomFilterEvaluator, ColumnBloomFilter, collect_bloom_filter_field_ids,
 };
+use crate::expr::{Bind, BoundPredicate};
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{
     RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_POS,
@@ -76,6 +77,7 @@ impl ArrowReader {
             row_selection_enabled: self.row_selection_enabled,
             bloom_filter_enabled: self.bloom_filter_enabled,
             parquet_read_options: self.parquet_read_options,
+            runtime_predicate_provider: self.runtime_predicate_provider,
             scan_metrics: scan_metrics.clone(),
         };
 
@@ -130,12 +132,46 @@ struct FileScanTaskReader {
     row_selection_enabled: bool,
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
+    runtime_predicate_provider: Option<Arc<dyn RuntimePredicateProvider>>,
     scan_metrics: ScanMetrics,
 }
 
 impl FileScanTaskReader {
     async fn process(self, task: FileScanTask) -> Result<ArrowRecordBatchStream> {
-        let should_load_page_index = (self.row_selection_enabled && task.predicate().is_some())
+        let runtime_predicate = match self.runtime_predicate_provider.as_ref() {
+            Some(provider) => match provider.snapshot() {
+                Ok(snapshot) => match snapshot
+                    .predicate()
+                    .map(|predicate| {
+                        predicate
+                            .clone()
+                            .rewrite_not()
+                            .bind(task.schema_ref(), task.case_sensitive())
+                    })
+                    .transpose()
+                {
+                    Ok(predicate) => predicate,
+                    Err(error) => {
+                        tracing::debug!(
+                            "Skipping runtime predicate for {} because binding failed: {error}",
+                            task.data_file_path()
+                        );
+                        None
+                    }
+                },
+                Err(error) => {
+                    tracing::debug!(
+                        "Skipping runtime predicate for {} because snapshotting failed: {error}",
+                        task.data_file_path()
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+
+        let should_load_page_index = (self.row_selection_enabled
+            && (task.predicate().is_some() || runtime_predicate.is_some()))
             || !task.deletes().is_empty();
         let mut parquet_read_options = self.parquet_read_options;
         parquet_read_options.preload_page_index = should_load_page_index;
@@ -466,11 +502,10 @@ impl FileScanTaskReader {
         let delete_filter = delete_filter_rx.await.unwrap()?;
         let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
 
-        // In addition to the optional predicate supplied in the `FileScanTask`,
-        // we also have an optional predicate resulting from equality delete files.
-        // If both are present, we logical-AND them together to form a single filter
-        // predicate that we can pass to the `RecordBatchStreamBuilder`.
-        let final_predicate = match (task.predicate(), delete_predicate) {
+        // Preserve the existing planned + equality-delete predicate composition, then add the
+        // task-open runtime predicate to the same conjunction. The normal reader pipeline below
+        // remains responsible for row-group, bloom, page-index, and row filtering.
+        let mut final_predicate = match (task.predicate(), delete_predicate) {
             (None, None) => None,
             (Some(predicate), None) => Some(predicate.clone()),
             (None, Some(ref predicate)) => Some(predicate.clone()),
@@ -478,6 +513,13 @@ impl FileScanTaskReader {
                 Some(filter_predicate.clone().and(delete_predicate))
             }
         };
+
+        if let Some(runtime_predicate) = runtime_predicate {
+            final_predicate = Some(match final_predicate {
+                Some(predicate) => predicate.and(runtime_predicate),
+                None => runtime_predicate,
+            });
+        }
 
         // There are three possible sources for potential lists of selected RowGroup indices,
         // and two for `RowSelection`s.
