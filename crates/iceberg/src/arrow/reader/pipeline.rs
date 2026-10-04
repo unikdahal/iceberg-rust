@@ -763,7 +763,7 @@ impl FileScanTaskReader {
         // batches (using the reader-produced `_pos` position) before the transformer, which
         // then passes it through as a virtual field.
         let first_row_id = task.first_row_id();
-        let raw_stream: ArrowRecordBatchStream = if runtime_state.is_some()
+        let raw_stream: ArrowRecordBatchStream = if let Some(runtime_state) = runtime_state
             && self.row_group_filtering_enabled
             && row_selection.is_none()
         {
@@ -784,7 +784,7 @@ impl FileScanTaskReader {
                 live_file_reader.expect("reader retained for live-capable task"),
                 metadata,
                 remaining,
-                runtime_state.expect("provider checked for live-capable task"),
+                runtime_state,
                 task,
                 use_position_fallback,
                 self.scan_metrics.clone(),
