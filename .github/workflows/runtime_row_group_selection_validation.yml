@@ -32,15 +32,6 @@ jobs:
         with:
           path: iceberg
           persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: apache/arrow-rs
-          ref: f90e061326bd821a7af09281d9e92de6f3b603d9 # 59.3.0
-          path: arrow
-          persist-credentials: false
-      - name: Apply validated generic Parquet selection backport
-        working-directory: arrow
-        run: git apply ../iceberg/dev/backports/parquet-row-group-selection-59.patch
       - name: Install Rust toolchains
         run: |
           rustup toolchain install stable --profile minimal --component clippy
@@ -48,33 +39,21 @@ jobs:
       - name: Check Iceberg formatting
         working-directory: iceberg
         run: cargo +nightly-2026-04-16 fmt --all -- --check
-      - name: Share the dependency patch with all Cargo subprocesses
+      - name: Verify the production dependency pin
         working-directory: iceberg
-        run: |
-          mkdir -p .cargo
-          python3 - <<'PYCONFIG'
-          import os
-          from pathlib import Path
-          path = Path(os.environ["GITHUB_WORKSPACE"]) / "arrow/parquet"
-          Path(".cargo/config.toml").write_text('[patch.crates-io]\nparquet = { path = "' + str(path) + '" }\n')
-          PYCONFIG
-      - name: Resolve the exact backported Parquet version
-        working-directory: iceberg
-        run: |
-          cargo +stable update -p parquet --precise 59.3.0
+        run: cargo +stable tree --locked -p iceberg -i parquet
       - name: Run live runtime and delete tests with local selections
         working-directory: iceberg
         run: |
-          cargo +stable test -p iceberg --features runtime-row-group-selections --lib runtime_predicate -- --nocapture
+          cargo +stable test --locked -p iceberg --features runtime-row-group-selections --lib runtime_predicate -- --nocapture
       - name: Run existing reader regressions with local selections
         working-directory: iceberg
         run: |
-          cargo +stable test -p iceberg --features runtime-row-group-selections --lib arrow::reader
+          cargo +stable test --locked -p iceberg --features runtime-row-group-selections --lib arrow::reader
       - name: Strict clippy for the selection-enabled reader
         working-directory: iceberg
         run: |
-          cargo +nightly-2026-04-16 clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Report the dependency difference
-        if: always()
+          cargo +nightly-2026-04-16 clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Check fallback without local selections
         working-directory: iceberg
-        run: git diff -- Cargo.lock
+        run: cargo +stable test --locked -p iceberg --no-default-features --lib runtime_predicate
