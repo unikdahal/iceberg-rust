@@ -30,7 +30,7 @@ license = { workspace = true }
 repository = { workspace = true }
 
 [features]
-default = []
+default = ["runtime-row-group-selections"]
 # Requires the generic Parquet 59.3 row-group-local selection backport.
 # Kept opt-in until its fork dependency can be pinned by downstream consumers.
 runtime-row-group-selections = []

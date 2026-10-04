@@ -21,8 +21,9 @@ Parquet's manifest uses the registry dependencies from the published 59.3.0
 crate. This prevents a git-patched Parquet dependency from pulling a second
 copy of the Arrow types used by DataFusion and Iceberg.
 
-The fork-only validation workflow applies the patch to an exact read-only
-Arrow checkout and runs decoder and reader regression tests. Publishing the
-dependency itself requires an accessible `unikdahal/arrow-rs` fork. This branch
-does not change Iceberg's production dependency or enable selection-bearing
-live scans yet.
+The production reader now pins the tested backport from
+`unikdahal/arrow-rs` at `fa20c8b77ff3d613c8b638f4f686f5316eb0138a`.
+The root Cargo patch is required in every consuming workspace: Cargo patches
+are not transitive. The reproducible patch remains as a record of the narrow
+59.3 reader API backport. The local-selection feature is enabled by default;
+`--no-default-features` still tests the flattened-selection fallback.
