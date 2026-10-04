@@ -26,7 +26,7 @@ use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReader
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::push_decoder::{ParquetPushDecoder, RowGroupSelection};
 
-use super::runtime_predicate::RuntimePredicateState;
+use super::runtime_predicate::{RuntimePredicateState, check_runtime_predicate_columns};
 use super::{ArrowFileReader, ArrowReader};
 use crate::arrow::ScanMetrics;
 use crate::expr::BoundPredicate;
@@ -138,15 +138,25 @@ impl RuntimePrunedParquetStream {
             }
         };
         if changed && let Some(predicate) = self.runtime.predicate().cloned() {
-            if !self.accepted_runtime {
-                self.metrics.record_runtime_predicate_task();
-                self.accepted_runtime = true;
-            }
-            match self.matching_row_groups(&predicate) {
-                Ok(keep) => self.prune_remaining(keep, next)?,
+            let usable = check_runtime_predicate_columns(
+                &predicate,
+                self.metadata.metadata().file_metadata().schema_descr(),
+                self.metadata.schema(),
+                self.task.schema(),
+                self.use_position_fallback,
+            )
+            .and_then(|()| self.matching_row_groups(&predicate));
+            match usable {
+                Ok(keep) => {
+                    if !self.accepted_runtime {
+                        self.metrics.record_runtime_predicate_task();
+                        self.accepted_runtime = true;
+                    }
+                    self.prune_remaining(keep, next)?
+                }
                 Err(error) => {
                     tracing::debug!(
-                        "Skipping live runtime statistics for {}: {error}",
+                        "Skipping live runtime predicate for {}: {error}",
                         self.task.data_file_path()
                     );
                     self.runtime.reject_current();

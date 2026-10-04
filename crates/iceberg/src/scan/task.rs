@@ -27,7 +27,7 @@ use crate::error::invalid_data;
 use crate::expr::BoundPredicate;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, Datum, ManifestEntryRef, NameMapping, PartitionSpec,
-    Schema, SchemaRef, SortOrderRef, Struct, StructType,
+    PrimitiveLiteral, Schema, SchemaRef, SortOrderRef, Struct, StructType,
 };
 
 /// A stream of [`FileScanTask`].
@@ -52,11 +52,25 @@ pub struct FileScanTaskMetrics {
     #[serde(default)]
     pub nan_value_counts: HashMap<i32, u64>,
     /// Inclusive lower bounds by Iceberg field ID.
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_finite_bounds")]
     pub lower_bounds: HashMap<i32, Datum>,
     /// Inclusive upper bounds by Iceberg field ID.
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_finite_bounds")]
     pub upper_bounds: HashMap<i32, Datum>,
+}
+
+/// Serializes only bounds every task format can carry. JSON has no
+/// representation for an infinite or NaN float, and a missing bound only
+/// weakens pruning, so such bounds are omitted rather than corrupted.
+fn serialize_finite_bounds<S: serde::Serializer>(
+    bounds: &HashMap<i32, Datum>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.collect_map(bounds.iter().filter(|(_, bound)| match bound.literal() {
+        PrimitiveLiteral::Float(value) => value.0.is_finite(),
+        PrimitiveLiteral::Double(value) => value.0.is_finite(),
+        _ => true,
+    }))
 }
 
 impl From<&DataFile> for FileScanTaskMetrics {
@@ -674,6 +688,54 @@ mod tests {
     use super::*;
     use crate::ErrorKind;
     use crate::spec::{Literal, NestedField, PrimitiveType, Transform, Type};
+
+    #[test]
+    fn file_metrics_with_non_finite_bounds_round_trip_through_task_json() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "f", Type::Primitive(PrimitiveType::Float)).into(),
+                    NestedField::optional(2, "d", Type::Primitive(PrimitiveType::Double)).into(),
+                    NestedField::optional(3, "i", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let metrics = FileScanTaskMetrics {
+            record_count: Some(4),
+            lower_bounds: HashMap::from([
+                (1, Datum::float(f32::NEG_INFINITY)),
+                (2, Datum::double(f64::NEG_INFINITY)),
+                (3, Datum::int(1)),
+            ]),
+            upper_bounds: HashMap::from([
+                (1, Datum::float(f32::INFINITY)),
+                (2, Datum::double(f64::INFINITY)),
+                (3, Datum::int(9)),
+            ]),
+            ..Default::default()
+        };
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(100)
+            .with_start(0)
+            .with_length(100)
+            .with_data_file_path("data_file_path".to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema)
+            .with_project_field_ids(vec![1, 2, 3])
+            .with_file_metrics(Some(Arc::new(metrics)))
+            .with_case_sensitive(false)
+            .build()
+            .unwrap();
+
+        let json = serde_json::to_string(&task).unwrap();
+        let decoded: FileScanTask = serde_json::from_str(&json).unwrap();
+        let decoded = decoded.file_metrics().unwrap();
+        // Non-finite float bounds are advisory and dropped; finite ones survive.
+        assert_eq!(decoded.lower_bounds, HashMap::from([(3, Datum::int(1))]));
+        assert_eq!(decoded.upper_bounds, HashMap::from([(3, Datum::int(9))]));
+        assert_eq!(decoded.record_count, Some(4));
+    }
 
     #[test]
     fn file_metrics_retain_only_selected_columns() {

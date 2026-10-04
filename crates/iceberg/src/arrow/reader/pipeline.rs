@@ -34,7 +34,7 @@ use parquet::arrow::{
 use parquet::encryption::decrypt::FileDecryptionProperties;
 
 use super::row_lineage::synthesize_row_id_column;
-use super::runtime_predicate::RuntimePredicateState;
+use super::runtime_predicate::{RuntimePredicateState, check_runtime_predicate_columns};
 use super::runtime_stream::RuntimePrunedParquetStream;
 use super::{
     ArrowFileReader, ArrowReader, ParquetReadOptions, RuntimePredicateProvider,
@@ -926,6 +926,13 @@ impl FileScanTaskReader {
         row_selection_enabled: bool,
         bloom_filter_enabled: bool,
     ) -> Result<()> {
+        check_runtime_predicate_columns(
+            runtime_predicate,
+            builder.parquet_schema(),
+            builder.schema(),
+            task.schema(),
+            use_position_fallback,
+        )?;
         let combined = match base_predicate {
             Some(base) => base.clone().and(runtime_predicate.clone()),
             None => runtime_predicate.clone(),

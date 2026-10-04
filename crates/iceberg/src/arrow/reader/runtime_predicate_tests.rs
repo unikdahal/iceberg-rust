@@ -1465,43 +1465,159 @@ async fn runtime_predicate_live_refresh_respects_task_byte_range() {
 }
 
 #[tokio::test]
-async fn runtime_predicate_on_column_missing_from_file_is_safe() {
+async fn runtime_predicate_on_column_missing_from_file_fails_open() {
+    use crate::spec::Literal;
+
     let temp = TempDir::new().unwrap();
     let path = write_three_row_group_file(temp.path().to_str().unwrap(), "evolved.parquet");
-    // `added` was added to the table after this file was written.
-    let schema: SchemaRef = Arc::new(
-        Schema::builder()
-            .with_schema_id(2)
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::required(2, "payload", Type::Primitive(PrimitiveType::String)).into(),
-                NestedField::optional(3, "added", Type::Primitive(PrimitiveType::Int)).into(),
-            ])
-            .build()
-            .unwrap(),
-    );
     let all: Vec<i32> = [0, 100, 200]
         .into_iter()
         .flat_map(|base| base..base + 4)
         .collect();
-    // Every row reads `added` as null, so IS NULL keeps every row.
-    let provider = Arc::new(FixedRuntimePredicate::new(
-        Reference::new("added").is_null(),
-    ));
-    let (batches, _) = execute(
+    // `added` was added after this file was written. Its value in this file is
+    // the initial default (7) or null, which physical filters never see.
+    for default in [Some(Literal::int(7)), None] {
+        let mut added = NestedField::optional(3, "added", Type::Primitive(PrimitiveType::Int));
+        if let Some(default) = default.clone() {
+            added = added.with_initial_default(default);
+        }
+        let schema: SchemaRef = Arc::new(
+            Schema::builder()
+                .with_schema_id(2)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::required(2, "payload", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                    added.into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        for predicate in [
+            Reference::new("added").is_null(),
+            Reference::new("added").greater_than_or_equal_to(Datum::int(5)),
+            Reference::new("added").less_than(Datum::int(5)),
+        ] {
+            let provider = Arc::new(FixedRuntimePredicate::new(predicate.clone()));
+            let (batches, metrics) = execute(
+                scan_task(path.clone(), Arc::clone(&schema), None),
+                Some(provider),
+            )
+            .await;
+            assert_eq!(ids(&batches), all, "{predicate} with default {default:?}");
+            assert_eq!(metrics.runtime_predicate_tasks(), 0);
+            // The same publication arriving during the scan is also ignored.
+            let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+            let (mut stream, metrics) = start_runtime_scan(
+                scan_task(path.clone(), Arc::clone(&schema), None),
+                Some(provider.clone()),
+                true,
+                true,
+                4,
+            );
+            let mut live = vec![stream.try_next().await.unwrap().unwrap()];
+            provider.publish(Some(predicate.clone()), 1);
+            live.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+            assert_eq!(ids(&live), all, "live {predicate} with default {default:?}");
+            assert_eq!(metrics.runtime_row_groups_pruned(), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn runtime_predicate_on_promoted_column_fails_open() {
+    let temp = TempDir::new().unwrap();
+    // The file stores `id` as INT; the table has since promoted it to BIGINT.
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "promoted.parquet");
+    let schema: SchemaRef = Arc::new(
+        Schema::builder()
+            .with_schema_id(2)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "payload", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let long_ids = |batches: &[RecordBatch]| -> Vec<i64> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    };
+    let all: Vec<i64> = [0, 100, 200]
+        .into_iter()
+        .flat_map(|base| base..base + 4)
+        .collect();
+    // Above i32::MAX: a literal cast down to the physical INT type would overflow.
+    let predicate = Reference::new("id").less_than(Datum::long(i64::from(i32::MAX) + 1));
+    let provider = Arc::new(FixedRuntimePredicate::new(predicate.clone()));
+    let (batches, metrics) = execute(
         scan_task(path.clone(), Arc::clone(&schema), None),
         Some(provider),
     )
     .await;
-    assert_eq!(ids(&batches), all);
-    // A range on the null column matches nothing. The reader must either apply
-    // that exactly or fail open; it must never fail or return a partial result.
-    let provider = Arc::new(FixedRuntimePredicate::new(
-        Reference::new("added").greater_than_or_equal_to(Datum::int(5)),
-    ));
-    let (batches, _) = execute(scan_task(path, schema, None), Some(provider)).await;
-    let result = ids(&batches);
-    assert!(result.is_empty() || result == all, "{result:?}");
+    assert_eq!(long_ids(&batches), all);
+    assert_eq!(metrics.runtime_predicate_tasks(), 0);
+
+    let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let (mut stream, _) = start_runtime_scan(
+        scan_task(path, schema, None),
+        Some(provider.clone()),
+        true,
+        true,
+        4,
+    );
+    let mut live = vec![stream.try_next().await.unwrap().unwrap()];
+    provider.publish(Some(predicate), 1);
+    live.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+    assert_eq!(long_ids(&live), all);
+}
+
+#[tokio::test]
+async fn runtime_not_predicates_keep_matching_rows() {
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "not.parquet");
+    // RG1 holds 100..=103, so NOT(id < 102) must keep 102 and 103.
+    let predicate = !Reference::new("id").less_than(Datum::int(102));
+
+    // Task open, with and without whole-file statistics spanning every group.
+    for with_stats in [false, true] {
+        let mut task = scan_task(path.clone(), iceberg_schema(), None);
+        if with_stats {
+            task = with_file_metrics(task, three_group_file_metrics());
+        }
+        let provider = Arc::new(FixedRuntimePredicate::new(predicate.clone()));
+        let (batches, metrics) = execute(task, Some(provider)).await;
+        assert_eq!(ids(&batches), vec![102, 103, 200, 201, 202, 203]);
+        assert_eq!(metrics.runtime_file_tasks_pruned(), 0);
+        assert_eq!(metrics.runtime_row_groups_pruned(), 1);
+    }
+
+    // Live refresh while RG0 is in flight.
+    let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let (mut stream, metrics) = start_runtime_scan(
+        scan_task(path, iceberg_schema(), None),
+        Some(provider.clone()),
+        true,
+        true,
+        4,
+    );
+    let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
+    provider.publish(Some(predicate), 1);
+    batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+    assert_eq!(ids(&batches), vec![
+        0, 1, 2, 3, 102, 103, 200, 201, 202, 203
+    ]);
+    assert_eq!(metrics.runtime_row_groups_pruned_live(), 0);
 }
 
 #[tokio::test]
