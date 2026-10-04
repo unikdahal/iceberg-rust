@@ -184,8 +184,7 @@ impl ScanMetrics {
 
     /// Additional row groups removed at live boundaries. Also included in
     /// [`Self::runtime_row_groups_pruned`].
-    #[cfg(test)]
-    pub(crate) fn runtime_row_groups_pruned_live(&self) -> u64 {
+    pub fn runtime_row_groups_pruned_live(&self) -> u64 {
         self.runtime_row_groups_pruned_live.load(Ordering::Relaxed)
     }
 }
