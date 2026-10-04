@@ -39,7 +39,6 @@ use crate::spec::Schema;
 impl ArrowReader {
     /// Build independent page selections, preserving each row group's local
     /// coordinates when a later runtime publication removes another group.
-    #[cfg(feature = "runtime-row-group-selections")]
     pub(super) fn get_row_group_selections_for_filter_predicate(
         predicate: Option<&BoundPredicate>,
         metadata: &parquet::arrow::arrow_reader::ArrowReaderMetadata,

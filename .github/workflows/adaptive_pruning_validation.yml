@@ -18,54 +18,51 @@
 name: Fork Adaptive Iceberg Pruning Validation
 on:
   push:
-    branches: [feat/iceberg-adaptive-pruning]
+    branches: [feat/iceberg-adaptive-pruning, 'adaptive-ci/**']
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: fork-adaptive-pruning-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   reader-tests:
     if: github.repository == 'unikdahal/iceberg-rust'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: iceberg
           persist-credentials: false
-      - name: Install Rust toolchains
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-builder
+      - name: Record formatting differences
         run: |
-          rustup toolchain install stable --profile minimal --component clippy
-          rustup toolchain install nightly-2026-04-16 --profile minimal --component rustfmt --component clippy
-      - name: Check Iceberg formatting
-        working-directory: iceberg
-        run: cargo +nightly-2026-04-16 fmt --all -- --check
-      - name: Verify the production dependency pin
-        working-directory: iceberg
-        run: cargo +stable tree --locked -p iceberg -i parquet
-      - name: Run live runtime and delete tests with local selections
-        working-directory: iceberg
+          cargo fmt --all
+          git diff > rust-format.patch
+          git checkout -- .
+      - name: Verify the Parquet dependency pin
+        run: cargo tree --locked -p iceberg -i parquet
+      - name: Compile all iceberg targets
+        run: cargo check --locked -p iceberg --all-targets --all-features
+      - name: Clippy
+        run: cargo clippy --locked -p iceberg --all-targets --all-features -- -D warnings
+      - name: Iceberg library tests
+        run: cargo test --locked -p iceberg --lib
+      - name: Regenerate the public API snapshot
+        if: always()
         run: |
-          cargo +stable test --locked -p iceberg --features runtime-row-group-selections --lib runtime_predicate -- --nocapture
-      - name: Run all Iceberg library regressions
-        working-directory: iceberg
-        run: cargo +stable test --locked -p iceberg --lib
-      - name: Run task and manifest planning regressions
-        working-directory: iceberg
-        run: |
-          cargo +stable test --locked -p iceberg --lib scan::
-      - name: Run existing reader regressions with local selections
-        working-directory: iceberg
-        run: |
-          cargo +stable test --locked -p iceberg --features runtime-row-group-selections --lib arrow::reader
-      - name: Run inclusive metrics and lazy delete loader regressions
-        working-directory: iceberg
-        run: |
-          cargo +stable test --locked -p iceberg --lib expr::visitors::inclusive_metrics_evaluator
-          cargo +stable test --locked -p iceberg --lib arrow::delete_file_loader
-      - name: Strict clippy for the selection-enabled reader
-        working-directory: iceberg
-        run: |
-          cargo +nightly-2026-04-16 clippy --locked --workspace --all-targets --all-features -- -D warnings
-      - name: Check fallback without local selections
-        working-directory: iceberg
-        run: cargo +stable test --locked -p iceberg --no-default-features --lib runtime_predicate
+          cargo install --locked cargo-public-api@0.51.0
+          cargo public-api -p iceberg --all-features -ss > crates/iceberg/public-api.txt
+          git diff -- crates/iceberg/public-api.txt > public-api.patch
+          git checkout -- crates/iceberg/public-api.txt
+          test ! -s public-api.patch
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: adaptive-pruning-patches
+          path: |
+            rust-format.patch
+            public-api.patch
+      - name: Require formatted sources
+        run: test ! -s rust-format.patch

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures::stream::BoxStream;
@@ -43,32 +44,61 @@ pub struct FileScanTaskMetrics {
     pub record_count: Option<u64>,
     /// Number of values, including nulls and NaNs, by Iceberg field ID.
     #[serde(default)]
-    pub value_counts: std::collections::HashMap<i32, u64>,
+    pub value_counts: HashMap<i32, u64>,
     /// Number of null values by Iceberg field ID.
     #[serde(default)]
-    pub null_value_counts: std::collections::HashMap<i32, u64>,
+    pub null_value_counts: HashMap<i32, u64>,
     /// Number of NaN values by Iceberg field ID.
     #[serde(default)]
-    pub nan_value_counts: std::collections::HashMap<i32, u64>,
+    pub nan_value_counts: HashMap<i32, u64>,
     /// Inclusive lower bounds by Iceberg field ID.
     #[serde(default)]
-    pub lower_bounds: std::collections::HashMap<i32, Datum>,
+    pub lower_bounds: HashMap<i32, Datum>,
     /// Inclusive upper bounds by Iceberg field ID.
     #[serde(default)]
-    pub upper_bounds: std::collections::HashMap<i32, Datum>,
+    pub upper_bounds: HashMap<i32, Datum>,
 }
 
 impl From<&DataFile> for FileScanTaskMetrics {
     fn from(file: &DataFile) -> Self {
+        Self::from_data_file(file, &ColumnStatsSelection::All)
+    }
+}
+
+impl FileScanTaskMetrics {
+    /// Copies the record count and only the selected columns' statistics.
+    pub(crate) fn from_data_file(file: &DataFile, selection: &ColumnStatsSelection) -> Self {
+        fn select<V: Clone>(
+            values: &HashMap<i32, V>,
+            selection: &ColumnStatsSelection,
+        ) -> HashMap<i32, V> {
+            match selection {
+                ColumnStatsSelection::All => values.clone(),
+                ColumnStatsSelection::Fields(ids) => values
+                    .iter()
+                    .filter(|(id, _)| ids.contains(id))
+                    .map(|(id, value)| (*id, value.clone()))
+                    .collect(),
+            }
+        }
         Self {
             record_count: Some(file.record_count),
-            value_counts: file.value_counts.clone(),
-            null_value_counts: file.null_value_counts.clone(),
-            nan_value_counts: file.nan_value_counts.clone(),
-            lower_bounds: file.lower_bounds.clone(),
-            upper_bounds: file.upper_bounds.clone(),
+            value_counts: select(&file.value_counts, selection),
+            null_value_counts: select(&file.null_value_counts, selection),
+            nan_value_counts: select(&file.nan_value_counts, selection),
+            lower_bounds: select(&file.lower_bounds, selection),
+            upper_bounds: select(&file.upper_bounds, selection),
         }
     }
+}
+
+/// Column statistics retained on planned tasks, when requested by the scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ColumnStatsSelection {
+    /// Retain statistics for every column.
+    All,
+    /// Retain statistics only for these field IDs.
+    Fields(HashSet<i32>),
 }
 
 /// A task to scan part of file.
@@ -389,6 +419,10 @@ pub struct FileScanTaskDeleteFile {
     pub file_path: String,
 
     /// The total size of the delete file in bytes, from the manifest entry.
+    ///
+    /// `0` means the size is unknown: a Parquet delete file is then sized with
+    /// one metadata request when it is first loaded, so a task skipped before
+    /// opening never pays for it. A deletion vector does not use this size.
     pub file_size_in_bytes: u64,
 
     /// delete file type
@@ -640,6 +674,37 @@ mod tests {
     use super::*;
     use crate::ErrorKind;
     use crate::spec::{Literal, NestedField, PrimitiveType, Transform, Type};
+
+    #[test]
+    fn file_metrics_retain_only_selected_columns() {
+        let file = crate::spec::DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("data.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(10)
+            .record_count(3)
+            .partition(Struct::empty())
+            .value_counts(HashMap::from([(1, 3), (2, 3)]))
+            .null_value_counts(HashMap::from([(1, 0), (2, 1)]))
+            .lower_bounds(HashMap::from([(1, Datum::int(1)), (2, Datum::long(5))]))
+            .upper_bounds(HashMap::from([(1, Datum::int(9)), (2, Datum::long(7))]))
+            .build()
+            .unwrap();
+
+        let all = FileScanTaskMetrics::from_data_file(&file, &ColumnStatsSelection::All);
+        assert_eq!(all, FileScanTaskMetrics::from(&file));
+        assert_eq!(all.lower_bounds.len(), 2);
+
+        let selected = FileScanTaskMetrics::from_data_file(
+            &file,
+            &ColumnStatsSelection::Fields(HashSet::from([2])),
+        );
+        assert_eq!(selected.record_count, Some(3));
+        assert_eq!(selected.value_counts, HashMap::from([(2, 3)]));
+        assert_eq!(selected.null_value_counts, HashMap::from([(2, 1)]));
+        assert_eq!(selected.lower_bounds, HashMap::from([(2, Datum::long(5))]));
+        assert_eq!(selected.upper_bounds, HashMap::from([(2, Datum::long(7))]));
+    }
 
     fn build_file_scan_task(
         schema: SchemaRef,

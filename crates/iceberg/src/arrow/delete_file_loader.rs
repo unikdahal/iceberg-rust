@@ -73,9 +73,8 @@ impl BasicDeleteFileLoader {
            Essentially a super-cut-down ArrowReader. We can't use ArrowReader directly
            as that introduces a circular dependency.
         */
-        // Some execution engines omit delete-file sizes and require the real
-        // object size, rather than the occasionally inaccurate manifest size.
-        // Resolve it lazily inside the cached loader, after runtime file pruning.
+        // A zero size means unknown (see `FileScanTaskDeleteFile`). Resolve it
+        // here, once per cached delete file and only for tasks that are read.
         let file_size_in_bytes = if file_size_in_bytes == 0 {
             let size = self
                 .file_io
@@ -357,11 +356,6 @@ mod tests {
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);
     }
-}
-
-#[cfg(test)]
-mod lazy_size_tests {
-    use super::*;
 
     #[tokio::test]
     async fn unknown_delete_size_still_reports_missing_and_empty_objects() {
@@ -382,5 +376,33 @@ mod lazy_size_tests {
             .err()
             .unwrap();
         assert!(error.to_string().contains("footer minimum"));
+
+        // A real file with an unknown size is sized lazily and read in full.
+        let present = temp.path().join("present.parquet");
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "pos",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let batch = arrow_array::RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(
+            arrow_array::Int64Array::from(vec![1, 2, 3]),
+        )])
+        .unwrap();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            std::fs::File::create(&present).unwrap(),
+            schema,
+            None,
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let batches: Vec<_> = loader
+            .parquet_to_batch_stream(present.to_str().unwrap(), 0, None)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
     }
 }

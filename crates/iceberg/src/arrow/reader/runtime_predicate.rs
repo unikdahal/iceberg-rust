@@ -51,11 +51,24 @@ impl RuntimePredicateSnapshot {
 /// Supplies execution-time predicates to an Arrow reader.
 ///
 /// A snapshot is requested when a data-file task begins processing, and may be
-/// refreshed between row groups. Implementations must only return predicates
-/// that are safe to AND with the task's planned predicate for unread rows.
-/// Generations must increase when the predicate changes, including changes to
-/// or from `None`. Publish the predicate before its generation becomes visible.
-/// Each snapshot must pair a predicate with its own publication generation.
+/// refreshed between row groups.
+///
+/// # Contract
+///
+/// * Safety: a published predicate must be safe to AND with the task's planned
+///   predicate for every row the scan reads *after* the publication, for the
+///   rest of the scan. A reader may keep using an earlier snapshot (for
+///   example in a row filter, or for a task that cannot refresh) after newer
+///   generations are published, so a later generation may only be equally or
+///   more restrictive than an earlier one, or `None`. Never publish a
+///   provisional predicate that a later generation would need to widen.
+/// * Generations: generations must increase whenever the predicate changes,
+///   including changes to or from `None`. Publish the predicate before its
+///   generation becomes visible, and pair each snapshot's predicate with its
+///   own publication generation.
+/// * Failure: errors from [`Self::snapshot`] and predicates that cannot be bound
+///   to a task's schema are advisory. The reader then keeps the planned and
+///   delete predicates for the affected rows and never fails the scan.
 pub trait RuntimePredicateProvider: Send + Sync {
     /// Returns the current publication generation without cloning the predicate.
     ///
@@ -86,6 +99,12 @@ impl RuntimePredicateState {
 
     pub(super) fn predicate(&self) -> Option<&BoundPredicate> {
         self.predicate.as_ref()
+    }
+
+    /// Drops the current predicate after it proved unusable for this task. The
+    /// generation is kept, so only a newer publication is tried again.
+    pub(super) fn reject_current(&mut self) {
+        self.predicate = None;
     }
 
     /// Snapshot and bind only on first use or after a publication change.

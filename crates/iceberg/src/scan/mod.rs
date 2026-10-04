@@ -142,6 +142,15 @@ pub struct TableScanBuilder<'a> {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     bloom_filter_enabled: bool,
+    column_stats: ColumnStatsRequest,
+}
+
+/// Which manifest column statistics planned tasks should retain.
+#[derive(Debug, Clone)]
+enum ColumnStatsRequest {
+    None,
+    All,
+    Columns(Vec<String>),
 }
 
 impl<'a> TableScanBuilder<'a> {
@@ -161,7 +170,29 @@ impl<'a> TableScanBuilder<'a> {
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
             bloom_filter_enabled: false,
+            column_stats: ColumnStatsRequest::None,
         }
+    }
+
+    /// Retains every column's manifest statistics on planned [`FileScanTask`]s.
+    ///
+    /// Statistics are dropped by default to keep planning and task serialization
+    /// cheap. When retained, [`FileScanTask::file_metrics`] lets a reader with an
+    /// execution-time predicate reject a file before opening it.
+    pub fn include_column_stats(mut self) -> Self {
+        self.column_stats = ColumnStatsRequest::All;
+        self
+    }
+
+    /// Retains manifest statistics only for the named columns on planned
+    /// [`FileScanTask`]s. The record count is always retained.
+    pub fn include_column_stats_for(
+        mut self,
+        column_names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.column_stats =
+            ColumnStatsRequest::Columns(column_names.into_iter().map(Into::into).collect());
+        self
     }
 
     /// Sets the desired size of batches in the response
@@ -322,6 +353,23 @@ impl<'a> TableScanBuilder<'a> {
             .default_name_mapping()?
             .map(Arc::new);
         let unified_partition_type = projected_partition_type(self.table, &schema, &field_ids)?;
+        let column_stats = match &self.column_stats {
+            ColumnStatsRequest::None => None,
+            ColumnStatsRequest::All => Some(Arc::new(ColumnStatsSelection::All)),
+            ColumnStatsRequest::Columns(names) => {
+                let ids = names
+                    .iter()
+                    .map(|name| {
+                        resolve_field_id(&schema, name, self.case_sensitive).ok_or_else(|| {
+                            invalid_data!(
+                                "Column {name} requested for statistics not found in table. Schema: {schema}"
+                            )
+                        })
+                    })
+                    .collect::<Result<_>>()?;
+                Some(Arc::new(ColumnStatsSelection::Fields(ids)))
+            }
+        };
 
         // Precompute the table's sort orders once, keyed by id, so each manifest-file
         // context carries only this narrow map instead of the full table metadata.
@@ -348,6 +396,7 @@ impl<'a> TableScanBuilder<'a> {
             expression_evaluator_cache: Arc::new(ExpressionEvaluatorCache::new()),
             unified_partition_type,
             sort_orders,
+            column_stats,
         };
 
         Ok(TableScan {
@@ -699,7 +748,7 @@ mod tests {
         RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
         RESERVED_COL_NAME_POS, RESERVED_COL_NAME_SPEC_ID, RESERVED_FIELD_ID_POS,
     };
-    use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
+    use crate::scan::{FileScanTask, FileScanTaskDeleteFile, TableScan};
     use crate::spec::{
         DataContentType, DataFileFormat, Datum, Literal, MAIN_BRANCH, MappedField, NameMapping,
         NestedField, NullOrder, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot,
@@ -1056,6 +1105,50 @@ mod tests {
         let batch_stream = table.scan().build().unwrap().to_arrow().await.unwrap();
         let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
         assert!(batches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_plan_files_retains_column_stats_only_when_requested() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        let plan = |scan: TableScan| async move {
+            scan.plan_files()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+        };
+
+        let default_tasks = plan(fixture.table.scan().build().unwrap()).await;
+        assert!(!default_tasks.is_empty());
+        assert!(
+            default_tasks
+                .iter()
+                .all(|task| task.file_metrics().is_none())
+        );
+
+        for scan in [
+            fixture.table.scan().include_column_stats(),
+            fixture.table.scan().include_column_stats_for(["x"]),
+        ] {
+            let tasks = plan(scan.build().unwrap()).await;
+            assert!(!tasks.is_empty());
+            for task in tasks {
+                let metrics = task.file_metrics().expect("requested statistics");
+                assert_eq!(metrics.record_count, task.record_count());
+            }
+        }
+
+        assert!(
+            fixture
+                .table
+                .scan()
+                .include_column_stats_for(["missing"])
+                .build()
+                .is_err()
+        );
     }
 
     #[tokio::test]

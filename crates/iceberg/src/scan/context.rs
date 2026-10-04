@@ -25,8 +25,8 @@ use crate::delete_file_index::DeleteFileIndex;
 use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::io::object_cache::ObjectCache;
 use crate::scan::{
-    BoundPredicates, ExpressionEvaluatorCache, FileScanTask, ManifestEvaluatorCache,
-    PartitionFilterCache,
+    BoundPredicates, ColumnStatsSelection, ExpressionEvaluatorCache, FileScanTask,
+    FileScanTaskMetrics, ManifestEvaluatorCache, PartitionFilterCache,
 };
 use crate::spec::{
     ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, NameMapping,
@@ -52,6 +52,7 @@ pub(crate) struct ManifestFileContext {
     partition_spec: Option<PartitionSpecRef>,
     unified_partition_type: Option<Arc<StructType>>,
     sort_orders: Arc<HashMap<i64, SortOrderRef>>,
+    column_stats: Option<Arc<ColumnStatsSelection>>,
 }
 
 /// Wraps a [`ManifestEntryRef`] alongside the objects that are needed
@@ -71,6 +72,7 @@ pub(crate) struct ManifestEntryContext {
     pub unified_partition_type: Option<Arc<StructType>>,
     pub sort_order_id: Option<i32>,
     pub sort_order: Option<SortOrderRef>,
+    pub column_stats: Option<Arc<ColumnStatsSelection>>,
 }
 
 impl ManifestFileContext {
@@ -91,6 +93,7 @@ impl ManifestFileContext {
             partition_spec,
             unified_partition_type,
             sort_orders,
+            column_stats,
         } = self;
 
         let manifest = object_cache.get_manifest(&manifest_file).await?;
@@ -122,6 +125,7 @@ impl ManifestFileContext {
                 unified_partition_type: unified_partition_type.clone(),
                 sort_order_id,
                 sort_order,
+                column_stats: column_stats.clone(),
             };
 
             sender
@@ -151,9 +155,12 @@ impl ManifestEntryContext {
             .with_start(0)
             .with_length(self.manifest_entry.file_size_in_bytes())
             .with_record_count(Some(self.manifest_entry.record_count()))
-            .with_file_metrics(Some(Arc::new(crate::scan::FileScanTaskMetrics::from(
-                self.manifest_entry.data_file(),
-            ))))
+            .with_file_metrics(self.column_stats.as_deref().map(|selection| {
+                Arc::new(FileScanTaskMetrics::from_data_file(
+                    self.manifest_entry.data_file(),
+                    selection,
+                ))
+            }))
             .with_first_row_id(self.manifest_entry.data_file().first_row_id())
             .with_data_sequence_number(self.manifest_entry.sequence_number())
             .with_data_file_path(self.manifest_entry.file_path().to_string())
@@ -219,6 +226,9 @@ pub(crate) struct PlanContext {
     /// [`ManifestFileContext`] carries only this narrow map rather than the full table
     /// metadata. Mirrors how `unified_partition_type` carries a precomputed value.
     pub sort_orders: Arc<HashMap<i64, SortOrderRef>>,
+
+    /// Manifest column statistics to retain on planned tasks, if requested.
+    pub column_stats: Option<Arc<ColumnStatsSelection>>,
 }
 
 impl PlanContext {
@@ -350,6 +360,7 @@ impl PlanContext {
                 .cloned(),
             unified_partition_type: self.unified_partition_type.clone(),
             sort_orders: self.sort_orders.clone(),
+            column_stats: self.column_stats.clone(),
         }
     }
 }

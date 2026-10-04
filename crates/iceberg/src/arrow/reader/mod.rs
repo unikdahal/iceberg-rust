@@ -131,13 +131,11 @@ impl ArrowReaderBuilder {
     /// Supplies an execution-time predicate source sampled when each data-file task starts.
     ///
     /// The sampled predicate is combined using AND with task and delete predicates before
-    /// row-group, page-index, bloom-filter, and row filtering. Returning no predicate leaves
-    /// the task unchanged.
-    /// When row-group filtering is enabled, newer generations can prune unread row groups.
-    /// With the `runtime-row-group-selections` feature, page and positional-delete
-    /// selections retain row-group-local coordinates and remain live-refreshable.
-    /// Without that feature, a flattened page or positional-delete `RowSelection`
-    /// keeps the task on its start-time runtime snapshot for the whole stream.
+    /// file, row-group, page-index, bloom-filter, and row filtering. Returning no predicate
+    /// leaves the task unchanged. When row-group filtering is enabled, newer generations
+    /// prune unread row groups and refresh the next group's page selection and row filter
+    /// at row-group boundaries; page and positional-delete selections keep row-group-local
+    /// coordinates. See [`RuntimePredicateProvider`] for the publication contract.
     pub fn with_runtime_predicate_provider(
         mut self,
         runtime_predicate_provider: Arc<dyn RuntimePredicateProvider>,

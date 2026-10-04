@@ -524,31 +524,6 @@ async fn runtime_predicate_live_refresh_preserves_cached_equality_deletes() {
 }
 
 #[tokio::test]
-#[cfg(not(feature = "runtime-row-group-selections"))]
-async fn runtime_predicate_live_disabled_for_flattened_page_selection() {
-    let temp = TempDir::new().unwrap();
-    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "pages.parquet");
-    let provider = Arc::new(ChangingRuntimePredicate::new(
-        Some(Reference::new("id").greater_than_or_equal_to(Datum::int(0))),
-        0,
-    ));
-    let (mut stream, metrics) = start_runtime_scan(
-        scan_task(path, iceberg_schema(), None),
-        Some(provider.clone()),
-        true,
-        true,
-        4,
-    );
-    let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
-    provider.publish(Some(Predicate::AlwaysFalse), 1);
-    batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
-    assert_eq!(ids(&batches).len(), 12);
-    assert_eq!(provider.snapshots.load(Ordering::Relaxed), 1);
-    assert_eq!(metrics.runtime_live_pruning_tasks(), 0);
-}
-
-#[tokio::test]
-#[cfg(feature = "runtime-row-group-selections")]
 async fn runtime_predicate_live_removal_preserves_local_page_selections() {
     let temp = TempDir::new().unwrap();
     let path = write_row_group_file_with_page_size(
@@ -588,7 +563,6 @@ async fn runtime_predicate_live_removal_preserves_local_page_selections() {
 }
 
 #[tokio::test]
-#[cfg(feature = "runtime-row-group-selections")]
 async fn runtime_predicate_live_can_remove_all_remaining_page_selections() {
     let temp = TempDir::new().unwrap();
     let path = write_three_row_group_file(temp.path().to_str().unwrap(), "all-pages.parquet");
@@ -609,44 +583,6 @@ async fn runtime_predicate_live_can_remove_all_remaining_page_selections() {
     assert_eq!(ids(&batches), vec![0, 1, 2, 3]);
     assert_eq!(metrics.runtime_row_groups_pruned_initial(), 0);
     assert_eq!(metrics.runtime_row_groups_pruned_live(), 2);
-}
-
-#[tokio::test]
-#[cfg(not(feature = "runtime-row-group-selections"))]
-async fn runtime_predicate_live_disabled_for_position_delete_selection() {
-    let temp = TempDir::new().unwrap();
-    let dir = temp.path().to_str().unwrap();
-    let path = write_three_row_group_file(dir, "positions-data.parquet");
-    let positions = format!("{dir}/live-positions.parquet");
-    write_delete(
-        &positions,
-        vec![
-            field("file_path", DataType::Utf8, 2_147_483_546),
-            field("pos", DataType::Int64, 2_147_483_545),
-        ],
-        vec![
-            Arc::new(StringArray::from(vec![path.as_str()])),
-            Arc::new(Int64Array::from(vec![5])),
-        ],
-    );
-    let delete = FileScanTaskDeleteFile::builder()
-        .with_file_size_in_bytes(std::fs::metadata(&positions).unwrap().len())
-        .with_file_path(positions)
-        .with_file_type(DataContentType::PositionDeletes)
-        .with_file_format(DataFileFormat::Parquet)
-        .with_partition_spec_id(0)
-        .build();
-    let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
-    let task = scan_task_with_deletes(path, iceberg_schema(), None, vec![delete]);
-    let (mut stream, metrics) = start_runtime_scan(task, Some(provider.clone()), false, true, 4);
-    let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
-    provider.publish(Some(Predicate::AlwaysFalse), 1);
-    batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
-    assert_eq!(ids(&batches), vec![
-        0, 1, 2, 3, 100, 102, 103, 200, 201, 202, 203
-    ]);
-    assert_eq!(provider.snapshots.load(Ordering::Relaxed), 1);
-    assert_eq!(metrics.runtime_live_pruning_tasks(), 0);
 }
 
 #[tokio::test]
@@ -904,7 +840,6 @@ async fn runtime_pruning_preserves_position_and_equality_deletes() {
 }
 
 #[tokio::test]
-#[cfg(feature = "runtime-row-group-selections")]
 async fn runtime_predicate_live_preserves_delete_and_position_matrix() {
     use crate::metadata_columns::RESERVED_FIELD_ID_POS;
 
@@ -1087,7 +1022,6 @@ async fn runtime_pruning_metrics_respect_task_byte_range() {
     assert_eq!(metrics.runtime_row_groups_pruned(), 1);
 }
 
-#[cfg(feature = "runtime-row-group-selections")]
 fn write_wide_runtime_file(dir: &str, name: &str, statistics: bool) -> String {
     use parquet::file::properties::EnabledStatistics;
     let schema = Arc::new(ArrowSchema::new(vec![
@@ -1132,7 +1066,6 @@ fn write_wide_runtime_file(dir: &str, name: &str, statistics: bool) -> String {
 }
 
 #[tokio::test]
-#[cfg(feature = "runtime-row-group-selections")]
 async fn runtime_predicate_live_pages_save_key_bytes_without_pruning_groups() {
     let temp = TempDir::new().unwrap();
     let path = write_wide_runtime_file(
@@ -1172,7 +1105,6 @@ async fn runtime_predicate_live_pages_save_key_bytes_without_pruning_groups() {
 }
 
 #[tokio::test]
-#[cfg(feature = "runtime-row-group-selections")]
 async fn runtime_predicate_live_row_filter_avoids_payload_reads_without_statistics() {
     let temp = TempDir::new().unwrap();
     let path = write_wide_runtime_file(
@@ -1341,4 +1273,260 @@ async fn runtime_predicate_file_pruning_refreshes_for_pending_tasks() {
     assert_eq!(ids(&batches), vec![0, 1, 2, 3]);
     assert_eq!(metrics.runtime_file_tasks_pruned(), 1);
     assert_eq!(metrics.runtime_row_groups_pruned_live(), 2);
+}
+
+/// Writes one four-row group per base with small payloads.
+fn write_groups(path: &str, bases: &[i32], field_ids: bool, key: Option<&[u8]>, bloom: bool) {
+    let metadata = |id: &str| {
+        if field_ids {
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())])
+        } else {
+            HashMap::new()
+        }
+    };
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int32, false).with_metadata(metadata("1")),
+        Field::new("payload", DataType::Utf8, false).with_metadata(metadata("2")),
+    ]));
+    let mut properties = WriterProperties::builder()
+        .set_compression(Compression::UNCOMPRESSED)
+        .set_max_row_group_row_count(Some(4))
+        .set_bloom_filter_enabled(bloom);
+    if let Some(key) = key {
+        properties = properties.with_file_encryption_properties(
+            parquet::encryption::encrypt::FileEncryptionProperties::builder(key.to_vec())
+                .build()
+                .unwrap(),
+        );
+    }
+    let mut writer = ArrowWriter::try_new(
+        File::create(path).unwrap(),
+        Arc::clone(&schema),
+        Some(properties.build()),
+    )
+    .unwrap();
+    for &base in bases {
+        let ids: Vec<i32> = (base..base + 4).collect();
+        let payloads: Vec<String> = ids.iter().map(|id| format!("payload-{id}")).collect();
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(StringArray::from(payloads)),
+        ])
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.flush().unwrap();
+    }
+    writer.close().unwrap();
+}
+
+/// Reads the first batch, publishes `id >= threshold`, then drains the stream.
+async fn read_with_live_threshold(
+    task: FileScanTask,
+    threshold: i32,
+) -> (Vec<RecordBatch>, ScanMetrics) {
+    let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let (mut stream, metrics) = start_runtime_scan(task, Some(provider.clone()), true, true, 4);
+    let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
+    provider.publish(
+        Some(Reference::new("id").greater_than_or_equal_to(Datum::int(threshold))),
+        1,
+    );
+    batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+    (batches, metrics)
+}
+
+#[tokio::test]
+async fn runtime_predicate_live_reads_encrypted_files() {
+    let temp = TempDir::new().unwrap();
+    let path = format!("{}/encrypted.parquet", temp.path().to_str().unwrap());
+    let key = b"0123456789abcdef";
+    write_groups(&path, &[0, 100, 200], true, Some(key), false);
+    let key_metadata = crate::encryption::StandardKeyMetadata::try_new(key)
+        .unwrap()
+        .encode()
+        .unwrap();
+    let task = FileScanTask::builder()
+        .with_file_size_in_bytes(std::fs::metadata(&path).unwrap().len())
+        .with_start(0)
+        .with_length(0)
+        .with_data_file_path(path)
+        .with_data_file_format(DataFileFormat::Parquet)
+        .with_schema(iceberg_schema())
+        .with_project_field_ids(vec![1, 2])
+        .with_case_sensitive(false)
+        .with_key_metadata(Some(key_metadata))
+        .build()
+        .unwrap();
+    let (batches, metrics) = read_with_live_threshold(task, 200).await;
+    assert_eq!(ids(&batches), vec![0, 1, 2, 3, 200, 201, 202, 203]);
+    assert_eq!(metrics.runtime_live_pruning_tasks(), 1);
+    assert_eq!(metrics.runtime_row_groups_pruned_live(), 1);
+}
+
+#[tokio::test]
+async fn runtime_predicate_live_resolves_files_without_field_ids() {
+    use crate::spec::{MappedField, NameMapping};
+
+    let temp = TempDir::new().unwrap();
+    let path = format!("{}/no-ids.parquet", temp.path().to_str().unwrap());
+    write_groups(&path, &[0, 100, 200], false, None, false);
+    let mapping = Arc::new(NameMapping::new(vec![
+        MappedField::new(Some(1), vec!["id".to_string()], vec![]),
+        MappedField::new(Some(2), vec!["payload".to_string()], vec![]),
+    ]));
+    // A name mapping assigns ids by name; without one, ids follow column positions.
+    for name_mapping in [Some(mapping), None] {
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&path).unwrap().len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(path.clone())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(iceberg_schema())
+            .with_project_field_ids(vec![1, 2])
+            .with_name_mapping(name_mapping)
+            .with_case_sensitive(false)
+            .build()
+            .unwrap();
+        let (batches, metrics) = read_with_live_threshold(task, 200).await;
+        assert_eq!(ids(&batches), vec![0, 1, 2, 3, 200, 201, 202, 203]);
+        assert_eq!(metrics.runtime_row_groups_pruned_live(), 1);
+    }
+}
+
+#[tokio::test]
+async fn runtime_predicate_live_preserves_row_ids() {
+    use crate::metadata_columns::{RESERVED_COL_NAME_ROW_ID, RESERVED_FIELD_ID_ROW_ID};
+
+    let temp = TempDir::new().unwrap();
+    let path = format!("{}/row-ids.parquet", temp.path().to_str().unwrap());
+    write_groups(&path, &[0, 100, 200], true, None, false);
+    let task = FileScanTask::builder()
+        .with_file_size_in_bytes(std::fs::metadata(&path).unwrap().len())
+        .with_start(0)
+        .with_length(0)
+        .with_data_file_path(path)
+        .with_data_file_format(DataFileFormat::Parquet)
+        .with_schema(iceberg_schema())
+        .with_project_field_ids(vec![1, RESERVED_FIELD_ID_ROW_ID])
+        .with_first_row_id(Some(1000))
+        .with_data_sequence_number(Some(1))
+        .with_case_sensitive(false)
+        .build()
+        .unwrap();
+    let (batches, metrics) = read_with_live_threshold(task, 200).await;
+    assert_eq!(ids(&batches), vec![0, 1, 2, 3, 200, 201, 202, 203]);
+    let row_ids: Vec<i64> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name(RESERVED_COL_NAME_ROW_ID)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    // Row ids are first_row_id plus the absolute file position, so the
+    // skipped group must not shift the ids of the third group.
+    assert_eq!(row_ids, vec![
+        1000, 1001, 1002, 1003, 1008, 1009, 1010, 1011
+    ]);
+    assert_eq!(metrics.runtime_row_groups_pruned_live(), 1);
+}
+
+#[tokio::test]
+async fn runtime_predicate_live_refresh_respects_task_byte_range() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let temp = TempDir::new().unwrap();
+    let path = format!("{}/split-live.parquet", temp.path().to_str().unwrap());
+    write_groups(&path, &[0, 100, 200, 300], true, None, false);
+    let parquet = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
+    let start = 4 + parquet.metadata().row_group(0).compressed_size() as u64;
+    let file_size = std::fs::metadata(&path).unwrap().len();
+    let task = FileScanTask::builder()
+        .with_file_size_in_bytes(file_size)
+        .with_start(start)
+        .with_length(file_size - start)
+        .with_data_file_path(path)
+        .with_data_file_format(DataFileFormat::Parquet)
+        .with_schema(iceberg_schema())
+        .with_project_field_ids(vec![1, 2])
+        .with_case_sensitive(false)
+        .build()
+        .unwrap();
+    let (batches, metrics) = read_with_live_threshold(task, 300).await;
+    // RG0 belongs to another split. RG1 was in flight; RG2 is pruned live.
+    assert_eq!(ids(&batches), vec![100, 101, 102, 103, 300, 301, 302, 303]);
+    assert_eq!(metrics.runtime_row_groups_pruned_live(), 1);
+}
+
+#[tokio::test]
+async fn runtime_predicate_on_column_missing_from_file_is_safe() {
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "evolved.parquet");
+    // `added` was added to the table after this file was written.
+    let schema: SchemaRef = Arc::new(
+        Schema::builder()
+            .with_schema_id(2)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "payload", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(3, "added", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let all: Vec<i32> = [0, 100, 200]
+        .into_iter()
+        .flat_map(|base| base..base + 4)
+        .collect();
+    // Every row reads `added` as null, so IS NULL keeps every row.
+    let provider = Arc::new(FixedRuntimePredicate::new(
+        Reference::new("added").is_null(),
+    ));
+    let (batches, _) = execute(
+        scan_task(path.clone(), Arc::clone(&schema), None),
+        Some(provider),
+    )
+    .await;
+    assert_eq!(ids(&batches), all);
+    // A range on the null column matches nothing. The reader must either apply
+    // that exactly or fail open; it must never fail or return a partial result.
+    let provider = Arc::new(FixedRuntimePredicate::new(
+        Reference::new("added").greater_than_or_equal_to(Datum::int(5)),
+    ));
+    let (batches, _) = execute(scan_task(path, schema, None), Some(provider)).await;
+    let result = ids(&batches);
+    assert!(result.is_empty() || result == all, "{result:?}");
+}
+
+#[tokio::test]
+async fn runtime_predicate_with_bloom_filters_keeps_planned_equality() {
+    let temp = TempDir::new().unwrap();
+    let path = format!("{}/bloom.parquet", temp.path().to_str().unwrap());
+    write_groups(&path, &[0, 100, 200], true, None, true);
+    let planned = Reference::new("id")
+        .equal_to(Datum::int(201))
+        .bind(iceberg_schema(), false)
+        .unwrap();
+    let task = scan_task(path, iceberg_schema(), Some(planned));
+    let provider = Arc::new(FixedRuntimePredicate::new(
+        Reference::new("id").greater_than_or_equal_to(Datum::int(100)),
+    ));
+    let scan = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+        .with_data_file_concurrency_limit(1)
+        .with_row_selection_enabled(true)
+        .with_bloom_filter_enabled(true)
+        .with_runtime_predicate_provider(provider)
+        .build()
+        .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
+        .unwrap();
+    let metrics = scan.metrics().clone();
+    let batches: Vec<RecordBatch> = scan.stream().try_collect().await.unwrap();
+    assert_eq!(ids(&batches), vec![201]);
+    assert_eq!(metrics.runtime_predicate_tasks(), 1);
 }

@@ -19,30 +19,26 @@
 
 # Parquet row-group-local selection backport
 
-The pinned Arrow fork carries the generic Arrow 60 row-group-local selection API onto
-Arrow/Parquet 59.3.0, based on Arrow commit
-`f90e061326bd821a7af09281d9e92de6f3b603d9`.
+The pinned Arrow fork carries the Arrow 60 adaptive push-decoder API onto
+Arrow/Parquet 59.3.0: `RowGroupSelection`, `with_row_group_selections`,
+`is_at_row_group_boundary`, `row_groups_remaining`, `peek_next_row_group`,
+`clear_all_ranges` and `into_builder`. Its public surface matches Arrow 60.0.0.
 DataFusion 55.1 requires Arrow 59.2, so upgrading only Parquet to 60 would
 introduce incompatible Arrow types.
 
-The patch adds `RowGroupSelection`, builder configuration, and an independent
-selection queue for each row group. Existing global selections keep their
-current semantics. The existing push decoder, its buffered ranges, projection,
-row filter, and remaining offset/limit budget are retained when rebuilding at
-a row-group boundary. Codec and Arrow 60 page-index changes are excluded.
+The reader's live runtime pruning requires this API unconditionally. When the
+workspace moves to Arrow 60, delete the root `[patch.crates-io]` entry and this
+file; no source changes are needed.
 
-Relevant Arrow 60 tests cover local offsets, reordered and duplicate row
-groups, bitmap and RLE selections, empty selections, row filters, offset/limit,
-invalid group indices and lengths, conflicting builder options, and rebuilding
-with unconsumed local selections.
+Existing global selections keep their current semantics. Rebuilding at a
+row-group boundary retains the push decoder's buffered ranges, projection,
+row filter, and remaining offset/limit budget. Codec and Arrow 60 page-index
+changes are excluded.
 
 Parquet's manifest uses the registry dependencies from the published 59.3.0
 crate. This prevents a git-patched Parquet dependency from pulling a second
 copy of the Arrow types used by DataFusion and Iceberg.
 
-The production reader now pins the tested backport from
-`unikdahal/arrow-rs` at `fa20c8b77ff3d613c8b638f4f686f5316eb0138a`.
-The root Cargo patch is required in every consuming workspace: Cargo patches
-are not transitive. The backport source is maintained once in that Arrow fork; this branch does
-not duplicate its patch text. The local-selection feature is enabled by default;
-`--no-default-features` still tests the flattened-selection fallback.
+The production reader pins the tested backport from `unikdahal/arrow-rs` at
+`fa20c8b77ff3d613c8b638f4f686f5316eb0138a`. Cargo patches are not transitive,
+so every consuming workspace must carry the same root patch.

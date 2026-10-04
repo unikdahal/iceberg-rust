@@ -96,7 +96,8 @@ impl ScanMetrics {
 
     /// Tasks evaluated against whole-file manifest statistics before opening.
     /// Multiple byte-range splits of one file count as separate tasks.
-    pub fn runtime_file_tasks_considered(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn runtime_file_tasks_considered(&self) -> u64 {
         self.runtime_file_tasks_considered.load(Ordering::Relaxed)
     }
 
@@ -149,26 +150,30 @@ impl ScanMetrics {
         self.runtime_predicate_tasks.load(Ordering::Relaxed)
     }
 
-    /// Returns the additional row groups pruned by runtime statistics, after
-    /// task byte ranges and static or equality-delete predicates are applied.
+    /// Returns the additional row groups pruned by runtime statistics, at task
+    /// open or at a live row-group boundary, after task byte ranges and static or
+    /// equality-delete predicates are applied.
     pub fn runtime_row_groups_pruned(&self) -> u64 {
         self.runtime_row_groups_pruned.load(Ordering::Relaxed)
     }
 
     /// Runtime statistics candidates considered at task start or after a
     /// publication refresh. A surviving group can be considered more than once.
-    pub fn runtime_row_groups_considered(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn runtime_row_groups_considered(&self) -> u64 {
         self.runtime_row_groups_considered.load(Ordering::Relaxed)
     }
 
     /// Additional row groups removed by the task-start runtime snapshot.
-    pub fn runtime_row_groups_pruned_initial(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn runtime_row_groups_pruned_initial(&self) -> u64 {
         self.runtime_row_groups_pruned_initial
             .load(Ordering::Relaxed)
     }
 
     /// Number of tasks using boundary-aware live pruning rather than snapshot fallback.
-    pub fn runtime_live_pruning_tasks(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn runtime_live_pruning_tasks(&self) -> u64 {
         self.runtime_live_pruning_tasks.load(Ordering::Relaxed)
     }
 
@@ -179,7 +184,8 @@ impl ScanMetrics {
 
     /// Additional row groups removed at live boundaries. Also included in
     /// [`Self::runtime_row_groups_pruned`].
-    pub fn runtime_row_groups_pruned_live(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn runtime_row_groups_pruned_live(&self) -> u64 {
         self.runtime_row_groups_pruned_live.load(Ordering::Relaxed)
     }
 }

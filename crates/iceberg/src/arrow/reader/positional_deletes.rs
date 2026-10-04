@@ -48,7 +48,6 @@ impl ArrowReader {
         .into())
     }
 
-    #[cfg(feature = "runtime-row-group-selections")]
     pub(super) fn build_deletes_row_group_selections(
         row_group_metadata_list: &[RowGroupMetaData],
         selected_row_groups: &Option<Vec<usize>>,
