@@ -524,7 +524,6 @@ mod test {
         BinaryExpression, Bind, BoundPredicate, Predicate, Reference, SetExpression,
         UnaryExpression,
     };
-    use crate::scan::FileScanTaskMetrics;
     use crate::spec::{
         DataContentType, DataFile, DataFileFormat, Datum, NestedField, PartitionSpec,
         PartitionSpecRef, PrimitiveType, Schema, SchemaRef, Struct, Transform, Type,
