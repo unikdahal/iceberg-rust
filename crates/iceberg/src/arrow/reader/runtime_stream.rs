@@ -221,7 +221,11 @@ impl RuntimePrunedParquetStream {
         let Some(&next) = self.remaining.front() else {
             return Ok(());
         };
-        if !changed && (self.prepared_next == Some(next) || self.runtime.predicate().is_none()) {
+        if !changed
+            && (!self.row_selection_enabled
+                || self.prepared_next == Some(next)
+                || self.runtime.predicate().is_none())
+        {
             return Ok(());
         }
         let mut selections: Vec<_> = base_selections
