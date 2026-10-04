@@ -174,7 +174,9 @@ impl FileScanTaskReader {
         }
 
         let should_load_page_index = (self.row_selection_enabled
-            && (task.predicate().is_some() || runtime_predicate.is_some()))
+            && (task.predicate().is_some()
+                || runtime_predicate.is_some()
+                || (cfg!(feature = "runtime-row-group-selections") && runtime_state.is_some())))
             || !task.deletes().is_empty();
         let mut parquet_read_options = self.parquet_read_options;
         parquet_read_options.preload_page_index = should_load_page_index;
