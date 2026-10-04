@@ -1026,7 +1026,7 @@ index ba075b4..b681798 100644
      /// drain RG0, then `into_builder` and widen the projection to all three
      /// columns. The rebuilt decoder's `NeedsData` for RG1 must request
 diff --git a/parquet/src/arrow/push_decoder/remaining.rs b/parquet/src/arrow/push_decoder/remaining.rs
-index d265818..8d374c3 100644
+index d265818..79c3fc7 100644
 --- a/parquet/src/arrow/push_decoder/remaining.rs
 +++ b/parquet/src/arrow/push_decoder/remaining.rs
 @@ -16,7 +16,9 @@
@@ -1086,7 +1086,7 @@ index d265818..8d374c3 100644
 +                    let row_count =
 +                        parquet_metadata.row_group_num_rows(row_group.row_group_index)?;
 +                    if let Some(selection) = &row_group.selection {
-+                        let selection_rows = selection.total_row_count();
++                        let selection_rows = selection.row_count() + selection.skipped_row_count();
 +                        if selection_rows > row_count {
 +                            return Err(ParquetError::General(format!(
 +                                "Row selection for row group {} contains {selection_rows} rows, but the row group has {row_count}",
