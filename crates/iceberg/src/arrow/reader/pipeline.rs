@@ -26,13 +26,18 @@ use std::sync::atomic::AtomicU64;
 
 use arrow_schema::{DataType, Field};
 use futures::{StreamExt, TryStreamExt};
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::arrow::arrow_reader::{
+    ArrowPredicate, ArrowReaderMetadata, ArrowReaderOptions, RowFilter,
+};
 use parquet::arrow::{
     PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask, RowNumber,
 };
 use parquet::encryption::decrypt::FileDecryptionProperties;
 
 use super::row_lineage::synthesize_row_id_column;
+use super::runtime_predicate::{
+    RuntimePredicates, check_runtime_predicate_columns, intersect_page_selection,
+};
 use super::{
     ArrowFileReader, ArrowReader, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
     apply_name_mapping_to_arrow_schema, find_leaf_by_field_id,
@@ -76,6 +81,9 @@ impl ArrowReader {
             row_selection_enabled: self.row_selection_enabled,
             bloom_filter_enabled: self.bloom_filter_enabled,
             parquet_read_options: self.parquet_read_options,
+            runtime_predicates: self
+                .runtime_predicate_provider
+                .map(|provider| Arc::new(RuntimePredicates::new(provider))),
             scan_metrics: scan_metrics.clone(),
         };
 
@@ -130,12 +138,31 @@ struct FileScanTaskReader {
     row_selection_enabled: bool,
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
+    /// Shared across tasks so each publication is bound once.
+    runtime_predicates: Option<Arc<RuntimePredicates>>,
     scan_metrics: ScanMetrics,
+}
+
+/// A predicate resolved against one file, with its statistics-based row-group selection.
+struct PlannedPredicate {
+    predicate: Arc<BoundPredicate>,
+    field_id_map: HashMap<i32, usize>,
+    row_groups: Option<Vec<usize>>,
+    /// Runtime predicates are advisory: a failure skips them instead of the scan.
+    advisory: bool,
 }
 
 impl FileScanTaskReader {
     async fn process(self, task: FileScanTask) -> Result<ArrowRecordBatchStream> {
-        let should_load_page_index = (self.row_selection_enabled && task.predicate().is_some())
+        let runtime_predicate = self.runtime_predicates.as_ref().and_then(|predicates| {
+            predicates.current(
+                &task.schema_ref(),
+                task.case_sensitive(),
+                task.data_file_path(),
+            )
+        });
+        let should_load_page_index = (self.row_selection_enabled
+            && (task.predicate().is_some() || runtime_predicate.is_some()))
             || !task.deletes().is_empty();
         let mut parquet_read_options = self.parquet_read_options;
         parquet_read_options.preload_page_index = should_load_page_index;
@@ -470,7 +497,7 @@ impl FileScanTaskReader {
         // we also have an optional predicate resulting from equality delete files.
         // If both are present, we logical-AND them together to form a single filter
         // predicate that we can pass to the `RecordBatchStreamBuilder`.
-        let final_predicate = match (task.predicate(), delete_predicate) {
+        let planned_predicate = match (task.predicate(), delete_predicate) {
             (None, None) => None,
             (Some(predicate), None) => Some(predicate.clone()),
             (None, Some(ref predicate)) => Some(predicate.clone()),
@@ -508,30 +535,56 @@ impl FileScanTaskReader {
             selected_row_group_indices = Some(byte_range_filtered_row_groups);
         }
 
-        if let Some(predicate) = final_predicate {
-            let (iceberg_field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
-                record_batch_stream_builder.parquet_schema(),
-                record_batch_stream_builder.schema(),
-                &predicate,
+        let mut plans = Vec::with_capacity(2);
+        let mut arrow_predicates: Vec<Box<dyn ArrowPredicate>> = Vec::with_capacity(2);
+        if let Some(predicate) = planned_predicate {
+            let (plan, arrow_predicate) = self.plan_predicate(
+                Arc::new(predicate),
+                false,
+                &record_batch_stream_builder,
+                &task,
                 use_position_fallback,
             )?;
-
-            let row_filter = ArrowReader::get_row_filter(
+            plans.push(plan);
+            arrow_predicates.push(arrow_predicate);
+        }
+        // Skip the runtime predicate for this file if it does not store its
+        // columns exactly as the table types them, or if it cannot be planned.
+        if let Some(predicate) = runtime_predicate {
+            let planned = check_runtime_predicate_columns(
                 &predicate,
                 record_batch_stream_builder.parquet_schema(),
-                &iceberg_field_ids,
-                &field_id_map,
-            )?;
-            record_batch_stream_builder = record_batch_stream_builder.with_row_filter(row_filter);
+                record_batch_stream_builder.schema(),
+                task.schema(),
+                use_position_fallback,
+            )
+            .and_then(|()| {
+                self.plan_predicate(
+                    predicate,
+                    true,
+                    &record_batch_stream_builder,
+                    &task,
+                    use_position_fallback,
+                )
+            });
+            match planned {
+                Ok((plan, arrow_predicate)) => {
+                    plans.push(plan);
+                    arrow_predicates.push(arrow_predicate);
+                }
+                Err(error) => tracing::debug!(
+                    "Skipping runtime predicate for {}: {error}",
+                    task.data_file_path()
+                ),
+            }
+        }
+        if !arrow_predicates.is_empty() {
+            record_batch_stream_builder =
+                record_batch_stream_builder.with_row_filter(RowFilter::new(arrow_predicates));
+        }
 
-            if self.row_group_filtering_enabled {
-                let predicate_filtered_row_groups = ArrowReader::get_selected_row_group_indices(
-                    &predicate,
-                    record_batch_stream_builder.metadata(),
-                    &field_id_map,
-                    task.schema(),
-                )?;
-
+        for plan in &plans {
+            if let Some(predicate_filtered_row_groups) = &plan.row_groups {
                 // Merge predicate-based filtering with byte range filtering (if present)
                 // by taking the intersection of both filters
                 selected_row_group_indices = match selected_row_group_indices {
@@ -543,11 +596,13 @@ impl FileScanTaskReader {
                             .collect();
                         Some(intersection)
                     }
-                    None => Some(predicate_filtered_row_groups),
+                    None => Some(predicate_filtered_row_groups.clone()),
                 };
             }
+        }
 
-            if self.bloom_filter_enabled {
+        if self.bloom_filter_enabled {
+            for plan in &plans {
                 let all_rgs;
                 let candidate_rgs = match &selected_row_group_indices {
                     Some(indices) => indices.as_slice(),
@@ -559,10 +614,10 @@ impl FileScanTaskReader {
                 };
 
                 let bloom_filtered = Self::filter_row_groups_by_bloom_filter(
-                    &predicate,
+                    &plan.predicate,
                     &mut record_batch_stream_builder,
                     candidate_rgs,
-                    &field_id_map,
+                    &plan.field_id_map,
                 )
                 .await?;
 
@@ -570,14 +625,22 @@ impl FileScanTaskReader {
                     selected_row_group_indices = Some(bloom_filtered);
                 }
             }
+        }
 
-            if self.row_selection_enabled {
-                row_selection = ArrowReader::get_row_selection_for_filter_predicate(
-                    &predicate,
+        if self.row_selection_enabled {
+            for plan in &plans {
+                let selection = ArrowReader::get_row_selection_for_filter_predicate(
+                    &plan.predicate,
                     record_batch_stream_builder.metadata(),
                     &selected_row_group_indices,
-                    &field_id_map,
+                    &plan.field_id_map,
                     task.schema(),
+                );
+                row_selection = intersect_page_selection(
+                    row_selection,
+                    selection,
+                    plan.advisory,
+                    task.data_file_path(),
                 )?;
             }
         }
@@ -695,6 +758,49 @@ impl FileScanTaskReader {
             )
             .with_source(e)
         })
+    }
+
+    /// Plans the Arrow row-filter predicate and row-group selection for `predicate`.
+    fn plan_predicate(
+        &self,
+        predicate: Arc<BoundPredicate>,
+        advisory: bool,
+        builder: &ParquetRecordBatchStreamBuilder<ArrowFileReader>,
+        task: &FileScanTask,
+        use_position_fallback: bool,
+    ) -> Result<(PlannedPredicate, Box<dyn ArrowPredicate>)> {
+        let (iceberg_field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
+            builder.parquet_schema(),
+            builder.schema(),
+            &predicate,
+            use_position_fallback,
+        )?;
+        let arrow_predicate = ArrowReader::get_arrow_predicate(
+            &predicate,
+            builder.parquet_schema(),
+            &iceberg_field_ids,
+            &field_id_map,
+        )?;
+        let row_groups = if self.row_group_filtering_enabled {
+            Some(ArrowReader::get_selected_row_group_indices(
+                &predicate,
+                builder.metadata(),
+                &field_id_map,
+                task.schema(),
+            )?)
+        } else {
+            None
+        };
+        if self.bloom_filter_enabled {
+            collect_bloom_filter_field_ids(&predicate)?;
+        }
+        let plan = PlannedPredicate {
+            predicate,
+            field_id_map,
+            row_groups,
+            advisory,
+        };
+        Ok((plan, arrow_predicate))
     }
 
     /// Reads bloom filters for relevant columns and evaluates the predicate
