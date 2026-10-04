@@ -30,7 +30,11 @@ license = { workspace = true }
 repository = { workspace = true }
 
 [features]
-default = []
+default = ["runtime-row-group-selections"]
+# Requires the generic Parquet 59.3 row-group-local selection backport.
+# Enabled in this fork with the matching Parquet patch; consuming workspaces
+# must carry the same patch because Cargo patches are not transitive.
+runtime-row-group-selections = []
 
 [dependencies]
 aes-gcm = { workspace = true }

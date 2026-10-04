@@ -1,0 +1,71 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Fork Adaptive Iceberg Pruning Validation
+on:
+  push:
+    branches: [feat/iceberg-adaptive-pruning]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  reader-tests:
+    if: github.repository == 'unikdahal/iceberg-rust'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: iceberg
+          persist-credentials: false
+      - name: Install Rust toolchains
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup toolchain install nightly-2026-04-16 --profile minimal --component rustfmt --component clippy
+      - name: Check Iceberg formatting
+        working-directory: iceberg
+        run: cargo +nightly-2026-04-16 fmt --all -- --check
+      - name: Verify the production dependency pin
+        working-directory: iceberg
+        run: cargo +stable tree --locked -p iceberg -i parquet
+      - name: Run live runtime and delete tests with local selections
+        working-directory: iceberg
+        run: |
+          cargo +stable test --locked -p iceberg --features runtime-row-group-selections --lib runtime_predicate -- --nocapture
+      - name: Run all Iceberg library regressions
+        working-directory: iceberg
+        run: cargo +stable test --locked -p iceberg --lib
+      - name: Run task and manifest planning regressions
+        working-directory: iceberg
+        run: |
+          cargo +stable test --locked -p iceberg --lib scan::
+      - name: Run existing reader regressions with local selections
+        working-directory: iceberg
+        run: |
+          cargo +stable test --locked -p iceberg --features runtime-row-group-selections --lib arrow::reader
+      - name: Run inclusive metrics and lazy delete loader regressions
+        working-directory: iceberg
+        run: |
+          cargo +stable test --locked -p iceberg --lib expr::visitors::inclusive_metrics_evaluator
+          cargo +stable test --locked -p iceberg --lib arrow::delete_file_loader
+      - name: Strict clippy for the selection-enabled reader
+        working-directory: iceberg
+        run: |
+          cargo +nightly-2026-04-16 clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Check fallback without local selections
+        working-directory: iceberg
+        run: cargo +stable test --locked -p iceberg --no-default-features --lib runtime_predicate

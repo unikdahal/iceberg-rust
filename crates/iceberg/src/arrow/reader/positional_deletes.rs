@@ -37,7 +37,43 @@ impl ArrowReader {
         selected_row_groups: &Option<Vec<usize>>,
         positional_deletes: &DeleteVector,
     ) -> Result<RowSelection> {
-        let mut results: Vec<RowSelector> = Vec::new();
+        Ok(Self::build_deletes_row_group_selectors(
+            row_group_metadata_list,
+            selected_row_groups,
+            positional_deletes,
+        )?
+        .into_iter()
+        .flat_map(|(_, selectors)| selectors)
+        .collect::<Vec<_>>()
+        .into())
+    }
+
+    #[cfg(feature = "runtime-row-group-selections")]
+    pub(super) fn build_deletes_row_group_selections(
+        row_group_metadata_list: &[RowGroupMetaData],
+        selected_row_groups: &Option<Vec<usize>>,
+        positional_deletes: &DeleteVector,
+    ) -> Result<Vec<parquet::arrow::push_decoder::RowGroupSelection>> {
+        Ok(Self::build_deletes_row_group_selectors(
+            row_group_metadata_list,
+            selected_row_groups,
+            positional_deletes,
+        )?
+        .into_iter()
+        .map(|(idx, selectors)| {
+            parquet::arrow::push_decoder::RowGroupSelection::new(idx, Some(selectors.into()))
+        })
+        .collect())
+    }
+
+    /// Preserve the existing delete-vector iterator and absolute row positions,
+    /// emitting one local mask only for each selected row group.
+    fn build_deletes_row_group_selectors(
+        row_group_metadata_list: &[RowGroupMetaData],
+        selected_row_groups: &Option<Vec<usize>>,
+        positional_deletes: &DeleteVector,
+    ) -> Result<Vec<(usize, Vec<RowSelector>)>> {
+        let mut selections = Vec::new();
         let mut selected_row_groups_idx = 0;
         let mut current_row_group_base_idx: u64 = 0;
         let mut delete_vector_iter = positional_deletes.iter();
@@ -79,12 +115,14 @@ impl ArrowReader {
                 }
             }
 
+            let mut results = Vec::new();
             let mut next_deleted_row_idx = match next_deleted_row_idx_opt {
                 Some(next_deleted_row_idx) => {
                     // if the index of the next deleted row is beyond this row group, add a selection for
                     // the remainder of this row group and skip to the next row group
                     if next_deleted_row_idx >= next_row_group_base_idx {
                         results.push(RowSelector::select(row_group_num_rows as usize));
+                        selections.push((idx, results));
                         current_row_group_base_idx += row_group_num_rows;
                         continue;
                     }
@@ -95,6 +133,7 @@ impl ArrowReader {
                 // If there are no more pos deletes, add a selector for the entirety of this row group.
                 _ => {
                     results.push(RowSelector::select(row_group_num_rows as usize));
+                    selections.push((idx, results));
                     current_row_group_base_idx += row_group_num_rows;
                     continue;
                 }
@@ -140,10 +179,11 @@ impl ArrowReader {
                 ));
             }
 
+            selections.push((idx, results));
             current_row_group_base_idx += row_group_num_rows;
         }
 
-        Ok(results.into())
+        Ok(selections)
     }
 }
 

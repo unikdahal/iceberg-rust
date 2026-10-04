@@ -20,22 +20,26 @@
 //! predicates, row-group / row selection, and delete handling into a stream
 //! of transformed Arrow `RecordBatch`es.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use arrow_schema::{DataType, Field};
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::arrow::push_decoder::ParquetPushDecoderBuilder;
 use parquet::arrow::{
     PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask, RowNumber,
 };
 use parquet::encryption::decrypt::FileDecryptionProperties;
 
 use super::row_lineage::synthesize_row_id_column;
+use super::runtime_predicate::RuntimePredicateState;
+use super::runtime_stream::RuntimePrunedParquetStream;
 use super::{
-    ArrowFileReader, ArrowReader, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
-    apply_name_mapping_to_arrow_schema, find_leaf_by_field_id,
+    ArrowFileReader, ArrowReader, ParquetReadOptions, RuntimePredicateProvider,
+    add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
+    find_leaf_by_field_id,
 };
 use crate::arrow::build_partition_constant;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
@@ -48,6 +52,7 @@ use crate::expr::BoundPredicate;
 use crate::expr::visitors::bloom_filter_evaluator::{
     BloomFilterEvaluator, ColumnBloomFilter, collect_bloom_filter_field_ids,
 };
+use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{
     RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_POS,
@@ -76,6 +81,7 @@ impl ArrowReader {
             row_selection_enabled: self.row_selection_enabled,
             bloom_filter_enabled: self.bloom_filter_enabled,
             parquet_read_options: self.parquet_read_options,
+            runtime_predicate_provider: self.runtime_predicate_provider,
             scan_metrics: scan_metrics.clone(),
         };
 
@@ -107,6 +113,19 @@ impl ArrowReader {
     }
 }
 
+fn intersect_row_groups(current: Option<Vec<usize>>, next: Vec<usize>) -> Vec<usize> {
+    match current {
+        Some(current) => {
+            let next: HashSet<_> = next.into_iter().collect();
+            current
+                .into_iter()
+                .filter(|idx| next.contains(idx))
+                .collect()
+        }
+        None => next,
+    }
+}
+
 // Metadata columns synthesized without reading any data column, so a projection of only
 // these can be pruned to zero data columns. Narrower than `is_metadata_field`, which also
 // matches `_deleted` -- excluded here because it has no synthesis handler.
@@ -130,12 +149,67 @@ struct FileScanTaskReader {
     row_selection_enabled: bool,
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
+    runtime_predicate_provider: Option<Arc<dyn RuntimePredicateProvider>>,
     scan_metrics: ScanMetrics,
 }
 
 impl FileScanTaskReader {
     async fn process(self, task: FileScanTask) -> Result<ArrowRecordBatchStream> {
-        let should_load_page_index = (self.row_selection_enabled && task.predicate().is_some())
+        let mut runtime_state = self
+            .runtime_predicate_provider
+            .as_ref()
+            .map(|provider| RuntimePredicateState::new(Arc::clone(provider)));
+        if let Some(state) = runtime_state.as_mut()
+            && let Err(error) = state.refresh_if_changed(task.schema_ref(), task.case_sensitive())
+        {
+            tracing::debug!(
+                "Skipping runtime predicate for {} because refreshing failed: {error}",
+                task.data_file_path()
+            );
+        }
+        let runtime_predicate = runtime_state
+            .as_ref()
+            .and_then(|state| state.predicate().cloned());
+        if runtime_predicate.is_some() {
+            self.scan_metrics.record_runtime_predicate_task();
+        }
+
+        // Reject the task before opening its data file or scheduling delete reads.
+        // A whole-file rejection is valid for every byte-range split of that file.
+        if let (Some(predicate), Some(metrics)) = (&runtime_predicate, task.file_metrics()) {
+            self.scan_metrics.record_runtime_file_task_considered();
+            let valid_bounds = metrics
+                .lower_bounds
+                .iter()
+                .chain(&metrics.upper_bounds)
+                .all(|(id, bound)| {
+                    task.schema().field_by_id(*id).is_some_and(|field| {
+                        field.field_type.as_primitive_type() == Some(bound.data_type())
+                    })
+                });
+            // Schema evolution and malformed statistics must not create false negatives.
+            let keep = if valid_bounds {
+                InclusiveMetricsEvaluator::eval_file_metrics(predicate, metrics)
+            } else {
+                Ok(true)
+            };
+            match keep {
+                Ok(false) => {
+                    self.scan_metrics.record_runtime_file_task_pruned();
+                    return Ok(Box::pin(futures::stream::empty()));
+                }
+                Ok(true) => {}
+                Err(error) => tracing::debug!(
+                    "Skipping runtime file pruning for {}: {error}",
+                    task.data_file_path()
+                ),
+            }
+        }
+
+        let should_load_page_index = (self.row_selection_enabled
+            && (task.predicate().is_some()
+                || runtime_predicate.is_some()
+                || (cfg!(feature = "runtime-row-group-selections") && runtime_state.is_some())))
             || !task.deletes().is_empty();
         let mut parquet_read_options = self.parquet_read_options;
         parquet_read_options.preload_page_index = should_load_page_index;
@@ -196,6 +270,14 @@ impl FileScanTaskReader {
         )?;
 
         // Build the stream reader, reusing the already-opened file reader
+        let (parquet_file_reader, live_file_reader) =
+            if runtime_state.is_some() && self.row_group_filtering_enabled {
+                let (planning, live) = parquet_file_reader.into_shared();
+                (planning, Some(live))
+            } else {
+                (parquet_file_reader, None)
+            };
+        let live_metadata = live_file_reader.as_ref().map(|_| arrow_metadata.clone());
         let mut record_batch_stream_builder =
             ParquetRecordBatchStreamBuilder::new_with_metadata(parquet_file_reader, arrow_metadata);
 
@@ -466,17 +548,19 @@ impl FileScanTaskReader {
         let delete_filter = delete_filter_rx.await.unwrap()?;
         let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
 
-        // In addition to the optional predicate supplied in the `FileScanTask`,
-        // we also have an optional predicate resulting from equality delete files.
-        // If both are present, we logical-AND them together to form a single filter
-        // predicate that we can pass to the `RecordBatchStreamBuilder`.
-        let final_predicate = match (task.predicate(), delete_predicate) {
+        let base_predicate = match (task.predicate(), delete_predicate) {
             (None, None) => None,
             (Some(predicate), None) => Some(predicate.clone()),
             (None, Some(ref predicate)) => Some(predicate.clone()),
             (Some(filter_predicate), Some(delete_predicate)) => {
                 Some(filter_predicate.clone().and(delete_predicate))
             }
+        };
+        let final_predicate = match (&base_predicate, &runtime_predicate) {
+            (None, None) => None,
+            (Some(predicate), None) => Some(predicate.clone()),
+            (None, Some(predicate)) => Some(predicate.clone()),
+            (Some(base), Some(runtime)) => Some(base.clone().and(runtime.clone())),
         };
 
         // There are three possible sources for potential lists of selected RowGroup indices,
@@ -496,6 +580,7 @@ impl FileScanTaskReader {
         // by using a `RowSelection`.
         let mut selected_row_group_indices = None;
         let mut row_selection = None;
+        let mut planned_row_filter = None;
 
         // Filter row groups based on byte range from task.start and task.length.
         // If both start and length are 0, read the entire file (backwards compatibility).
@@ -508,43 +593,62 @@ impl FileScanTaskReader {
             selected_row_group_indices = Some(byte_range_filtered_row_groups);
         }
 
-        if let Some(predicate) = final_predicate {
+        let positional_delete_indexes = delete_filter.get_delete_vector(&task);
+        let use_local_selections = cfg!(feature = "runtime-row-group-selections")
+            && runtime_state.is_some()
+            && self.row_group_filtering_enabled;
+
+        if let Some(predicate) = final_predicate.as_ref() {
             let (iceberg_field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
                 record_batch_stream_builder.parquet_schema(),
                 record_batch_stream_builder.schema(),
-                &predicate,
+                predicate,
                 use_position_fallback,
             )?;
 
             let row_filter = ArrowReader::get_row_filter(
-                &predicate,
+                predicate,
                 record_batch_stream_builder.parquet_schema(),
                 &iceberg_field_ids,
                 &field_id_map,
             )?;
-            record_batch_stream_builder = record_batch_stream_builder.with_row_filter(row_filter);
+            planned_row_filter = Some(row_filter);
 
             if self.row_group_filtering_enabled {
-                let predicate_filtered_row_groups = ArrowReader::get_selected_row_group_indices(
-                    &predicate,
-                    record_batch_stream_builder.metadata(),
-                    &field_id_map,
-                    task.schema(),
-                )?;
-
-                // Merge predicate-based filtering with byte range filtering (if present)
-                // by taking the intersection of both filters
-                selected_row_group_indices = match selected_row_group_indices {
-                    Some(byte_range_filtered) => {
-                        // Keep only row groups that are in both filters
-                        let intersection: Vec<usize> = byte_range_filtered
-                            .into_iter()
-                            .filter(|idx| predicate_filtered_row_groups.contains(idx))
-                            .collect();
-                        Some(intersection)
-                    }
-                    None => Some(predicate_filtered_row_groups),
-                };
+                if let Some(base_predicate) = &base_predicate {
+                    let base_filtered_row_groups = ArrowReader::get_selected_row_group_indices(
+                        base_predicate,
+                        record_batch_stream_builder.metadata(),
+                        &field_id_map,
+                        task.schema(),
+                    )?;
+                    selected_row_group_indices = Some(intersect_row_groups(
+                        selected_row_group_indices,
+                        base_filtered_row_groups,
+                    ));
+                }
+                if let Some(runtime_predicate) = &runtime_predicate {
+                    let before_runtime = selected_row_group_indices
+                        .as_ref()
+                        .map(Vec::len)
+                        .unwrap_or_else(|| record_batch_stream_builder.metadata().num_row_groups());
+                    let runtime_filtered_row_groups = ArrowReader::get_selected_row_group_indices(
+                        runtime_predicate,
+                        record_batch_stream_builder.metadata(),
+                        &field_id_map,
+                        task.schema(),
+                    )?;
+                    let after_runtime = intersect_row_groups(
+                        selected_row_group_indices.take(),
+                        runtime_filtered_row_groups,
+                    );
+                    self.scan_metrics
+                        .record_runtime_row_groups_considered(before_runtime);
+                    self.scan_metrics.record_runtime_row_groups_pruned(
+                        before_runtime.saturating_sub(after_runtime.len()),
+                    );
+                    selected_row_group_indices = Some(after_runtime);
+                }
             }
 
             if self.bloom_filter_enabled {
@@ -559,7 +663,7 @@ impl FileScanTaskReader {
                 };
 
                 let bloom_filtered = Self::filter_row_groups_by_bloom_filter(
-                    &predicate,
+                    predicate,
                     &mut record_batch_stream_builder,
                     candidate_rgs,
                     &field_id_map,
@@ -571,9 +675,9 @@ impl FileScanTaskReader {
                 }
             }
 
-            if self.row_selection_enabled {
+            if self.row_selection_enabled && !use_local_selections {
                 row_selection = ArrowReader::get_row_selection_for_filter_predicate(
-                    &predicate,
+                    predicate,
                     record_batch_stream_builder.metadata(),
                     &selected_row_group_indices,
                     &field_id_map,
@@ -582,9 +686,8 @@ impl FileScanTaskReader {
             }
         }
 
-        let positional_delete_indexes = delete_filter.get_delete_vector(&task);
-
-        if let Some(positional_delete_indexes) = positional_delete_indexes {
+        if !use_local_selections && let Some(positional_delete_indexes) = &positional_delete_indexes
+        {
             let delete_row_selection = {
                 let positional_delete_indexes = positional_delete_indexes.lock().unwrap();
 
@@ -605,23 +708,113 @@ impl FileScanTaskReader {
             };
         }
 
-        if let Some(row_selection) = row_selection {
-            record_batch_stream_builder =
-                record_batch_stream_builder.with_row_selection(row_selection);
-        }
-
-        if let Some(selected_row_group_indices) = selected_row_group_indices {
-            record_batch_stream_builder =
-                record_batch_stream_builder.with_row_groups(selected_row_group_indices);
-        }
-
         // Build the batch stream and send all the RecordBatches that it generates
         // to the requester. When `_row_id` is projected, synthesize it over the raw parquet
         // batches (using the reader-produced `_pos` position) before the transformer, which
         // then passes it through as a virtual field.
         let first_row_id = task.first_row_id();
-        let record_batch_stream = record_batch_stream_builder.build()?.map(move |batch| {
-            let mut batch = batch.map_err(|err| -> Error { err.into() })?;
+        let raw_stream: ArrowRecordBatchStream = if let Some(runtime_state) = runtime_state
+            && self.row_group_filtering_enabled
+            && (row_selection.is_none() || use_local_selections)
+        {
+            let metadata = live_metadata.expect("metadata retained for live-capable task");
+            let remaining = selected_row_group_indices
+                .unwrap_or_else(|| (0..metadata.metadata().num_row_groups()).collect());
+            let builder = ParquetPushDecoderBuilder::new_with_metadata(metadata.clone())
+                .with_projection(projection_mask);
+            #[cfg(feature = "runtime-row-group-selections")]
+            let mut local_selections = if use_local_selections {
+                Some(ArrowReader::get_row_group_selections_for_filter_predicate(
+                    base_predicate
+                        .as_ref()
+                        .filter(|_| self.row_selection_enabled),
+                    &metadata,
+                    &remaining,
+                    task.schema(),
+                    use_position_fallback,
+                )?)
+            } else {
+                None
+            };
+            #[cfg(feature = "runtime-row-group-selections")]
+            if let Some(selections) = local_selections.as_mut()
+                && let Some(positional_deletes) = &positional_delete_indexes
+            {
+                let deletes = positional_deletes.lock().unwrap();
+                let delete_selections = ArrowReader::build_deletes_row_group_selections(
+                    metadata.metadata().row_groups(),
+                    &Some(remaining.clone()),
+                    &deletes,
+                )?;
+                for (selection, deletes) in selections.iter_mut().zip(delete_selections) {
+                    debug_assert_eq!(selection.row_group_index(), deletes.row_group_index());
+                    let combined = match (selection.selection(), deletes.selection()) {
+                        (Some(pages), Some(deletes)) => Some(pages.intersection(deletes)),
+                        (None, Some(deletes)) => Some(deletes.clone()),
+                        (Some(pages), None) => Some(pages.clone()),
+                        (None, None) => None,
+                    };
+                    *selection = parquet::arrow::push_decoder::RowGroupSelection::new(
+                        selection.row_group_index(),
+                        combined,
+                    );
+                }
+            }
+            #[cfg(feature = "runtime-row-group-selections")]
+            let mut builder = if let Some(selections) = &local_selections {
+                builder.with_row_group_selections(selections.clone())
+            } else {
+                builder.with_row_groups(remaining.clone())
+            };
+            #[cfg(not(feature = "runtime-row-group-selections"))]
+            let mut builder = builder.with_row_groups(remaining.clone());
+            if let Some(batch_size) = self.batch_size {
+                builder = builder.with_batch_size(batch_size);
+            }
+            if let Some(row_filter) = planned_row_filter {
+                builder = builder.with_row_filter(row_filter);
+            }
+            let stream = RuntimePrunedParquetStream::new(
+                builder.build()?,
+                live_file_reader.expect("reader retained for live-capable task"),
+                metadata,
+                remaining,
+                runtime_state,
+                task,
+                use_position_fallback,
+                self.scan_metrics.clone(),
+            );
+            #[cfg(feature = "runtime-row-group-selections")]
+            let stream = if let Some(selections) = local_selections {
+                stream.with_row_group_selections(
+                    selections,
+                    base_predicate,
+                    self.row_selection_enabled,
+                )
+            } else {
+                stream
+            };
+            stream.into_stream()
+        } else {
+            // A flattened page/position selection has coordinates in the
+            // original selected groups. Keep task-open pruning until the
+            // selection is represented per row group.
+            if let Some(row_selection) = row_selection {
+                record_batch_stream_builder =
+                    record_batch_stream_builder.with_row_selection(row_selection);
+            }
+            if let Some(row_groups) = selected_row_group_indices {
+                record_batch_stream_builder =
+                    record_batch_stream_builder.with_row_groups(row_groups);
+            }
+            if let Some(row_filter) = planned_row_filter {
+                record_batch_stream_builder =
+                    record_batch_stream_builder.with_row_filter(row_filter);
+            }
+            Box::pin(record_batch_stream_builder.build()?.map_err(Error::from))
+        };
+        let record_batch_stream = raw_stream.map(move |batch| {
+            let mut batch = batch?;
             if project_row_id {
                 batch = synthesize_row_id_column(batch, first_row_id)?;
             }

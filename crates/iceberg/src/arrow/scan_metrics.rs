@@ -53,12 +53,30 @@ impl<F: FileRead> FileRead for CountingFileRead<F> {
 #[derive(Clone, Debug)]
 pub struct ScanMetrics {
     bytes_read: Arc<AtomicU64>,
+    runtime_file_tasks_considered: Arc<AtomicU64>,
+    runtime_file_tasks_pruned: Arc<AtomicU64>,
+    runtime_predicate_tasks: Arc<AtomicU64>,
+    runtime_row_groups_pruned: Arc<AtomicU64>,
+    runtime_row_groups_considered: Arc<AtomicU64>,
+    runtime_row_groups_pruned_initial: Arc<AtomicU64>,
+    runtime_live_pruning_tasks: Arc<AtomicU64>,
+    runtime_predicate_refreshes: Arc<AtomicU64>,
+    runtime_row_groups_pruned_live: Arc<AtomicU64>,
 }
 
 impl ScanMetrics {
     pub(crate) fn new() -> Self {
         Self {
             bytes_read: Arc::new(AtomicU64::new(0)),
+            runtime_file_tasks_considered: Arc::new(AtomicU64::new(0)),
+            runtime_file_tasks_pruned: Arc::new(AtomicU64::new(0)),
+            runtime_predicate_tasks: Arc::new(AtomicU64::new(0)),
+            runtime_row_groups_pruned: Arc::new(AtomicU64::new(0)),
+            runtime_row_groups_considered: Arc::new(AtomicU64::new(0)),
+            runtime_row_groups_pruned_initial: Arc::new(AtomicU64::new(0)),
+            runtime_live_pruning_tasks: Arc::new(AtomicU64::new(0)),
+            runtime_predicate_refreshes: Arc::new(AtomicU64::new(0)),
+            runtime_row_groups_pruned_live: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -66,9 +84,103 @@ impl ScanMetrics {
         &self.bytes_read
     }
 
+    pub(crate) fn record_runtime_file_task_considered(&self) {
+        self.runtime_file_tasks_considered
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_runtime_file_task_pruned(&self) {
+        self.runtime_file_tasks_pruned
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Tasks evaluated against whole-file manifest statistics before opening.
+    /// Multiple byte-range splits of one file count as separate tasks.
+    pub fn runtime_file_tasks_considered(&self) -> u64 {
+        self.runtime_file_tasks_considered.load(Ordering::Relaxed)
+    }
+
+    /// Tasks rejected before any data-file or task-specific delete-file I/O.
+    /// Counts tasks, rather than distinct files, to respect split scan planning.
+    pub fn runtime_file_tasks_pruned(&self) -> u64 {
+        self.runtime_file_tasks_pruned.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_runtime_predicate_task(&self) {
+        self.runtime_predicate_tasks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_runtime_row_groups_pruned(&self, count: usize) {
+        self.runtime_row_groups_pruned
+            .fetch_add(count as u64, Ordering::Relaxed);
+        self.runtime_row_groups_pruned_initial
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_runtime_row_groups_considered(&self, count: usize) {
+        self.runtime_row_groups_considered
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_runtime_live_pruning_task(&self) {
+        self.runtime_live_pruning_tasks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_runtime_predicate_refresh(&self) {
+        self.runtime_predicate_refreshes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_runtime_row_groups_pruned_live(&self, count: usize) {
+        self.runtime_row_groups_pruned
+            .fetch_add(count as u64, Ordering::Relaxed);
+        self.runtime_row_groups_pruned_live
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
     /// Total bytes read from storage during this scan, including data files and delete files.
     pub fn bytes_read(&self) -> u64 {
         self.bytes_read.load(Ordering::Relaxed)
+    }
+
+    /// Returns the number of data-file tasks that accepted a runtime predicate.
+    pub fn runtime_predicate_tasks(&self) -> u64 {
+        self.runtime_predicate_tasks.load(Ordering::Relaxed)
+    }
+
+    /// Returns the additional row groups pruned by runtime statistics, after
+    /// task byte ranges and static or equality-delete predicates are applied.
+    pub fn runtime_row_groups_pruned(&self) -> u64 {
+        self.runtime_row_groups_pruned.load(Ordering::Relaxed)
+    }
+
+    /// Runtime statistics candidates considered at task start or after a
+    /// publication refresh. A surviving group can be considered more than once.
+    pub fn runtime_row_groups_considered(&self) -> u64 {
+        self.runtime_row_groups_considered.load(Ordering::Relaxed)
+    }
+
+    /// Additional row groups removed by the task-start runtime snapshot.
+    pub fn runtime_row_groups_pruned_initial(&self) -> u64 {
+        self.runtime_row_groups_pruned_initial
+            .load(Ordering::Relaxed)
+    }
+
+    /// Number of tasks using boundary-aware live pruning rather than snapshot fallback.
+    pub fn runtime_live_pruning_tasks(&self) -> u64 {
+        self.runtime_live_pruning_tasks.load(Ordering::Relaxed)
+    }
+
+    /// Successful post-start runtime publication refreshes, including `None` predicates.
+    pub fn runtime_predicate_refreshes(&self) -> u64 {
+        self.runtime_predicate_refreshes.load(Ordering::Relaxed)
+    }
+
+    /// Additional row groups removed at live boundaries. Also included in
+    /// [`Self::runtime_row_groups_pruned`].
+    pub fn runtime_row_groups_pruned_live(&self) -> u64 {
+        self.runtime_row_groups_pruned_live.load(Ordering::Relaxed)
     }
 }
 

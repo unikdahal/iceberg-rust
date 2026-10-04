@@ -15,10 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
+
 use fnv::FnvHashSet;
 
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
 use crate::expr::{BoundPredicate, BoundReference};
+use crate::scan::FileScanTaskMetrics;
 use crate::spec::{DataFile, Datum, PrimitiveLiteral};
 use crate::{Error, ErrorKind};
 
@@ -27,12 +30,22 @@ const ROWS_MIGHT_MATCH: crate::Result<bool> = Ok(true);
 const ROWS_CANNOT_MATCH: crate::Result<bool> = Ok(false);
 
 pub(crate) struct InclusiveMetricsEvaluator<'a> {
-    data_file: &'a DataFile,
+    value_counts: &'a HashMap<i32, u64>,
+    null_value_counts: &'a HashMap<i32, u64>,
+    nan_value_counts: &'a HashMap<i32, u64>,
+    lower_bounds: &'a HashMap<i32, Datum>,
+    upper_bounds: &'a HashMap<i32, Datum>,
 }
 
 impl<'a> InclusiveMetricsEvaluator<'a> {
     fn new(data_file: &'a DataFile) -> Self {
-        InclusiveMetricsEvaluator { data_file }
+        Self {
+            value_counts: &data_file.value_counts,
+            null_value_counts: &data_file.null_value_counts,
+            nan_value_counts: &data_file.nan_value_counts,
+            lower_bounds: &data_file.lower_bounds,
+            upper_bounds: &data_file.upper_bounds,
+        }
     }
 
     /// Evaluate this `InclusiveMetricsEvaluator`'s filter predicate against the
@@ -52,24 +65,41 @@ impl<'a> InclusiveMetricsEvaluator<'a> {
         visit(&mut evaluator, filter)
     }
 
+    pub(crate) fn eval_file_metrics(
+        filter: &'a BoundPredicate,
+        metrics: &'a FileScanTaskMetrics,
+    ) -> crate::Result<bool> {
+        if metrics.record_count == Some(0) {
+            return ROWS_CANNOT_MATCH;
+        }
+        let mut evaluator = Self {
+            value_counts: &metrics.value_counts,
+            null_value_counts: &metrics.null_value_counts,
+            nan_value_counts: &metrics.nan_value_counts,
+            lower_bounds: &metrics.lower_bounds,
+            upper_bounds: &metrics.upper_bounds,
+        };
+        visit(&mut evaluator, filter)
+    }
+
     fn nan_count(&self, field_id: i32) -> Option<&u64> {
-        self.data_file.nan_value_counts.get(&field_id)
+        self.nan_value_counts.get(&field_id)
     }
 
     fn null_count(&self, field_id: i32) -> Option<&u64> {
-        self.data_file.null_value_counts.get(&field_id)
+        self.null_value_counts.get(&field_id)
     }
 
     fn value_count(&self, field_id: i32) -> Option<&u64> {
-        self.data_file.value_counts.get(&field_id)
+        self.value_counts.get(&field_id)
     }
 
     fn lower_bound(&self, field_id: i32) -> Option<&Datum> {
-        self.data_file.lower_bounds.get(&field_id)
+        self.lower_bounds.get(&field_id)
     }
 
     fn upper_bound(&self, field_id: i32) -> Option<&Datum> {
-        self.data_file.upper_bounds.get(&field_id)
+        self.upper_bounds.get(&field_id)
     }
 
     fn contains_nans_only(&self, field_id: i32) -> bool {

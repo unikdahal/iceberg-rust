@@ -37,6 +37,54 @@ use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator
 use crate::spec::Schema;
 
 impl ArrowReader {
+    /// Build independent page selections, preserving each row group's local
+    /// coordinates when a later runtime publication removes another group.
+    #[cfg(feature = "runtime-row-group-selections")]
+    pub(super) fn get_row_group_selections_for_filter_predicate(
+        predicate: Option<&BoundPredicate>,
+        metadata: &parquet::arrow::arrow_reader::ArrowReaderMetadata,
+        selected_row_groups: &[usize],
+        snapshot_schema: &Schema,
+        use_position_fallback: bool,
+    ) -> Result<Vec<parquet::arrow::push_decoder::RowGroupSelection>> {
+        use parquet::arrow::push_decoder::RowGroupSelection;
+
+        let parquet_metadata = metadata.metadata();
+        let page_context = predicate
+            .zip(parquet_metadata.column_index())
+            .zip(parquet_metadata.offset_index());
+        let field_id_map = predicate
+            .map(|predicate| {
+                Self::build_field_id_set_and_map(
+                    parquet_metadata.file_metadata().schema_descr(),
+                    metadata.schema(),
+                    predicate,
+                    use_position_fallback,
+                )
+                .map(|(_, map)| map)
+            })
+            .transpose()?;
+        selected_row_groups
+            .iter()
+            .map(|&idx| {
+                let selection =
+                    if let Some(((predicate, column_index), offset_index)) = page_context {
+                        Some(RowSelection::from(PageIndexEvaluator::eval(
+                            predicate,
+                            &column_index[idx],
+                            &offset_index[idx],
+                            parquet_metadata.row_group(idx),
+                            field_id_map.as_ref().expect("predicate mapping exists"),
+                            snapshot_schema,
+                        )?))
+                    } else {
+                        None
+                    };
+                Ok(RowGroupSelection::new(idx, selection))
+            })
+            .collect()
+    }
+
     pub(super) fn get_row_filter(
         predicates: &BoundPredicate,
         parquet_schema: &SchemaDescriptor,
