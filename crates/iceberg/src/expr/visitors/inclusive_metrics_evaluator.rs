@@ -21,6 +21,7 @@ use fnv::FnvHashSet;
 
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
 use crate::expr::{BoundPredicate, BoundReference};
+use crate::scan::FileScanTaskMetrics;
 use crate::spec::{DataFile, Datum, PrimitiveLiteral};
 use crate::{Error, ErrorKind};
 
@@ -57,6 +58,19 @@ impl<'a> From<&'a DataFile> for FileMetrics<'a> {
             nan_value_counts: &data_file.nan_value_counts,
             lower_bounds: &data_file.lower_bounds,
             upper_bounds: &data_file.upper_bounds,
+        }
+    }
+}
+
+impl<'a> From<&'a FileScanTaskMetrics> for FileMetrics<'a> {
+    fn from(metrics: &'a FileScanTaskMetrics) -> Self {
+        Self {
+            record_count: metrics.record_count(),
+            value_counts: metrics.value_counts(),
+            null_value_counts: metrics.null_value_counts(),
+            nan_value_counts: metrics.nan_value_counts(),
+            lower_bounds: metrics.lower_bounds(),
+            upper_bounds: metrics.upper_bounds(),
         }
     }
 }
