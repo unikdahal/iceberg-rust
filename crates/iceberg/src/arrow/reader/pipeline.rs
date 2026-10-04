@@ -168,6 +168,8 @@ impl FileScanTaskReader {
         if let (Some(predicate), Some(metrics)) = (&runtime_predicate, task.file_metrics())
             && !Self::file_might_match(predicate, metrics, &task)
         {
+            self.scan_metrics.record_runtime_predicate_task();
+            self.scan_metrics.record_runtime_file_task_pruned();
             return Ok(Box::pin(futures::stream::empty()));
         }
 
@@ -620,9 +622,33 @@ impl FileScanTaskReader {
                 }
             }
         };
+        if plans.iter().any(|plan| plan.advisory) {
+            self.scan_metrics.record_runtime_predicate_task();
+        }
         if let Some(arrow_predicate) = arrow_predicate {
             record_batch_stream_builder =
                 record_batch_stream_builder.with_row_filter(RowFilter::new(vec![arrow_predicate]));
+        }
+
+        // Count the candidate groups the runtime predicate removed beyond the
+        // task byte range and the planned and equality-delete predicates.
+        if let Some(runtime_groups) = plans
+            .iter()
+            .find(|plan| plan.advisory)
+            .and_then(|plan| plan.row_groups.as_ref())
+        {
+            let without_runtime = match plans.iter().find(|plan| !plan.advisory) {
+                Some(planned) => planned.row_groups.clone().unwrap_or_default(),
+                None => (0..record_batch_stream_builder.metadata().num_row_groups()).collect(),
+            };
+            let candidates = |groups: &[usize]| match &selected_row_group_indices {
+                Some(selected) => intersect_sorted(groups, selected).len(),
+                None => groups.len(),
+            };
+            let with_runtime = intersect_sorted(&without_runtime, runtime_groups);
+            self.scan_metrics.record_runtime_row_groups_pruned(
+                candidates(&without_runtime).saturating_sub(candidates(&with_runtime)),
+            );
         }
 
         for plan in &plans {
