@@ -570,7 +570,15 @@ impl FileScanTaskReader {
             match planned {
                 Ok((plan, arrow_predicate)) => {
                     plans.push(plan);
-                    arrow_predicates.push(arrow_predicate);
+                    // Arrow evaluates filters sequentially, decoding later
+                    // predicates only for surviving rows. Prefer the runtime
+                    // restriction first: join-key ranges and TopK bounds can
+                    // sharply reduce decoding/evaluation of planned predicates
+                    // and equality-delete lists. Neither source has cost or
+                    // selectivity estimates here, so this is a heuristic; a
+                    // cheaper, more selective planned filter could favor the
+                    // opposite order. Statistics/page intersections are unchanged.
+                    arrow_predicates.insert(0, arrow_predicate);
                 }
                 Err(error) => tracing::debug!(
                     "Skipping runtime predicate for {}: {error}",

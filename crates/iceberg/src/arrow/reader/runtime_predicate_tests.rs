@@ -20,9 +20,12 @@ use std::fs::File;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{
+    ArrayRef, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+    StringArray,
+};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -259,7 +262,10 @@ fn write_groups(path: &str, bases: &[i32], field_ids: bool, key: Option<&[u8]>, 
     writer.close().unwrap();
 }
 
-struct FailedProvider;
+#[derive(Default)]
+struct FailedProvider {
+    snapshots: AtomicU64,
+}
 
 impl RuntimePredicateProvider for FailedProvider {
     fn generation(&self) -> u64 {
@@ -267,6 +273,7 @@ impl RuntimePredicateProvider for FailedProvider {
     }
 
     fn snapshot(&self) -> Result<RuntimePredicateSnapshot> {
+        self.snapshots.fetch_add(1, Ordering::Relaxed);
         Err(crate::Error::new(
             crate::ErrorKind::Unexpected,
             "publication failed",
@@ -279,8 +286,17 @@ async fn execute_tasks(
     provider: Option<Arc<dyn RuntimePredicateProvider>>,
     bloom_filter: bool,
 ) -> (Vec<RecordBatch>, ScanMetrics) {
+    execute_tasks_with_concurrency(tasks, provider, bloom_filter, 1).await
+}
+
+async fn execute_tasks_with_concurrency(
+    tasks: Vec<FileScanTask>,
+    provider: Option<Arc<dyn RuntimePredicateProvider>>,
+    bloom_filter: bool,
+    concurrency: usize,
+) -> (Vec<RecordBatch>, ScanMetrics) {
     let mut builder = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
-        .with_data_file_concurrency_limit(1)
+        .with_data_file_concurrency_limit(concurrency)
         .with_row_selection_enabled(true)
         .with_bloom_filter_enabled(bloom_filter);
     if let Some(provider) = provider {
@@ -388,7 +404,7 @@ async fn runtime_predicate_failures_keep_the_planned_filter() {
     };
     // A failing provider, and a predicate that cannot be bound.
     for provider in [
-        Arc::new(FailedProvider) as Arc<dyn RuntimePredicateProvider>,
+        Arc::new(FailedProvider::default()) as Arc<dyn RuntimePredicateProvider>,
         Arc::new(FixedRuntimePredicate::new(
             Reference::new("missing").equal_to(Datum::int(1)),
         )),
@@ -842,6 +858,9 @@ async fn runtime_predicate_prunes_pages_within_a_row_group() {
             let scan = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
                 .with_row_group_filtering_enabled(false)
                 .with_row_selection_enabled(row_selection)
+                // Keep the skipped page ranges separate; the default 1 MiB
+                // coalescing threshold would read them along with selected pages.
+                .with_range_coalesce_bytes(0)
                 .with_runtime_predicate_provider(provider)
                 .build()
                 .read(Box::pin(futures::stream::iter([Ok(task)])) as FileScanTaskStream)
@@ -980,4 +999,218 @@ fn runtime_page_selection_failure_keeps_the_planned_selection() {
         intersect_page_selection(Some(planned.clone()), selection(), true, &path).unwrap();
     assert_eq!(combined, Some(planned));
     assert!(intersect_page_selection(None, selection(), false, &path).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runtime_predicate_concurrent_tasks_reuse_success_and_failure() {
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "concurrent.parquet");
+    let tasks: Vec<_> = (0..12)
+        .map(|_| scan_task(path.clone(), iceberg_schema(), None))
+        .collect();
+    let success = Arc::new(FixedRuntimePredicate::new(
+        Reference::new("id").greater_than_or_equal_to(Datum::int(200)),
+    ));
+    let absent = Arc::new(ChangingRuntimePredicate::new(None, 1));
+    let failure = Arc::new(FailedProvider::default());
+    let binding_failure = Arc::new(FixedRuntimePredicate::new(
+        Reference::new("missing").equal_to(Datum::int(0)),
+    ));
+    for (provider, expected) in [
+        (success.clone() as Arc<dyn RuntimePredicateProvider>, vec![
+            200, 201, 202, 203,
+        ]),
+        (
+            absent.clone() as Arc<dyn RuntimePredicateProvider>,
+            all_ids(),
+        ),
+        (
+            failure.clone() as Arc<dyn RuntimePredicateProvider>,
+            all_ids(),
+        ),
+        (
+            binding_failure.clone() as Arc<dyn RuntimePredicateProvider>,
+            all_ids(),
+        ),
+    ] {
+        let (batches, _) =
+            execute_tasks_with_concurrency(tasks.clone(), Some(provider), false, 4).await;
+        let mut actual = ids(&batches);
+        actual.sort_unstable();
+        let mut expected = expected.repeat(tasks.len());
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+    assert_eq!(success.snapshots(), 1);
+    assert_eq!(absent.snapshots(), 1);
+    assert_eq!(failure.snapshots.load(Ordering::Relaxed), 1);
+    assert_eq!(binding_failure.snapshots(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runtime_predicate_concurrent_tasks_pick_up_new_generation_without_regression() {
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "generations.parquet");
+    let task = scan_task(path, iceberg_schema(), None);
+    let provider = Arc::new(ChangingRuntimePredicate::new(
+        Some(Reference::new("id").greater_than_or_equal_to(Datum::int(100))),
+        1,
+    ));
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let next = task.clone();
+    // Withhold the second wave until the four first-wave tasks have completed.
+    // This tests a publication boundary without depending on file-read timing.
+    let tasks = futures::stream::iter(vec![task.clone(); 4].into_iter().map(Ok))
+        .chain(futures::stream::once(async move {
+            release_rx.await.unwrap();
+            Ok(next)
+        }))
+        .chain(futures::stream::iter(vec![task; 3].into_iter().map(Ok)));
+    let scan = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+        .with_data_file_concurrency_limit(4)
+        .with_runtime_predicate_provider(provider.clone())
+        .build()
+        .read(Box::pin(tasks) as FileScanTaskStream)
+        .unwrap();
+    let mut stream = scan.stream();
+    let mut first_wave = vec![];
+    // Each first-wave file produces two four-row batches (RG1 and RG2).
+    for _ in 0..8 {
+        first_wave.push(stream.try_next().await.unwrap().unwrap());
+    }
+    let mut actual = ids(&first_wave);
+    actual.sort_unstable();
+    let mut expected = [100, 101, 102, 103, 200, 201, 202, 203].repeat(4);
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+    assert_eq!(provider.snapshots(), 1);
+
+    provider.publish(
+        Some(Reference::new("id").greater_than_or_equal_to(Datum::int(200))),
+        2,
+    );
+    release_tx.send(()).unwrap();
+    let second_wave = stream.try_collect::<Vec<_>>().await.unwrap();
+    let mut actual = ids(&second_wave);
+    actual.sort_unstable();
+    let mut expected = [200, 201, 202, 203].repeat(4);
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+    assert_eq!(provider.snapshots(), 2);
+}
+
+async fn check_promoted_runtime_column(
+    path: &str,
+    file_type: DataType,
+    table_type: PrimitiveType,
+    values: ArrayRef,
+    predicate: Predicate,
+) -> Vec<RecordBatch> {
+    write_delete(
+        path,
+        vec![
+            field("id", DataType::Int32, 1),
+            field("value", file_type, 3),
+        ],
+        vec![Arc::new(Int32Array::from(vec![0, 1, 2, 3])), values],
+    );
+    let schema = Arc::new(
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(3, "value", Type::Primitive(table_type)).into(),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let planned = Reference::new("id")
+        .greater_than_or_equal_to(Datum::int(1))
+        .bind(schema.clone(), false)
+        .unwrap();
+    let task = scan_task_with_deletes_and_projection(
+        path.to_string(),
+        schema,
+        Some(planned),
+        vec![],
+        vec![1, 3],
+    );
+    let (baseline, _) = execute(task.clone(), None).await;
+    let provider = Arc::new(FixedRuntimePredicate::new(predicate));
+    let (batches, _) = execute(task, Some(provider.clone())).await;
+    assert_eq!(ids(&batches), vec![1, 2, 3]);
+    assert_eq!(
+        batches, baseline,
+        "promotion must fail open and preserve the planned filter"
+    );
+    assert_eq!(provider.snapshots(), 1);
+    batches
+}
+
+#[tokio::test]
+async fn runtime_predicate_on_float_promoted_to_double_is_ignored() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("float.parquet");
+    // The DOUBLE boundary is between adjacent FLOAT values. Narrowing it
+    // changes the comparison even though it lies within the FLOAT range.
+    let boundary = 1.0 + f64::from(f32::EPSILON) / 2.0;
+    let batches = check_promoted_runtime_column(
+        path.to_str().unwrap(),
+        DataType::Float32,
+        PrimitiveType::Double,
+        Arc::new(Float32Array::from(vec![
+            1.0,
+            1.0,
+            1.0 + f32::EPSILON,
+            1.0 + f32::EPSILON,
+        ])),
+        Reference::new("value").less_than(Datum::double(boundary)),
+    )
+    .await;
+    assert_eq!(batches[0].column(1).data_type(), &DataType::Float64);
+    let values = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(values.values().as_ref(), &[
+        1.0,
+        f64::from(1.0 + f32::EPSILON),
+        f64::from(1.0 + f32::EPSILON)
+    ]);
+}
+
+#[tokio::test]
+async fn runtime_predicate_on_widened_decimal_precision_is_ignored() {
+    let temp = TempDir::new().unwrap();
+    // 8 -> 9 can share the same physical width; precision itself must be
+    // checked, rather than only the Parquet physical storage type.
+    for precision in [9, 12] {
+        let path = temp.path().join(format!("decimal-{precision}.parquet"));
+        let batches = check_promoted_runtime_column(
+            path.to_str().unwrap(),
+            DataType::Decimal128(8, 2),
+            PrimitiveType::Decimal {
+                precision,
+                scale: 2,
+            },
+            Arc::new(
+                Decimal128Array::from(vec![123, 456, 789, 1000])
+                    .with_precision_and_scale(8, 2)
+                    .unwrap(),
+            ),
+            // Fits the table precision but exceeds the file's precision.
+            Reference::new("value").greater_than(Datum::decimal_from_str("1000000.00").unwrap()),
+        )
+        .await;
+        assert_eq!(
+            batches[0].column(1).data_type(),
+            &DataType::Decimal128(precision as u8, 2)
+        );
+        let values = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(values.values().as_ref(), &[456, 789, 1000]);
+    }
 }
