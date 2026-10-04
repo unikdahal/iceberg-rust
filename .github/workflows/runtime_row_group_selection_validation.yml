@@ -48,7 +48,8 @@ jobs:
           cargo +stable test --locked -p iceberg --features runtime-row-group-selections --lib runtime_predicate -- --nocapture
       - name: Run task and manifest planning regressions
         working-directory: iceberg
-        run: cargo +stable test --locked -p iceberg --lib scan::
+        run: |
+          cargo +stable test --locked -p iceberg --lib scan::
       - name: Run existing reader regressions with local selections
         working-directory: iceberg
         run: |
