@@ -652,8 +652,7 @@ impl FileScanTaskReader {
         let positional_delete_indexes = delete_filter.get_delete_vector(&task);
         let use_local_selections = cfg!(feature = "runtime-row-group-selections")
             && runtime_state.is_some()
-            && self.row_group_filtering_enabled
-            && positional_delete_indexes.is_none();
+            && self.row_group_filtering_enabled;
 
         if let Some(predicate) = final_predicate.as_ref() {
             let (iceberg_field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
@@ -743,7 +742,8 @@ impl FileScanTaskReader {
             }
         }
 
-        if let Some(positional_delete_indexes) = positional_delete_indexes {
+        if !use_local_selections && let Some(positional_delete_indexes) = &positional_delete_indexes
+        {
             let delete_row_selection = {
                 let positional_delete_indexes = positional_delete_indexes.lock().unwrap();
 
@@ -779,7 +779,7 @@ impl FileScanTaskReader {
             let builder = ParquetPushDecoderBuilder::new_with_metadata(metadata.clone())
                 .with_projection(projection_mask);
             #[cfg(feature = "runtime-row-group-selections")]
-            let local_selections = if use_local_selections {
+            let mut local_selections = if use_local_selections {
                 Some(ArrowReader::get_row_group_selections_for_filter_predicate(
                     final_predicate
                         .as_ref()
@@ -792,6 +792,30 @@ impl FileScanTaskReader {
             } else {
                 None
             };
+            #[cfg(feature = "runtime-row-group-selections")]
+            if let Some(selections) = local_selections.as_mut()
+                && let Some(positional_deletes) = &positional_delete_indexes
+            {
+                let deletes = positional_deletes.lock().unwrap();
+                let delete_selections = ArrowReader::build_deletes_row_group_selections(
+                    metadata.metadata().row_groups(),
+                    &Some(remaining.clone()),
+                    &deletes,
+                )?;
+                for (selection, deletes) in selections.iter_mut().zip(delete_selections) {
+                    debug_assert_eq!(selection.row_group_index(), deletes.row_group_index());
+                    let combined = match (selection.selection(), deletes.selection()) {
+                        (Some(pages), Some(deletes)) => Some(pages.intersection(deletes)),
+                        (None, Some(deletes)) => Some(deletes.clone()),
+                        (Some(pages), None) => Some(pages.clone()),
+                        (None, None) => None,
+                    };
+                    *selection = parquet::arrow::push_decoder::RowGroupSelection::new(
+                        selection.row_group_index(),
+                        combined,
+                    );
+                }
+            }
             #[cfg(feature = "runtime-row-group-selections")]
             let mut builder = if let Some(selections) = &local_selections {
                 builder.with_row_group_selections(selections.clone())

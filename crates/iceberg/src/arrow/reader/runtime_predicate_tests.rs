@@ -612,6 +612,7 @@ async fn runtime_predicate_live_can_remove_all_remaining_page_selections() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "runtime-row-group-selections"))]
 async fn runtime_predicate_live_disabled_for_position_delete_selection() {
     let temp = TempDir::new().unwrap();
     let dir = temp.path().to_str().unwrap();
@@ -682,6 +683,16 @@ fn scan_task_with_deletes(
     predicate: Option<crate::expr::BoundPredicate>,
     deletes: Vec<FileScanTaskDeleteFile>,
 ) -> FileScanTask {
+    scan_task_with_deletes_and_projection(file_path, schema, predicate, deletes, vec![1, 2])
+}
+
+fn scan_task_with_deletes_and_projection(
+    file_path: String,
+    schema: SchemaRef,
+    predicate: Option<crate::expr::BoundPredicate>,
+    deletes: Vec<FileScanTaskDeleteFile>,
+    project_field_ids: Vec<i32>,
+) -> FileScanTask {
     FileScanTask::builder()
         .with_file_size_in_bytes(std::fs::metadata(&file_path).unwrap().len())
         .with_start(0)
@@ -689,7 +700,7 @@ fn scan_task_with_deletes(
         .with_data_file_path(file_path)
         .with_data_file_format(DataFileFormat::Parquet)
         .with_schema(schema)
-        .with_project_field_ids(vec![1, 2])
+        .with_project_field_ids(project_field_ids)
         .with_predicate(predicate)
         .with_deletes(deletes)
         .with_case_sensitive(false)
@@ -888,6 +899,112 @@ async fn runtime_pruning_preserves_position_and_equality_deletes() {
         assert_eq!(provider.snapshots(), 1);
         assert_eq!(metrics.runtime_predicate_tasks(), 1);
         assert_eq!(metrics.runtime_row_groups_pruned(), 2);
+        assert!(metrics.bytes_read() < baseline_metrics.bytes_read());
+    }
+}
+
+#[tokio::test]
+#[cfg(feature = "runtime-row-group-selections")]
+async fn runtime_predicate_live_preserves_delete_and_position_matrix() {
+    use crate::metadata_columns::RESERVED_FIELD_ID_POS;
+
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path().to_str().unwrap();
+    let path =
+        write_row_group_file_with_page_size(dir, "live-delete-matrix.parquet", &[0, 100, 200], 1);
+    let positions = format!("{dir}/live-delete-positions.parquet");
+    let equalities = format!("{dir}/live-delete-equalities.parquet");
+    // Deletes exist in RG0, the dynamically skipped RG1, and retained RG2.
+    write_delete(
+        &positions,
+        vec![
+            field("file_path", DataType::Utf8, 2_147_483_546),
+            field("pos", DataType::Int64, 2_147_483_545),
+        ],
+        vec![
+            Arc::new(StringArray::from(vec![path.as_str(); 4])),
+            Arc::new(Int64Array::from(vec![1, 5, 8, 11])),
+        ],
+    );
+    write_delete(&equalities, vec![field("id", DataType::Int32, 1)], vec![
+        Arc::new(Int32Array::from(vec![2, 202])),
+    ]);
+    let delete = |path: String, file_type, equality_ids| {
+        FileScanTaskDeleteFile::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&path).unwrap().len())
+            .with_file_path(path)
+            .with_file_type(file_type)
+            .with_file_format(DataFileFormat::Parquet)
+            .with_partition_spec_id(0)
+            .with_equality_ids(equality_ids)
+            .build()
+    };
+    let position = delete(positions, DataContentType::PositionDeletes, None);
+    let equality = delete(equalities, DataContentType::EqualityDeletes, Some(vec![1]));
+    for (deletes, expected) in [
+        (vec![], vec![2, 3, 200, 201, 202]),
+        (vec![position.clone()], vec![2, 3, 201, 202]),
+        (vec![equality.clone()], vec![3, 200, 201]),
+        (vec![position, equality], vec![3, 201]),
+    ] {
+        let planned = Reference::new("id")
+            .greater_than_or_equal_to(Datum::int(2))
+            .and(Reference::new("id").less_than_or_equal_to(Datum::int(202)))
+            .bind(iceberg_schema(), false)
+            .unwrap();
+        let task = scan_task_with_deletes_and_projection(
+            path.clone(),
+            iceberg_schema(),
+            Some(planned),
+            deletes,
+            vec![1, 2, RESERVED_FIELD_ID_POS],
+        );
+        let (baseline, baseline_metrics) = start_runtime_scan(task.clone(), None, true, true, 1);
+        let full = baseline.try_collect::<Vec<_>>().await.unwrap();
+        let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+        let (mut stream, metrics) = start_runtime_scan(task, Some(provider.clone()), true, true, 1);
+        let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
+        provider.publish(
+            Some(Reference::new("id").greater_than_or_equal_to(Datum::int(200))),
+            1,
+        );
+        batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+        assert_eq!(ids(&batches), expected);
+        assert_eq!(
+            ids(&full)
+                .into_iter()
+                .filter(|id| *id < 100 || *id >= 200)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let positions: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("_pos")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        let expected_positions: Vec<i64> = expected
+            .iter()
+            .map(|id| {
+                if *id < 100 {
+                    i64::from(*id)
+                } else {
+                    i64::from(*id - 200 + 8)
+                }
+            })
+            .collect();
+        assert_eq!(positions, expected_positions);
+        assert_eq!(provider.snapshots.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.runtime_predicate_refreshes(), 1);
+        assert_eq!(metrics.runtime_row_groups_pruned_live(), 1);
         assert!(metrics.bytes_read() < baseline_metrics.bytes_read());
     }
 }
