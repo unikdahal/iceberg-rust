@@ -129,7 +129,7 @@ impl ArrowReaderBuilder {
 
     /// Supplies an execution-time predicate source sampled once for each data-file task.
     ///
-    /// The sampled predicate is ANDed with the task predicate and delete predicate before
+    /// The sampled predicate is combined using AND with task and delete predicates before
     /// row-group, page-index, bloom-filter, and row filtering. Returning no predicate leaves
     /// the task unchanged.
     pub fn with_runtime_predicate_provider(
