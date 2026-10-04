@@ -294,8 +294,10 @@ async fn runtime_predicate_live_arrival_waits_for_row_group_boundary() {
     assert_eq!(metrics.runtime_predicate_tasks(), 1);
     assert_eq!(metrics.runtime_live_pruning_tasks(), 1);
     assert_eq!(metrics.runtime_predicate_refreshes(), 1);
-    assert_eq!(metrics.runtime_live_row_groups_pruned(), 1);
+    assert_eq!(metrics.runtime_row_groups_pruned_live(), 1);
     assert_eq!(metrics.runtime_row_groups_pruned(), 1);
+    assert_eq!(metrics.runtime_row_groups_pruned_initial(), 0);
+    assert_eq!(metrics.runtime_row_groups_considered(), 2);
     assert!(metrics.bytes_read() < baseline_metrics.bytes_read());
 }
 
@@ -332,7 +334,83 @@ async fn runtime_predicate_live_tightening_only_prunes_remaining_groups() {
     assert_eq!(ids(&output).into_iter().max(), Some(403));
     assert_eq!(provider.snapshots.load(Ordering::Relaxed), 4);
     assert_eq!(metrics.runtime_predicate_refreshes(), 3);
-    assert_eq!(metrics.runtime_live_row_groups_pruned(), 3);
+    assert_eq!(metrics.runtime_row_groups_pruned_live(), 3);
+    assert_eq!(metrics.runtime_row_groups_considered(), 8);
+}
+
+#[tokio::test]
+async fn runtime_predicate_concurrent_files_cache_generations_independently() {
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path().to_str().unwrap();
+    let task_a = scan_task(
+        write_three_row_group_file(dir, "a.parquet"),
+        iceberg_schema(),
+        None,
+    );
+    let task_b = scan_task(
+        write_three_row_group_file(dir, "b.parquet"),
+        iceberg_schema(),
+        None,
+    );
+    let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let (mut a, metrics_a) = start_runtime_scan(task_a, Some(provider.clone()), false, true, 4);
+    let (mut b, metrics_b) = start_runtime_scan(task_b, Some(provider.clone()), false, true, 4);
+    let (first_a, first_b) = tokio::join!(a.try_next(), b.try_next());
+    assert_eq!(ids(&[first_a.unwrap().unwrap()]), vec![0, 1, 2, 3]);
+    assert_eq!(ids(&[first_b.unwrap().unwrap()]), vec![0, 1, 2, 3]);
+    assert_eq!(provider.snapshots.load(Ordering::Relaxed), 2);
+    provider.publish(
+        Some(Reference::new("id").greater_than_or_equal_to(Datum::int(200))),
+        1,
+    );
+    let (rest_a, rest_b) = tokio::join!(a.try_collect::<Vec<_>>(), b.try_collect::<Vec<_>>());
+    assert_eq!(ids(&rest_a.unwrap()), vec![200, 201, 202, 203]);
+    assert_eq!(ids(&rest_b.unwrap()), vec![200, 201, 202, 203]);
+    assert_eq!(provider.snapshots.load(Ordering::Relaxed), 4);
+    for metrics in [metrics_a, metrics_b] {
+        assert_eq!(metrics.runtime_predicate_refreshes(), 1);
+        assert_eq!(metrics.runtime_row_groups_pruned_live(), 1);
+        assert_eq!(metrics.runtime_row_groups_considered(), 2);
+    }
+}
+
+#[tokio::test]
+async fn runtime_predicate_multifile_reader_samples_each_task_once() {
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path().to_str().unwrap();
+    let tasks = Box::pin(futures::stream::iter(vec![
+        Ok(scan_task(
+            write_three_row_group_file(dir, "parallel-a.parquet"),
+            iceberg_schema(),
+            None,
+        )),
+        Ok(scan_task(
+            write_three_row_group_file(dir, "parallel-b.parquet"),
+            iceberg_schema(),
+            None,
+        )),
+    ])) as FileScanTaskStream;
+    let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let scan = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+        .with_data_file_concurrency_limit(2)
+        .with_batch_size(2)
+        .with_runtime_predicate_provider(provider.clone())
+        .build()
+        .read(tasks)
+        .unwrap();
+    let metrics = scan.metrics().clone();
+    let batches: Vec<RecordBatch> = scan.stream().try_collect().await.unwrap();
+    let mut values = ids(&batches);
+    values.sort_unstable();
+    let mut expected: Vec<i32> = [0, 100, 200]
+        .into_iter()
+        .flat_map(|base| (base..base + 4).flat_map(|id| [id, id]))
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(values, expected);
+    assert_eq!(provider.snapshots.load(Ordering::Relaxed), 2);
+    assert_eq!(metrics.runtime_live_pruning_tasks(), 2);
+    assert_eq!(metrics.runtime_predicate_refreshes(), 0);
 }
 
 #[tokio::test]
@@ -377,7 +455,7 @@ async fn runtime_predicate_live_refresh_keeps_planned_row_filter() {
     );
     batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
     assert_eq!(ids(&batches), vec![0, 1, 2, 3, 200, 201]);
-    assert_eq!(metrics.runtime_live_row_groups_pruned(), 1);
+    assert_eq!(metrics.runtime_row_groups_pruned_live(), 1);
 }
 
 #[tokio::test]
@@ -400,7 +478,7 @@ async fn runtime_predicate_live_bad_publication_fails_open_and_next_generation_r
     assert!(stream.try_next().await.unwrap().is_none());
     assert_eq!(provider.snapshots.load(Ordering::Relaxed), 3);
     assert_eq!(metrics.runtime_predicate_refreshes(), 1);
-    assert_eq!(metrics.runtime_live_row_groups_pruned(), 1);
+    assert_eq!(metrics.runtime_row_groups_pruned_live(), 1);
 }
 
 #[tokio::test]
@@ -431,7 +509,7 @@ async fn runtime_predicate_live_refresh_preserves_cached_equality_deletes() {
     );
     batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
     assert_eq!(ids(&batches), vec![0, 2, 3, 200, 201, 203]);
-    assert_eq!(metrics.runtime_live_row_groups_pruned(), 1);
+    assert_eq!(metrics.runtime_row_groups_pruned_live(), 1);
 }
 
 #[tokio::test]

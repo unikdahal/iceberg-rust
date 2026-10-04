@@ -141,6 +141,8 @@ impl RuntimePrunedParquetStream {
             }
         };
         let pruned = self.remaining.len() - keep.len();
+        self.metrics
+            .record_runtime_row_groups_considered(self.remaining.len());
         if pruned != 0 {
             let decoder = self.decoder.take().expect("decoder exists while streaming");
             self.decoder = Some(
@@ -150,7 +152,7 @@ impl RuntimePrunedParquetStream {
                     .build()?,
             );
             self.remaining = keep.into();
-            self.metrics.record_runtime_live_row_groups_pruned(pruned);
+            self.metrics.record_runtime_row_groups_pruned_live(pruned);
         }
         Ok(())
     }

@@ -693,6 +693,8 @@ impl FileScanTaskReader {
                         selected_row_group_indices.take(),
                         runtime_filtered_row_groups,
                     );
+                    self.scan_metrics
+                        .record_runtime_row_groups_considered(before_runtime);
                     self.scan_metrics.record_runtime_row_groups_pruned(
                         before_runtime.saturating_sub(after_runtime.len()),
                     );

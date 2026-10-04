@@ -55,9 +55,11 @@ pub struct ScanMetrics {
     bytes_read: Arc<AtomicU64>,
     runtime_predicate_tasks: Arc<AtomicU64>,
     runtime_row_groups_pruned: Arc<AtomicU64>,
+    runtime_row_groups_considered: Arc<AtomicU64>,
+    runtime_row_groups_pruned_initial: Arc<AtomicU64>,
     runtime_live_pruning_tasks: Arc<AtomicU64>,
     runtime_predicate_refreshes: Arc<AtomicU64>,
-    runtime_live_row_groups_pruned: Arc<AtomicU64>,
+    runtime_row_groups_pruned_live: Arc<AtomicU64>,
 }
 
 impl ScanMetrics {
@@ -66,9 +68,11 @@ impl ScanMetrics {
             bytes_read: Arc::new(AtomicU64::new(0)),
             runtime_predicate_tasks: Arc::new(AtomicU64::new(0)),
             runtime_row_groups_pruned: Arc::new(AtomicU64::new(0)),
+            runtime_row_groups_considered: Arc::new(AtomicU64::new(0)),
+            runtime_row_groups_pruned_initial: Arc::new(AtomicU64::new(0)),
             runtime_live_pruning_tasks: Arc::new(AtomicU64::new(0)),
             runtime_predicate_refreshes: Arc::new(AtomicU64::new(0)),
-            runtime_live_row_groups_pruned: Arc::new(AtomicU64::new(0)),
+            runtime_row_groups_pruned_live: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -83,6 +87,13 @@ impl ScanMetrics {
     pub(crate) fn record_runtime_row_groups_pruned(&self, count: usize) {
         self.runtime_row_groups_pruned
             .fetch_add(count as u64, Ordering::Relaxed);
+        self.runtime_row_groups_pruned_initial
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_runtime_row_groups_considered(&self, count: usize) {
+        self.runtime_row_groups_considered
+            .fetch_add(count as u64, Ordering::Relaxed);
     }
 
     pub(crate) fn record_runtime_live_pruning_task(&self) {
@@ -95,9 +106,10 @@ impl ScanMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_runtime_live_row_groups_pruned(&self, count: usize) {
-        self.record_runtime_row_groups_pruned(count);
-        self.runtime_live_row_groups_pruned
+    pub(crate) fn record_runtime_row_groups_pruned_live(&self, count: usize) {
+        self.runtime_row_groups_pruned
+            .fetch_add(count as u64, Ordering::Relaxed);
+        self.runtime_row_groups_pruned_live
             .fetch_add(count as u64, Ordering::Relaxed);
     }
 
@@ -117,6 +129,18 @@ impl ScanMetrics {
         self.runtime_row_groups_pruned.load(Ordering::Relaxed)
     }
 
+    /// Runtime statistics candidates considered at task start or after a
+    /// publication refresh. A surviving group can be considered more than once.
+    pub fn runtime_row_groups_considered(&self) -> u64 {
+        self.runtime_row_groups_considered.load(Ordering::Relaxed)
+    }
+
+    /// Additional row groups removed by the task-start runtime snapshot.
+    pub fn runtime_row_groups_pruned_initial(&self) -> u64 {
+        self.runtime_row_groups_pruned_initial
+            .load(Ordering::Relaxed)
+    }
+
     /// Number of tasks using boundary-aware live pruning rather than snapshot fallback.
     pub fn runtime_live_pruning_tasks(&self) -> u64 {
         self.runtime_live_pruning_tasks.load(Ordering::Relaxed)
@@ -129,8 +153,8 @@ impl ScanMetrics {
 
     /// Additional row groups removed at live boundaries. Also included in
     /// [`Self::runtime_row_groups_pruned`].
-    pub fn runtime_live_row_groups_pruned(&self) -> u64 {
-        self.runtime_live_row_groups_pruned.load(Ordering::Relaxed)
+    pub fn runtime_row_groups_pruned_live(&self) -> u64 {
+        self.runtime_row_groups_pruned_live.load(Ordering::Relaxed)
     }
 }
 
