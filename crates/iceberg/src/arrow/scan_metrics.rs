@@ -53,6 +53,8 @@ impl<F: FileRead> FileRead for CountingFileRead<F> {
 #[derive(Clone, Debug)]
 pub struct ScanMetrics {
     bytes_read: Arc<AtomicU64>,
+    runtime_file_tasks_considered: Arc<AtomicU64>,
+    runtime_file_tasks_pruned: Arc<AtomicU64>,
     runtime_predicate_tasks: Arc<AtomicU64>,
     runtime_row_groups_pruned: Arc<AtomicU64>,
     runtime_row_groups_considered: Arc<AtomicU64>,
@@ -66,6 +68,8 @@ impl ScanMetrics {
     pub(crate) fn new() -> Self {
         Self {
             bytes_read: Arc::new(AtomicU64::new(0)),
+            runtime_file_tasks_considered: Arc::new(AtomicU64::new(0)),
+            runtime_file_tasks_pruned: Arc::new(AtomicU64::new(0)),
             runtime_predicate_tasks: Arc::new(AtomicU64::new(0)),
             runtime_row_groups_pruned: Arc::new(AtomicU64::new(0)),
             runtime_row_groups_considered: Arc::new(AtomicU64::new(0)),
@@ -78,6 +82,28 @@ impl ScanMetrics {
 
     pub(crate) fn bytes_read_counter(&self) -> &Arc<AtomicU64> {
         &self.bytes_read
+    }
+
+    pub(crate) fn record_runtime_file_task_considered(&self) {
+        self.runtime_file_tasks_considered
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_runtime_file_task_pruned(&self) {
+        self.runtime_file_tasks_pruned
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Tasks evaluated against whole-file manifest statistics before opening.
+    /// Multiple byte-range splits of one file count as separate tasks.
+    pub fn runtime_file_tasks_considered(&self) -> u64 {
+        self.runtime_file_tasks_considered.load(Ordering::Relaxed)
+    }
+
+    /// Tasks rejected before any data-file or task-specific delete-file I/O.
+    /// Counts tasks, rather than distinct files, to respect split scan planning.
+    pub fn runtime_file_tasks_pruned(&self) -> u64 {
+        self.runtime_file_tasks_pruned.load(Ordering::Relaxed)
     }
 
     pub(crate) fn record_runtime_predicate_task(&self) {

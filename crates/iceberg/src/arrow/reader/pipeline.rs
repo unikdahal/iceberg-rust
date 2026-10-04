@@ -52,6 +52,7 @@ use crate::expr::BoundPredicate;
 use crate::expr::visitors::bloom_filter_evaluator::{
     BloomFilterEvaluator, ColumnBloomFilter, collect_bloom_filter_field_ids,
 };
+use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{
     RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_POS,
@@ -171,6 +172,38 @@ impl FileScanTaskReader {
             .and_then(|state| state.predicate().cloned());
         if runtime_predicate.is_some() {
             self.scan_metrics.record_runtime_predicate_task();
+        }
+
+        // Reject the task before opening its data file or scheduling delete reads.
+        // A whole-file rejection is valid for every byte-range split of that file.
+        if let (Some(predicate), Some(metrics)) = (&runtime_predicate, task.file_metrics()) {
+            self.scan_metrics.record_runtime_file_task_considered();
+            let valid_bounds = metrics
+                .lower_bounds
+                .iter()
+                .chain(&metrics.upper_bounds)
+                .all(|(id, bound)| {
+                    task.schema().field_by_id(*id).is_some_and(|field| {
+                        field.field_type.as_primitive_type() == Some(bound.data_type())
+                    })
+                });
+            // Schema evolution and malformed statistics must not create false negatives.
+            let keep = if valid_bounds {
+                InclusiveMetricsEvaluator::eval_file_metrics(predicate, metrics)
+            } else {
+                Ok(true)
+            };
+            match keep {
+                Ok(false) => {
+                    self.scan_metrics.record_runtime_file_task_pruned();
+                    return Ok(Box::pin(futures::stream::empty()));
+                }
+                Ok(true) => {}
+                Err(error) => tracing::debug!(
+                    "Skipping runtime file pruning for {}: {error}",
+                    task.data_file_path()
+                ),
+            }
         }
 
         let should_load_page_index = (self.row_selection_enabled

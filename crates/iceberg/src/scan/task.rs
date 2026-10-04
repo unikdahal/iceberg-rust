@@ -23,13 +23,51 @@ use typed_builder::TypedBuilder;
 
 use crate::expr::BoundPredicate;
 use crate::spec::{
-    DataContentType, DataFileFormat, ManifestEntryRef, NameMapping, PartitionSpec, Schema,
-    SchemaRef, SortOrderRef, Struct, StructType,
+    DataContentType, DataFile, DataFileFormat, Datum, ManifestEntryRef, NameMapping, PartitionSpec,
+    Schema, SchemaRef, SortOrderRef, Struct, StructType,
 };
 use crate::{Error, ErrorKind, Result};
 
 /// A stream of [`FileScanTask`].
 pub type FileScanTaskStream = BoxStream<'static, Result<FileScanTask>>;
+
+/// Whole-file Iceberg manifest statistics used before opening a data file.
+///
+/// Bounds and counts describe the entire physical file, including when a task
+/// reads only a byte range. Missing column statistics never imply exclusion.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, Deserialize)]
+pub struct FileScanTaskMetrics {
+    /// Number of records in the entire data file.
+    pub record_count: u64,
+    /// Number of values, including nulls and NaNs, by Iceberg field ID.
+    #[serde(default)]
+    pub value_counts: std::collections::HashMap<i32, u64>,
+    /// Number of null values by Iceberg field ID.
+    #[serde(default)]
+    pub null_value_counts: std::collections::HashMap<i32, u64>,
+    /// Number of NaN values by Iceberg field ID.
+    #[serde(default)]
+    pub nan_value_counts: std::collections::HashMap<i32, u64>,
+    /// Inclusive lower bounds by Iceberg field ID.
+    #[serde(default)]
+    pub lower_bounds: std::collections::HashMap<i32, Datum>,
+    /// Inclusive upper bounds by Iceberg field ID.
+    #[serde(default)]
+    pub upper_bounds: std::collections::HashMap<i32, Datum>,
+}
+
+impl From<&DataFile> for FileScanTaskMetrics {
+    fn from(file: &DataFile) -> Self {
+        Self {
+            record_count: file.record_count,
+            value_counts: file.value_counts.clone(),
+            null_value_counts: file.null_value_counts.clone(),
+            nan_value_counts: file.nan_value_counts.clone(),
+            lower_bounds: file.lower_bounds.clone(),
+            upper_bounds: file.upper_bounds.clone(),
+        }
+    }
+}
 
 /// A task to scan part of file.
 #[derive(Debug, Clone, Deserialize, PartialEq, TypedBuilder)]
@@ -52,6 +90,10 @@ pub struct FileScanTask {
     /// reading the entire data file.
     #[builder(default)]
     record_count: Option<u64>,
+
+    /// Whole-file statistics retained from the manifest for runtime file pruning.
+    #[builder(default)]
+    file_metrics: Option<Arc<FileScanTaskMetrics>>,
 
     /// The first row id assigned to the data file.
     ///
@@ -170,6 +212,11 @@ impl FileScanTask {
     /// Returns the number of records in the file when the whole file is scanned.
     pub fn record_count(&self) -> Option<u64> {
         self.record_count
+    }
+
+    /// Returns whole-file manifest statistics, including for split tasks.
+    pub fn file_metrics(&self) -> Option<&Arc<FileScanTaskMetrics>> {
+        self.file_metrics.as_ref()
     }
 
     /// Returns the first row id assigned to the data file.
@@ -399,7 +446,7 @@ mod _serde {
 
     use serde::{Deserialize, Serialize};
 
-    use super::{FileScanTask, FileScanTaskDeleteFile};
+    use super::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskMetrics};
     use crate::expr::BoundPredicate;
     use crate::spec::{
         DataFileFormat, Literal, NameMapping, PartitionSpec, RawLiteral, SchemaRef, SortOrderRef,
@@ -413,6 +460,8 @@ mod _serde {
         start: u64,
         length: u64,
         record_count: Option<u64>,
+        #[serde(default)]
+        file_metrics: Option<Arc<FileScanTaskMetrics>>,
         first_row_id: Option<i64>,
         data_sequence_number: Option<i64>,
         data_file_path: String,
@@ -445,6 +494,8 @@ mod _serde {
         length: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         record_count: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_metrics: Option<&'a Arc<FileScanTaskMetrics>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         first_row_id: Option<i64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -503,6 +554,7 @@ mod _serde {
                 start: value.start,
                 length: value.length,
                 record_count: value.record_count,
+                file_metrics: value.file_metrics.as_ref(),
                 first_row_id: value.first_row_id,
                 data_sequence_number: value.data_sequence_number,
                 data_file_path: &value.data_file_path,
@@ -556,6 +608,7 @@ mod _serde {
                 .with_start(value.start)
                 .with_length(value.length)
                 .with_record_count(value.record_count)
+                .with_file_metrics(value.file_metrics)
                 .with_first_row_id(value.first_row_id)
                 .with_data_sequence_number(value.data_sequence_number)
                 .with_data_file_path(value.data_file_path)

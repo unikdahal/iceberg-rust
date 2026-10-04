@@ -1206,3 +1206,137 @@ async fn runtime_predicate_live_row_filter_avoids_payload_reads_without_statisti
         baseline_metrics.bytes_read()
     );
 }
+
+fn with_file_metrics(
+    task: FileScanTask,
+    metrics: crate::scan::FileScanTaskMetrics,
+) -> FileScanTask {
+    // Also verify that whole-file metrics survive worker task serialization.
+    let mut json = serde_json::to_value(task).unwrap();
+    json["file_metrics"] = serde_json::to_value(metrics).unwrap();
+    serde_json::from_value(json).unwrap()
+}
+
+fn three_group_file_metrics() -> crate::scan::FileScanTaskMetrics {
+    crate::scan::FileScanTaskMetrics {
+        record_count: 12,
+        lower_bounds: HashMap::from([(1, Datum::int(0))]),
+        upper_bounds: HashMap::from([(1, Datum::int(203))]),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn runtime_predicate_file_rejection_precedes_data_and_delete_io() {
+    for delete_type in [
+        None,
+        Some(DataContentType::PositionDeletes),
+        Some(DataContentType::EqualityDeletes),
+    ] {
+        let deletes = delete_type
+            .map(|file_type| {
+                FileScanTaskDeleteFile::builder()
+                    .with_file_path("/does-not-exist/delete.parquet".to_string())
+                    .with_file_size_in_bytes(100)
+                    .with_file_type(file_type)
+                    .with_file_format(DataFileFormat::Parquet)
+                    .with_partition_spec_id(0)
+                    .with_equality_ids(
+                        (file_type == DataContentType::EqualityDeletes).then_some(vec![1]),
+                    )
+                    .build()
+            })
+            .into_iter()
+            .collect();
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(100)
+            .with_start(40)
+            .with_length(20)
+            .with_data_file_path("/does-not-exist/data.parquet".to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(iceberg_schema())
+            .with_project_field_ids(vec![1, 2])
+            .with_file_metrics(Some(Arc::new(three_group_file_metrics())))
+            .with_deletes(deletes)
+            .with_case_sensitive(false)
+            .build()
+            .unwrap();
+        let provider = Arc::new(FixedRuntimePredicate::new(
+            Reference::new("id").greater_than(Datum::int(203)),
+        ));
+        let (batches, metrics) = execute(task, Some(provider.clone())).await;
+        assert!(batches.is_empty());
+        assert_eq!(metrics.bytes_read(), 0);
+        assert_eq!(metrics.runtime_file_tasks_considered(), 1);
+        assert_eq!(metrics.runtime_file_tasks_pruned(), 1);
+        assert_eq!(metrics.runtime_row_groups_pruned(), 0);
+        assert_eq!(provider.snapshots(), 1);
+    }
+}
+
+#[tokio::test]
+async fn runtime_predicate_file_bounds_keep_intersections_and_fail_open() {
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "file_metrics.parquet");
+    let provider = Arc::new(FixedRuntimePredicate::new(
+        Reference::new("id").greater_than_or_equal_to(Datum::int(200)),
+    ));
+    for file_metrics in [
+        three_group_file_metrics(),
+        crate::scan::FileScanTaskMetrics {
+            record_count: 12,
+            ..Default::default()
+        },
+        crate::scan::FileScanTaskMetrics {
+            record_count: 12,
+            // Wrong-type bounds cannot reject a correctly typed reader predicate.
+            upper_bounds: HashMap::from([(1, Datum::long(0))]),
+            ..Default::default()
+        },
+    ] {
+        let task = with_file_metrics(
+            scan_task(path.clone(), iceberg_schema(), None),
+            file_metrics,
+        );
+        let (batches, metrics) = execute(task, Some(provider.clone())).await;
+        assert_eq!(ids(&batches), vec![200, 201, 202, 203]);
+        assert_eq!(metrics.runtime_file_tasks_pruned(), 0);
+        assert!(metrics.bytes_read() > 0);
+    }
+    let task = with_file_metrics(
+        scan_task(path, iceberg_schema(), None),
+        three_group_file_metrics(),
+    );
+    let (batches, metrics) = execute(task, None).await;
+    assert_eq!(ids(&batches).len(), 12);
+    assert_eq!(metrics.runtime_file_tasks_considered(), 0);
+}
+
+#[tokio::test]
+async fn runtime_predicate_file_pruning_refreshes_for_pending_tasks() {
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "pending_file.parquet");
+    let task = with_file_metrics(
+        scan_task(path, iceberg_schema(), None),
+        three_group_file_metrics(),
+    );
+    let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let tasks =
+        Box::pin(futures::stream::iter(vec![Ok(task.clone()), Ok(task)])) as FileScanTaskStream;
+    let scan = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+        .with_data_file_concurrency_limit(1)
+        .with_row_selection_enabled(false)
+        .with_batch_size(4)
+        .with_runtime_predicate_provider(provider.clone())
+        .build()
+        .read(tasks)
+        .unwrap();
+    let metrics = scan.metrics().clone();
+    let mut stream = scan.stream();
+    let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
+    provider.publish(Some(Reference::new("id").greater_than(Datum::int(203))), 1);
+    batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+    assert_eq!(ids(&batches), vec![0, 1, 2, 3]);
+    assert_eq!(metrics.runtime_file_tasks_pruned(), 1);
+    assert_eq!(metrics.runtime_row_groups_pruned_live(), 2);
+}

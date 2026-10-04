@@ -151,6 +151,9 @@ impl ManifestEntryContext {
             .with_start(0)
             .with_length(self.manifest_entry.file_size_in_bytes())
             .with_record_count(Some(self.manifest_entry.record_count()))
+            .with_file_metrics(Some(Arc::new(crate::scan::FileScanTaskMetrics::from(
+                self.manifest_entry.data_file(),
+            ))))
             .with_first_row_id(self.manifest_entry.data_file().first_row_id())
             .with_data_sequence_number(self.manifest_entry.sequence_number())
             .with_data_file_path(self.manifest_entry.file_path().to_string())

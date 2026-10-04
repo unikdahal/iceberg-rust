@@ -18,7 +18,7 @@
 name: Fork Runtime Row Group Selection Validation
 on:
   push:
-    branches: [feat/runtime-row-group-selection, feat/runtime-position-delete-selection, feat/runtime-page-pruning, feat/runtime-pruning-overhead]
+    branches: [feat/runtime-row-group-selection, feat/runtime-position-delete-selection, feat/runtime-page-pruning, feat/runtime-pruning-overhead, feat/runtime-file-pruning]
   workflow_dispatch:
 permissions:
   contents: read
@@ -46,6 +46,9 @@ jobs:
         working-directory: iceberg
         run: |
           cargo +stable test --locked -p iceberg --features runtime-row-group-selections --lib runtime_predicate -- --nocapture
+      - name: Run task and manifest planning regressions
+        working-directory: iceberg
+        run: cargo +stable test --locked -p iceberg --lib scan::
       - name: Run existing reader regressions with local selections
         working-directory: iceberg
         run: |
