@@ -649,16 +649,22 @@ impl FileScanTaskReader {
             selected_row_group_indices = Some(byte_range_filtered_row_groups);
         }
 
-        if let Some(predicate) = final_predicate {
+        let positional_delete_indexes = delete_filter.get_delete_vector(&task);
+        let use_local_selections = cfg!(feature = "runtime-row-group-selections")
+            && runtime_state.is_some()
+            && self.row_group_filtering_enabled
+            && positional_delete_indexes.is_none();
+
+        if let Some(predicate) = final_predicate.as_ref() {
             let (iceberg_field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
                 record_batch_stream_builder.parquet_schema(),
                 record_batch_stream_builder.schema(),
-                &predicate,
+                predicate,
                 use_position_fallback,
             )?;
 
             let row_filter = ArrowReader::get_row_filter(
-                &predicate,
+                predicate,
                 record_batch_stream_builder.parquet_schema(),
                 &iceberg_field_ids,
                 &field_id_map,
@@ -714,7 +720,7 @@ impl FileScanTaskReader {
                 };
 
                 let bloom_filtered = Self::filter_row_groups_by_bloom_filter(
-                    &predicate,
+                    predicate,
                     &mut record_batch_stream_builder,
                     candidate_rgs,
                     &field_id_map,
@@ -726,9 +732,9 @@ impl FileScanTaskReader {
                 }
             }
 
-            if self.row_selection_enabled {
+            if self.row_selection_enabled && !use_local_selections {
                 row_selection = ArrowReader::get_row_selection_for_filter_predicate(
-                    &predicate,
+                    predicate,
                     record_batch_stream_builder.metadata(),
                     &selected_row_group_indices,
                     &field_id_map,
@@ -736,8 +742,6 @@ impl FileScanTaskReader {
                 )?;
             }
         }
-
-        let positional_delete_indexes = delete_filter.get_delete_vector(&task);
 
         if let Some(positional_delete_indexes) = positional_delete_indexes {
             let delete_row_selection = {
@@ -767,21 +771,42 @@ impl FileScanTaskReader {
         let first_row_id = task.first_row_id();
         let raw_stream: ArrowRecordBatchStream = if let Some(runtime_state) = runtime_state
             && self.row_group_filtering_enabled
-            && row_selection.is_none()
+            && (row_selection.is_none() || use_local_selections)
         {
             let metadata = live_metadata.expect("metadata retained for live-capable task");
             let remaining = selected_row_group_indices
                 .unwrap_or_else(|| (0..metadata.metadata().num_row_groups()).collect());
-            let mut builder = ParquetPushDecoderBuilder::new_with_metadata(metadata.clone())
-                .with_projection(projection_mask)
-                .with_row_groups(remaining.clone());
+            let builder = ParquetPushDecoderBuilder::new_with_metadata(metadata.clone())
+                .with_projection(projection_mask);
+            #[cfg(feature = "runtime-row-group-selections")]
+            let local_selections = if use_local_selections {
+                Some(ArrowReader::get_row_group_selections_for_filter_predicate(
+                    final_predicate
+                        .as_ref()
+                        .filter(|_| self.row_selection_enabled),
+                    &metadata,
+                    &remaining,
+                    task.schema(),
+                    use_position_fallback,
+                )?)
+            } else {
+                None
+            };
+            #[cfg(feature = "runtime-row-group-selections")]
+            let mut builder = if let Some(selections) = &local_selections {
+                builder.with_row_group_selections(selections.clone())
+            } else {
+                builder.with_row_groups(remaining.clone())
+            };
+            #[cfg(not(feature = "runtime-row-group-selections"))]
+            let mut builder = builder.with_row_groups(remaining.clone());
             if let Some(batch_size) = self.batch_size {
                 builder = builder.with_batch_size(batch_size);
             }
             if let Some(row_filter) = planned_row_filter {
                 builder = builder.with_row_filter(row_filter);
             }
-            RuntimePrunedParquetStream::new(
+            let stream = RuntimePrunedParquetStream::new(
                 builder.build()?,
                 live_file_reader.expect("reader retained for live-capable task"),
                 metadata,
@@ -790,8 +815,14 @@ impl FileScanTaskReader {
                 task,
                 use_position_fallback,
                 self.scan_metrics.clone(),
-            )
-            .into_stream()
+            );
+            #[cfg(feature = "runtime-row-group-selections")]
+            let stream = if let Some(selections) = local_selections {
+                stream.with_row_group_selections(selections)
+            } else {
+                stream
+            };
+            stream.into_stream()
         } else {
             // A flattened page/position selection has coordinates in the
             // original selected groups. Keep task-open pruning until the

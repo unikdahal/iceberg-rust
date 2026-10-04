@@ -44,6 +44,8 @@ pub(super) struct RuntimePrunedParquetStream {
     use_position_fallback: bool,
     metrics: ScanMetrics,
     accepted_runtime: bool,
+    #[cfg(feature = "runtime-row-group-selections")]
+    row_group_selections: Option<Vec<parquet::arrow::push_decoder::RowGroupSelection>>,
 }
 
 impl RuntimePrunedParquetStream {
@@ -71,7 +73,18 @@ impl RuntimePrunedParquetStream {
             use_position_fallback,
             metrics,
             accepted_runtime,
+            #[cfg(feature = "runtime-row-group-selections")]
+            row_group_selections: None,
         }
+    }
+
+    #[cfg(feature = "runtime-row-group-selections")]
+    pub(super) fn with_row_group_selections(
+        mut self,
+        selections: Vec<parquet::arrow::push_decoder::RowGroupSelection>,
+    ) -> Self {
+        self.row_group_selections = Some(selections);
+        self
     }
 
     fn refresh_at_boundary(&mut self) -> Result<()> {
@@ -145,12 +158,18 @@ impl RuntimePrunedParquetStream {
             .record_runtime_row_groups_considered(self.remaining.len());
         if pruned != 0 {
             let decoder = self.decoder.take().expect("decoder exists while streaming");
-            self.decoder = Some(
-                decoder
-                    .into_builder()?
-                    .with_row_groups(keep.clone())
-                    .build()?,
-            );
+            let builder = decoder.into_builder()?;
+            #[cfg(feature = "runtime-row-group-selections")]
+            let builder = if let Some(selections) = self.row_group_selections.as_mut() {
+                selections
+                    .retain(|selection| keep.binary_search(&selection.row_group_index()).is_ok());
+                builder.with_row_group_selections(selections.clone())
+            } else {
+                builder.with_row_groups(keep.clone())
+            };
+            #[cfg(not(feature = "runtime-row-group-selections"))]
+            let builder = builder.with_row_groups(keep.clone());
+            self.decoder = Some(builder.build()?);
             self.remaining = keep.into();
             self.metrics.record_runtime_row_groups_pruned_live(pruned);
         }
