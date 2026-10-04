@@ -48,22 +48,32 @@ jobs:
       - name: Check Iceberg formatting
         working-directory: iceberg
         run: cargo +nightly-2026-04-16 fmt --all -- --check
+      - name: Share the dependency patch with all Cargo subprocesses
+        working-directory: iceberg
+        run: |
+          mkdir -p .cargo
+          python3 - <<'PYCONFIG'
+          import os
+          from pathlib import Path
+          path = Path(os.environ["GITHUB_WORKSPACE"]) / "arrow/parquet"
+          Path(".cargo/config.toml").write_text('[patch.crates-io]\nparquet = { path = "' + str(path) + '" }\n')
+          PYCONFIG
       - name: Resolve the exact backported Parquet version
         working-directory: iceberg
         run: |
-          cargo +stable --config "patch.crates-io.parquet.path=\"$GITHUB_WORKSPACE/arrow/parquet\"" update -p parquet --precise 59.3.0
+          cargo +stable update -p parquet --precise 59.3.0
       - name: Run live runtime and delete tests with local selections
         working-directory: iceberg
         run: |
-          cargo +stable --config "patch.crates-io.parquet.path=\"$GITHUB_WORKSPACE/arrow/parquet\"" test -p iceberg --features runtime-row-group-selections --lib runtime_predicate -- --nocapture
+          cargo +stable test -p iceberg --features runtime-row-group-selections --lib runtime_predicate -- --nocapture
       - name: Run existing reader regressions with local selections
         working-directory: iceberg
         run: |
-          cargo +stable --config "patch.crates-io.parquet.path=\"$GITHUB_WORKSPACE/arrow/parquet\"" test -p iceberg --features runtime-row-group-selections --lib arrow::reader
+          cargo +stable test -p iceberg --features runtime-row-group-selections --lib arrow::reader
       - name: Strict clippy for the selection-enabled reader
         working-directory: iceberg
         run: |
-          cargo +stable --config "patch.crates-io.parquet.path=\"$GITHUB_WORKSPACE/arrow/parquet\"" clippy -p iceberg --features runtime-row-group-selections --tests -- -D warnings
+          cargo +stable clippy -p iceberg --features runtime-row-group-selections --tests -- -D warnings
       - name: Report the dependency difference
         if: always()
         working-directory: iceberg
