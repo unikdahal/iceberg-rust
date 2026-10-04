@@ -1448,3 +1448,93 @@ async fn runtime_predicate_file_statistics_keep_possible_matches_and_fail_open()
     let (batches, _) = execute(task, None).await;
     assert_eq!(ids(&batches), all_ids());
 }
+
+#[tokio::test]
+async fn runtime_predicate_metrics_attribute_only_runtime_pruning() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "metrics.parquet");
+    let range_100_103 = || {
+        Reference::new("id")
+            .greater_than_or_equal_to(Datum::int(100))
+            .and(Reference::new("id").less_than_or_equal_to(Datum::int(103)))
+    };
+
+    // Without a provider nothing is recorded.
+    let (_, metrics) = execute(scan_task(path.clone(), iceberg_schema(), None), None).await;
+    assert_eq!(metrics.runtime_predicate_tasks(), 0);
+    assert_eq!(metrics.runtime_row_groups_pruned(), 0);
+
+    // The runtime predicate alone removes RG0 and RG2.
+    let provider = Arc::new(FixedRuntimePredicate::new(range_100_103()));
+    let (_, metrics) = execute(
+        scan_task(path.clone(), iceberg_schema(), None),
+        Some(provider),
+    )
+    .await;
+    assert_eq!(metrics.runtime_predicate_tasks(), 1);
+    assert_eq!(metrics.runtime_row_groups_pruned(), 2);
+    assert_eq!(metrics.runtime_file_tasks_pruned(), 0);
+
+    // The planned predicate already removes RG0; only RG2 is the runtime's.
+    let planned = Reference::new("id")
+        .greater_than_or_equal_to(Datum::int(100))
+        .bind(iceberg_schema(), false)
+        .unwrap();
+    let provider = Arc::new(FixedRuntimePredicate::new(
+        Reference::new("id").less_than_or_equal_to(Datum::int(103)),
+    ));
+    let (_, metrics) = execute(
+        scan_task(path.clone(), iceberg_schema(), Some(planned)),
+        Some(provider),
+    )
+    .await;
+    assert_eq!(metrics.runtime_row_groups_pruned(), 1);
+
+    // RG0 belongs to another byte-range split and is not counted.
+    let parquet = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
+    let start = 4 + parquet.metadata().row_group(0).compressed_size() as u64;
+    let file_size = std::fs::metadata(&path).unwrap().len();
+    let split = FileScanTask::builder()
+        .with_file_size_in_bytes(file_size)
+        .with_start(start)
+        .with_length(file_size - start)
+        .with_data_file_path(path.clone())
+        .with_data_file_format(DataFileFormat::Parquet)
+        .with_schema(iceberg_schema())
+        .with_project_field_ids(vec![1, 2])
+        .with_case_sensitive(false)
+        .build()
+        .unwrap();
+    let provider = Arc::new(FixedRuntimePredicate::new(
+        Reference::new("id").greater_than_or_equal_to(Datum::int(200)),
+    ));
+    let (_, metrics) = execute(split, Some(provider)).await;
+    assert_eq!(metrics.runtime_row_groups_pruned(), 1);
+
+    // An unusable predicate is not counted.
+    let provider = Arc::new(FixedRuntimePredicate::new(
+        Reference::new("missing").equal_to(Datum::int(1)),
+    ));
+    let (_, metrics) = execute(
+        scan_task(path.clone(), iceberg_schema(), None),
+        Some(provider),
+    )
+    .await;
+    assert_eq!(metrics.runtime_predicate_tasks(), 0);
+    assert_eq!(metrics.runtime_row_groups_pruned(), 0);
+
+    // A task rejected from whole-file statistics is counted before any I/O.
+    let task = with_file_metrics(
+        scan_task(path, iceberg_schema(), None),
+        three_group_file_metrics(),
+    );
+    let provider = Arc::new(FixedRuntimePredicate::new(
+        Reference::new("id").greater_than(Datum::int(203)),
+    ));
+    let (_, metrics) = execute(task, Some(provider)).await;
+    assert_eq!(metrics.runtime_predicate_tasks(), 1);
+    assert_eq!(metrics.runtime_file_tasks_pruned(), 1);
+    assert_eq!(metrics.bytes_read(), 0);
+}
