@@ -38,7 +38,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: apache/arrow-rs
-          ref: 782e5a685501a9db6cc8e9a3b7cbff894940c47a # 59.2.0
+          ref: f90e061326bd821a7af09281d9e92de6f3b603d9 # 59.3.0
           path: arrow
           submodules: true
           persist-credentials: false
