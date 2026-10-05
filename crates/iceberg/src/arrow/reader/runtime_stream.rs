@@ -178,6 +178,12 @@ impl RuntimePrunedStream {
         };
         let pruned = self.selections.len() - selections.len();
         self.selections = selections;
+        // A task whose first usable runtime predicate arrives after the file was
+        // opened was not counted by the task-start path. Count it when that
+        // predicate is first adopted; later refreshes keep the same task count.
+        if self.refresh.runtime.is_none() {
+            self.refresh.metrics.record_runtime_predicate_task();
+        }
         self.refresh.runtime = Some(runtime);
         self.refresh.metrics.record_runtime_refresh(pruned);
         self.rebuild_decoder(next, row_filter)
