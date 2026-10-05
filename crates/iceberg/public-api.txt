@@ -1335,6 +1335,7 @@ pub fn iceberg::scan::FileScanTask::data_file_format(&self) -> iceberg::spec::Da
 pub fn iceberg::scan::FileScanTask::data_file_path(&self) -> &str
 pub fn iceberg::scan::FileScanTask::data_sequence_number(&self) -> core::option::Option<i64>
 pub fn iceberg::scan::FileScanTask::deletes(&self) -> &[iceberg::scan::FileScanTaskDeleteFile]
+pub fn iceberg::scan::FileScanTask::file_metrics(&self) -> core::option::Option<&iceberg::scan::FileScanTaskMetrics>
 pub fn iceberg::scan::FileScanTask::file_size_in_bytes(&self) -> u64
 pub fn iceberg::scan::FileScanTask::first_row_id(&self) -> core::option::Option<i64>
 pub fn iceberg::scan::FileScanTask::key_metadata(&self) -> core::option::Option<&[u8]>
@@ -1361,7 +1362,7 @@ impl core::fmt::Debug for iceberg::scan::FileScanTask
 pub fn iceberg::scan::FileScanTask::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for iceberg::scan::FileScanTask
 impl iceberg::scan::FileScanTask
-pub fn iceberg::scan::FileScanTask::builder() -> FileScanTaskBuilder<((), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), ())>
+pub fn iceberg::scan::FileScanTask::builder() -> FileScanTaskBuilder<((), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), ())>
 impl serde_core::ser::Serialize for iceberg::scan::FileScanTask
 pub fn iceberg::scan::FileScanTask::serialize<S>(&self, serializer: S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error> where S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for iceberg::scan::FileScanTask
@@ -1391,6 +1392,30 @@ impl serde_core::ser::Serialize for iceberg::scan::FileScanTaskDeleteFile
 pub fn iceberg::scan::FileScanTaskDeleteFile::serialize<__S>(&self, __serializer: __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for iceberg::scan::FileScanTaskDeleteFile
 pub fn iceberg::scan::FileScanTaskDeleteFile::deserialize<__D>(__deserializer: __D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+pub struct iceberg::scan::FileScanTaskMetrics
+impl iceberg::scan::FileScanTaskMetrics
+pub fn iceberg::scan::FileScanTaskMetrics::lower_bounds(&self) -> &std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>
+pub fn iceberg::scan::FileScanTaskMetrics::nan_value_counts(&self) -> &std::collections::hash::map::HashMap<i32, u64>
+pub fn iceberg::scan::FileScanTaskMetrics::new(record_count: core::option::Option<u64>, value_counts: std::collections::hash::map::HashMap<i32, u64>, null_value_counts: std::collections::hash::map::HashMap<i32, u64>, nan_value_counts: std::collections::hash::map::HashMap<i32, u64>, lower_bounds: std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>, upper_bounds: std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>) -> Self
+pub fn iceberg::scan::FileScanTaskMetrics::null_value_counts(&self) -> &std::collections::hash::map::HashMap<i32, u64>
+pub fn iceberg::scan::FileScanTaskMetrics::record_count(&self) -> core::option::Option<u64>
+pub fn iceberg::scan::FileScanTaskMetrics::upper_bounds(&self) -> &std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>
+pub fn iceberg::scan::FileScanTaskMetrics::value_counts(&self) -> &std::collections::hash::map::HashMap<i32, u64>
+impl core::clone::Clone for iceberg::scan::FileScanTaskMetrics
+pub fn iceberg::scan::FileScanTaskMetrics::clone(&self) -> iceberg::scan::FileScanTaskMetrics
+impl core::cmp::PartialEq for iceberg::scan::FileScanTaskMetrics
+pub fn iceberg::scan::FileScanTaskMetrics::eq(&self, other: &iceberg::scan::FileScanTaskMetrics) -> bool
+impl core::convert::From<&iceberg::spec::DataFile> for iceberg::scan::FileScanTaskMetrics
+pub fn iceberg::scan::FileScanTaskMetrics::from(file: &iceberg::spec::DataFile) -> Self
+impl core::default::Default for iceberg::scan::FileScanTaskMetrics
+pub fn iceberg::scan::FileScanTaskMetrics::default() -> iceberg::scan::FileScanTaskMetrics
+impl core::fmt::Debug for iceberg::scan::FileScanTaskMetrics
+pub fn iceberg::scan::FileScanTaskMetrics::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for iceberg::scan::FileScanTaskMetrics
+impl serde_core::ser::Serialize for iceberg::scan::FileScanTaskMetrics
+pub fn iceberg::scan::FileScanTaskMetrics::serialize<__S>(&self, __serializer: __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for iceberg::scan::FileScanTaskMetrics
+pub fn iceberg::scan::FileScanTaskMetrics::deserialize<D>(deserializer: D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error> where D: serde_core::de::Deserializer<'de>
 pub struct iceberg::scan::ScanMetrics
 impl iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanMetrics::bytes_read(&self) -> u64
@@ -1413,6 +1438,8 @@ pub fn iceberg::scan::TableScan::fmt(&self, f: &mut core::fmt::Formatter<'_>) ->
 pub struct iceberg::scan::TableScanBuilder<'a>
 impl<'a> iceberg::scan::TableScanBuilder<'a>
 pub fn iceberg::scan::TableScanBuilder<'a>::build(self) -> iceberg::Result<iceberg::scan::TableScan>
+pub fn iceberg::scan::TableScanBuilder<'a>::include_column_stats(self) -> Self
+pub fn iceberg::scan::TableScanBuilder<'a>::include_column_stats_for(self, column_names: impl core::iter::traits::collect::IntoIterator<Item = impl core::convert::Into<alloc::string::String>>) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select(self, column_names: impl core::iter::traits::collect::IntoIterator<Item = impl alloc::string::ToString>) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select_all(self) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select_empty(self) -> Self
@@ -1956,6 +1983,8 @@ pub fn iceberg::spec::DataFile::clone(&self) -> iceberg::spec::DataFile
 impl core::cmp::Eq for iceberg::spec::DataFile
 impl core::cmp::PartialEq for iceberg::spec::DataFile
 pub fn iceberg::spec::DataFile::eq(&self, other: &iceberg::spec::DataFile) -> bool
+impl core::convert::From<&iceberg::spec::DataFile> for iceberg::scan::FileScanTaskMetrics
+pub fn iceberg::scan::FileScanTaskMetrics::from(file: &iceberg::spec::DataFile) -> Self
 impl core::fmt::Debug for iceberg::spec::DataFile
 pub fn iceberg::spec::DataFile::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for iceberg::spec::DataFile
