@@ -33,7 +33,7 @@ The comparison includes:
 - **original:** the complete original cache implementation from `505e988b`, with generation checked outside the same mutex. Its miss path is retained to avoid unfair inlining differences, but only warmed hits are timed;
 - **unlocked control:** the generation load and bound `Arc` clone/drop without cache key checks or a mutex. This is a lower bound, not a proposed replacement.
 
-The provider stays at generation 1. Both a bound predicate and a `None` snapshot are measured, and the benchmark asserts exactly one snapshot for each workload after every thread-count experiment. The schema is shared by `Arc`, as in a scan using a common table schema. No snapshot/binding work or file I/O is timed.
+The provider stays at generation 1. Both a bound predicate and a `None` snapshot are measured, and the benchmark asserts exactly one snapshot for each workload after every thread-count experiment. The schema is shared by `Arc`, as in a scan using a common table schema. No snapshot/binding work or file I/O is timed. This benchmark validates only stable cache-hit overhead. It does not measure concurrent generation refreshes, binding large predicates, waiters blocked by a refresh, or generation-publication latency. Refresh correctness is covered by concurrency tests, rather than by these timings.
 
 Each sample makes 10,000,000 calls in total across 1, 2, 4, or 8 worker threads. Threads synchronize at start/end barriers; thread creation is excluded. One warm-up sample is discarded before each timed sample. Nine samples per implementation are collected, rotating implementation order to reduce temporal bias. Every result crosses `black_box` and is dropped, including the `Arc` reference-count cost.
 
