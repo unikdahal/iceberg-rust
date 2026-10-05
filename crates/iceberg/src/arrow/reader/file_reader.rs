@@ -52,6 +52,20 @@ impl ArrowFileReader {
         self.parquet_read_options = options;
         self
     }
+
+    /// Shares the already-open ranged reader between planning and decoding.
+    /// Neither handle reloads metadata or opens another storage reader.
+    pub(crate) fn into_shared(self) -> (Self, Self) {
+        let reader: Arc<dyn FileRead> = self.r.into();
+        let make = || Self {
+            meta: FileMetadata {
+                size: self.meta.size,
+            },
+            parquet_read_options: self.parquet_read_options,
+            r: Box::new(Arc::clone(&reader)),
+        };
+        (make(), make())
+    }
 }
 
 impl AsyncFileReader for ArrowFileReader {

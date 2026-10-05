@@ -1541,3 +1541,17 @@ async fn runtime_predicate_metrics_attribute_only_runtime_pruning() {
     assert_eq!(metrics.runtime_file_tasks_pruned(), 1);
     assert_eq!(metrics.bytes_read(), 0);
 }
+
+#[tokio::test]
+async fn runtime_predicate_that_prunes_every_row_group_reads_no_rows() {
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "none.parquet");
+    let task = scan_task(path, iceberg_schema(), None);
+    let (_, baseline) = execute(task.clone(), None).await;
+    let provider = Arc::new(FixedRuntimePredicate::new(
+        Reference::new("id").greater_than_or_equal_to(Datum::int(1000)),
+    ));
+    let (batches, metrics) = execute(task, Some(provider)).await;
+    assert!(batches.is_empty());
+    assert!(metrics.bytes_read() < baseline.bytes_read());
+}
