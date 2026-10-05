@@ -1552,3 +1552,236 @@ async fn runtime_predicate_that_prunes_every_row_group_reads_no_rows() {
     assert!(batches.is_empty());
     assert!(metrics.bytes_read() < baseline.bytes_read());
 }
+
+fn start_runtime_scan(
+    task: FileScanTask,
+    provider: Option<Arc<dyn RuntimePredicateProvider>>,
+    row_selection: bool,
+    row_groups: bool,
+    batch_size: usize,
+) -> (ArrowRecordBatchStream, ScanMetrics) {
+    let mut builder = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+        .with_data_file_concurrency_limit(1)
+        .with_row_selection_enabled(row_selection)
+        .with_row_group_filtering_enabled(row_groups)
+        .with_batch_size(batch_size);
+    if let Some(provider) = provider {
+        builder = builder.with_runtime_predicate_provider(provider);
+    }
+    let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+    let scan = builder.build().read(tasks).unwrap();
+    let metrics = scan.metrics().clone();
+    (scan.stream(), metrics)
+}
+
+#[tokio::test]
+async fn runtime_predicate_live_arrival_waits_for_row_group_boundary() {
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "live.parquet");
+    let task = scan_task(path, iceberg_schema(), None);
+    let (baseline, baseline_metrics) = start_runtime_scan(task.clone(), None, false, true, 2);
+    let _: Vec<RecordBatch> = baseline.try_collect().await.unwrap();
+    let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let (mut stream, metrics) = start_runtime_scan(task, Some(provider.clone()), false, true, 2);
+    let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
+    assert_eq!(ids(&batches), vec![0, 1]);
+    provider.publish(
+        Some(Reference::new("id").greater_than_or_equal_to(Datum::int(200))),
+        1,
+    );
+    // RG0 is in flight. Tightening cannot discard its remaining batch.
+    batches.push(stream.try_next().await.unwrap().unwrap());
+    assert_eq!(ids(&batches), vec![0, 1, 2, 3]);
+    assert_eq!(provider.snapshots(), 1);
+    batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+    assert_eq!(ids(&batches), vec![0, 1, 2, 3, 200, 201, 202, 203]);
+    assert_eq!(provider.snapshots(), 2);
+    assert!(metrics.bytes_read() < baseline_metrics.bytes_read());
+}
+
+#[tokio::test]
+async fn runtime_predicate_live_tightening_only_prunes_remaining_groups() {
+    let temp = TempDir::new().unwrap();
+    let path = write_row_group_file(temp.path().to_str().unwrap(), "tightening.parquet", &[
+        200, 0, 300, 100, 400, 350,
+    ]);
+    let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let (mut stream, _) = start_runtime_scan(
+        scan_task(path, iceberg_schema(), None),
+        Some(provider.clone()),
+        false,
+        true,
+        4,
+    );
+    let mut output = Vec::new();
+    for (generation, expected) in [
+        (1, vec![200, 201, 202, 203]),
+        (2, vec![300, 301, 302, 303]),
+        (3, vec![400, 401, 402, 403]),
+    ] {
+        let batch = stream.try_next().await.unwrap().unwrap();
+        assert_eq!(ids(std::slice::from_ref(&batch)), expected);
+        let max = *expected.last().unwrap();
+        output.push(batch);
+        provider.publish(
+            Some(Reference::new("id").greater_than(Datum::int(max))),
+            generation,
+        );
+    }
+    assert!(stream.try_next().await.unwrap().is_none());
+    assert_eq!(ids(&output).into_iter().max(), Some(403));
+    assert_eq!(provider.snapshots(), 4);
+}
+
+#[tokio::test]
+async fn runtime_predicate_live_refresh_keeps_planned_row_filter() {
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "planned.parquet");
+    let schema = iceberg_schema();
+    let planned = Reference::new("id")
+        .less_than_or_equal_to(Datum::int(201))
+        .bind(Arc::clone(&schema), false)
+        .unwrap();
+    let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let (mut stream, _) = start_runtime_scan(
+        scan_task(path, schema, Some(planned)),
+        Some(provider.clone()),
+        false,
+        true,
+        4,
+    );
+    let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
+    provider.publish(
+        Some(Reference::new("id").greater_than_or_equal_to(Datum::int(200))),
+        1,
+    );
+    batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+    assert_eq!(ids(&batches), vec![0, 1, 2, 3, 200, 201]);
+}
+
+#[tokio::test]
+async fn runtime_predicate_live_bad_publication_fails_open_and_next_generation_recovers() {
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "recover.parquet");
+    let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let (mut stream, _) = start_runtime_scan(
+        scan_task(path, iceberg_schema(), None),
+        Some(provider.clone()),
+        false,
+        true,
+        4,
+    );
+    let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
+    provider.publish(Some(Reference::new("missing").equal_to(Datum::int(100))), 1);
+    batches.push(stream.try_next().await.unwrap().unwrap());
+    assert_eq!(ids(&batches), vec![0, 1, 2, 3, 100, 101, 102, 103]);
+    provider.publish(Some(Predicate::AlwaysFalse), 2);
+    assert!(stream.try_next().await.unwrap().is_none());
+    assert_eq!(provider.snapshots(), 3);
+}
+
+#[tokio::test]
+async fn runtime_predicate_live_refresh_preserves_cached_equality_deletes() {
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path().to_str().unwrap();
+    let path = write_three_row_group_file(dir, "equalities-data.parquet");
+    let equality_path = format!("{dir}/live-equality.parquet");
+    write_delete(&equality_path, vec![field("id", DataType::Int32, 1)], vec![
+        Arc::new(Int32Array::from(vec![1, 202])),
+    ]);
+    let delete = FileScanTaskDeleteFile::builder()
+        .with_file_size_in_bytes(std::fs::metadata(&equality_path).unwrap().len())
+        .with_file_path(equality_path)
+        .with_file_type(DataContentType::EqualityDeletes)
+        .with_file_format(DataFileFormat::Parquet)
+        .with_partition_spec_id(0)
+        .with_equality_ids(Some(vec![1]))
+        .build();
+    let task = scan_task_with_deletes(path, iceberg_schema(), None, vec![delete]);
+    let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let (mut stream, _) = start_runtime_scan(task, Some(provider.clone()), false, true, 4);
+    let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
+    assert_eq!(ids(&batches), vec![0, 2, 3]);
+    provider.publish(
+        Some(Reference::new("id").greater_than_or_equal_to(Datum::int(200))),
+        1,
+    );
+    batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+    assert_eq!(ids(&batches), vec![0, 2, 3, 200, 201, 203]);
+}
+
+#[tokio::test]
+async fn runtime_predicate_live_removal_preserves_local_page_selections() {
+    let temp = TempDir::new().unwrap();
+    let path = write_row_group_file_with_page_size(
+        temp.path().to_str().unwrap(),
+        "local-pages.parquet",
+        &[0, 100, 200],
+        1,
+    );
+    // Each row is a page. The static predicate retains only the last two
+    // pages of RG0 and the first two pages of RG2, giving distinct local masks.
+    let planned = Reference::new("id")
+        .greater_than_or_equal_to(Datum::int(2))
+        .and(Reference::new("id").less_than_or_equal_to(Datum::int(201)))
+        .bind(iceberg_schema(), false)
+        .unwrap();
+    let task = scan_task(path, iceberg_schema(), Some(planned));
+    let (baseline, baseline_metrics) = start_runtime_scan(task.clone(), None, true, true, 1);
+    let full = baseline.try_collect::<Vec<_>>().await.unwrap();
+    assert_eq!(ids(&full), vec![2, 3, 100, 101, 102, 103, 200, 201]);
+    let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let (mut stream, metrics) = start_runtime_scan(task, Some(provider.clone()), true, true, 1);
+    let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
+    assert_eq!(ids(&batches), vec![2]);
+    provider.publish(
+        Some(Reference::new("id").greater_than_or_equal_to(Datum::int(200))),
+        1,
+    );
+    batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+    // A generation change halfway through RG0 takes effect only after its
+    // remaining selected page. Removing RG1 cannot shift RG2's local mask.
+    assert_eq!(ids(&batches), vec![2, 3, 200, 201]);
+    assert_eq!(provider.snapshots(), 2);
+    assert!(metrics.bytes_read() < baseline_metrics.bytes_read());
+}
+
+#[tokio::test]
+async fn runtime_predicate_live_can_remove_all_remaining_row_groups() {
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "all-pages.parquet");
+    let provider = Arc::new(ChangingRuntimePredicate::new(
+        Some(Reference::new("id").greater_than_or_equal_to(Datum::int(0))),
+        0,
+    ));
+    let (mut stream, _) = start_runtime_scan(
+        scan_task(path, iceberg_schema(), None),
+        Some(provider.clone()),
+        true,
+        true,
+        4,
+    );
+    let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
+    provider.publish(Some(Predicate::AlwaysFalse), 1);
+    batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+    assert_eq!(ids(&batches), vec![0, 1, 2, 3]);
+}
+
+#[tokio::test]
+async fn runtime_predicate_live_refresh_is_off_when_row_group_filtering_is_disabled() {
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "disabled.parquet");
+    let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let (mut stream, _) = start_runtime_scan(
+        scan_task(path, iceberg_schema(), None),
+        Some(provider.clone()),
+        false,
+        false,
+        4,
+    );
+    let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
+    provider.publish(Some(Predicate::AlwaysFalse), 1);
+    batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+    assert_eq!(ids(&batches).len(), 12);
+    assert_eq!(provider.snapshots(), 1);
+}

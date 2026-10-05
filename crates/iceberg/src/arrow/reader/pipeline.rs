@@ -37,7 +37,9 @@ use super::row_lineage::synthesize_row_id_column;
 use super::runtime_predicate::{
     RuntimePredicates, check_runtime_predicate_columns, intersect_page_selection, intersect_sorted,
 };
-use super::runtime_stream::{PushDecodedStream, split_row_selection};
+use super::runtime_stream::{
+    BoundaryRefresh, ResolvedPredicate, RuntimePrunedStream, split_row_selection,
+};
 use super::{
     ArrowFileReader, ArrowReader, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
     apply_name_mapping_to_arrow_schema, find_leaf_by_field_id,
@@ -156,6 +158,11 @@ struct PlannedPredicate {
 
 impl FileScanTaskReader {
     async fn process(self, task: FileScanTask) -> Result<ArrowRecordBatchStream> {
+        // Read before the predicate, so a publication in between is looked at again.
+        let observed_generation = self
+            .runtime_predicates
+            .as_ref()
+            .map(|predicates| predicates.generation());
         let runtime_predicate = self.runtime_predicates.as_ref().and_then(|predicates| {
             predicates.current(
                 &task.schema_ref(),
@@ -756,16 +763,40 @@ impl FileScanTaskReader {
             } else {
                 let selections =
                     split_row_selection(metadata.metadata(), &row_groups, row_selection);
-                let mut builder = ParquetPushDecoderBuilder::new_with_metadata(metadata)
+                let mut builder = ParquetPushDecoderBuilder::new_with_metadata(metadata.clone())
                     .with_projection(projection_mask)
-                    .with_row_group_selections(selections);
+                    .with_row_group_selections(selections.clone());
                 if let Some(batch_size) = self.batch_size {
                     builder = builder.with_batch_size(batch_size);
                 }
                 if let Some(row_filter) = row_filter {
                     builder = builder.with_row_filter(row_filter);
                 }
-                PushDecodedStream::new(builder.build()?, live_file_reader).into_stream()
+                let resolve = |plan: &PlannedPredicate| ResolvedPredicate {
+                    predicate: plan.predicate.clone(),
+                    field_ids: plan.field_ids.clone(),
+                    field_id_map: plan.field_id_map.clone(),
+                };
+                let refresh = BoundaryRefresh {
+                    predicates: self
+                        .runtime_predicates
+                        .clone()
+                        .expect("provider configured for live-capable task"),
+                    seen_generation: observed_generation.unwrap_or_default(),
+                    planned: plans.iter().find(|plan| !plan.advisory).map(resolve),
+                    runtime: plans.iter().find(|plan| plan.advisory).map(resolve),
+                    row_selection_enabled: self.row_selection_enabled,
+                    task,
+                    use_position_fallback,
+                };
+                RuntimePrunedStream::new(
+                    builder.build()?,
+                    live_file_reader,
+                    metadata,
+                    selections,
+                    refresh,
+                )
+                .into_stream()
             }
         } else {
             if let Some(row_selection) = row_selection {
