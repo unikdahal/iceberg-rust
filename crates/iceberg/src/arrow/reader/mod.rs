@@ -46,6 +46,10 @@ mod row_filter;
 mod row_lineage;
 mod runtime_predicate;
 #[cfg(test)]
+mod runtime_predicate_bench;
+#[cfg(test)]
+mod runtime_predicate_cache_bench;
+#[cfg(test)]
 mod runtime_predicate_tests;
 pub use file_reader::ArrowFileReader;
 pub(crate) use options::ParquetReadOptions;

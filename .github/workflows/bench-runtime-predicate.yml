@@ -1,0 +1,45 @@
+name: Runtime predicate benchmarks
+
+on:
+  push:
+    branches:
+      - 'bench/**'
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-builder
+
+      - name: Runner
+        run: |
+          nproc
+          lscpu | grep -E "Model name|^CPU\(s\)"
+          rustc --version
+
+      - name: Build benchmarks
+        run: cargo test --release -p iceberg --lib --no-run -j 2
+
+      - name: Filter order benchmark
+        run: |
+          cargo test --release -p iceberg --lib filter_order_benchmark -j 2 -- --ignored --nocapture --test-threads=1 | tee filter-order.txt
+
+      - name: Cache concurrency benchmark
+        run: |
+          cargo test --release -p iceberg --lib runtime_predicate_cache_benchmark -j 2 -- --ignored --nocapture --test-threads=1 | tee cache.txt
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: benchmark-results
+          path: |
+            filter-order.txt
+            cache.txt
