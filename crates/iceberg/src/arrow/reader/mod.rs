@@ -47,6 +47,7 @@ mod row_lineage;
 mod runtime_predicate;
 #[cfg(test)]
 mod runtime_predicate_tests;
+mod runtime_stream;
 pub use file_reader::ArrowFileReader;
 pub(crate) use options::ParquetReadOptions;
 use predicate_visitor::{CollectFieldIdVisitor, PredicateConverter};

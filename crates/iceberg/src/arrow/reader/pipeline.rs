@@ -27,6 +27,7 @@ use std::sync::atomic::AtomicU64;
 use arrow_schema::{DataType, Field};
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, RowFilter};
+use parquet::arrow::push_decoder::ParquetPushDecoderBuilder;
 use parquet::arrow::{
     PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask, RowNumber,
 };
@@ -36,6 +37,7 @@ use super::row_lineage::synthesize_row_id_column;
 use super::runtime_predicate::{
     RuntimePredicates, check_runtime_predicate_columns, intersect_page_selection, intersect_sorted,
 };
+use super::runtime_stream::{PushDecodedStream, split_row_selection};
 use super::{
     ArrowFileReader, ArrowReader, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
     apply_name_mapping_to_arrow_schema, find_leaf_by_field_id,
@@ -233,6 +235,17 @@ impl FileScanTaskReader {
             missing_field_ids,
             install_row_number,
         )?;
+
+        // With a runtime predicate provider, a second handle on the open reader
+        // decodes the task by row group, with row-group-local selections.
+        let (parquet_file_reader, live_file_reader) =
+            if self.runtime_predicates.is_some() && self.row_group_filtering_enabled {
+                let (planning, decoding) = parquet_file_reader.into_shared();
+                (planning, Some(decoding))
+            } else {
+                (parquet_file_reader, None)
+            };
+        let live_metadata = live_file_reader.as_ref().map(|_| arrow_metadata.clone());
 
         // Build the stream reader, reusing the already-opened file reader
         let mut record_batch_stream_builder =
@@ -625,10 +638,8 @@ impl FileScanTaskReader {
         if plans.iter().any(|plan| plan.advisory) {
             self.scan_metrics.record_runtime_predicate_task();
         }
-        if let Some(arrow_predicate) = arrow_predicate {
-            record_batch_stream_builder =
-                record_batch_stream_builder.with_row_filter(RowFilter::new(vec![arrow_predicate]));
-        }
+        let row_filter =
+            arrow_predicate.map(|arrow_predicate| RowFilter::new(vec![arrow_predicate]));
 
         // Count the candidate groups the runtime predicate removed beyond the
         // task byte range and the planned and equality-delete predicates.
@@ -730,23 +741,49 @@ impl FileScanTaskReader {
             };
         }
 
-        if let Some(row_selection) = row_selection {
-            record_batch_stream_builder =
-                record_batch_stream_builder.with_row_selection(row_selection);
-        }
-
-        if let Some(selected_row_group_indices) = selected_row_group_indices {
-            record_batch_stream_builder =
-                record_batch_stream_builder.with_row_groups(selected_row_group_indices);
-        }
-
         // Build the batch stream and send all the RecordBatches that it generates
         // to the requester. When `_row_id` is projected, synthesize it over the raw parquet
         // batches (using the reader-produced `_pos` position) before the transformer, which
         // then passes it through as a virtual field.
         let first_row_id = task.first_row_id();
-        let record_batch_stream = record_batch_stream_builder.build()?.map(move |batch| {
-            let mut batch = batch.map_err(|err| -> Error { err.into() })?;
+        let raw_stream: ArrowRecordBatchStream = if let Some(live_file_reader) = live_file_reader {
+            let metadata = live_metadata.expect("metadata retained for live-capable task");
+            let row_groups = selected_row_group_indices
+                .unwrap_or_else(|| (0..metadata.metadata().num_row_groups()).collect());
+            if row_groups.is_empty() {
+                // No group can match; an empty selection list must not mean "all".
+                Box::pin(futures::stream::empty())
+            } else {
+                let selections =
+                    split_row_selection(metadata.metadata(), &row_groups, row_selection);
+                let mut builder = ParquetPushDecoderBuilder::new_with_metadata(metadata)
+                    .with_projection(projection_mask)
+                    .with_row_group_selections(selections);
+                if let Some(batch_size) = self.batch_size {
+                    builder = builder.with_batch_size(batch_size);
+                }
+                if let Some(row_filter) = row_filter {
+                    builder = builder.with_row_filter(row_filter);
+                }
+                PushDecodedStream::new(builder.build()?, live_file_reader).into_stream()
+            }
+        } else {
+            if let Some(row_selection) = row_selection {
+                record_batch_stream_builder =
+                    record_batch_stream_builder.with_row_selection(row_selection);
+            }
+            if let Some(row_groups) = selected_row_group_indices {
+                record_batch_stream_builder =
+                    record_batch_stream_builder.with_row_groups(row_groups);
+            }
+            if let Some(row_filter) = row_filter {
+                record_batch_stream_builder =
+                    record_batch_stream_builder.with_row_filter(row_filter);
+            }
+            Box::pin(record_batch_stream_builder.build()?.map_err(Error::from))
+        };
+        let record_batch_stream = raw_stream.map(move |batch| {
+            let mut batch = batch?;
             if project_row_id {
                 batch = synthesize_row_id_column(batch, first_row_id)?;
             }
