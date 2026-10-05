@@ -787,7 +787,10 @@ async fn runtime_predicate_prunes_pages_within_a_row_group() {
         .unwrap();
     assert_eq!(metadata.num_row_groups(), 1);
     assert_eq!(
-        metadata.offset_index().unwrap()[0][0]
+        metadata
+            .page_index_for_row_group(0)
+            .offset_index(0)
+            .unwrap()
             .page_locations()
             .len(),
         4
