@@ -40,6 +40,7 @@ use parquet::file::metadata::ParquetMetaData;
 
 use super::runtime_predicate::{RuntimePredicates, check_runtime_predicate_columns};
 use super::{ArrowFileReader, ArrowReader};
+use crate::arrow::ScanMetrics;
 use crate::expr::BoundPredicate;
 use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
 use crate::scan::{ArrowRecordBatchStream, FileScanTask};
@@ -86,6 +87,7 @@ pub(super) struct BoundaryRefresh {
     pub(super) row_selection_enabled: bool,
     pub(super) task: FileScanTask,
     pub(super) use_position_fallback: bool,
+    pub(super) metrics: ScanMetrics,
 }
 
 pub(super) struct RuntimePrunedStream {
@@ -174,8 +176,10 @@ impl RuntimePrunedStream {
         let Some(row_filter) = self.compile_row_filter(&runtime) else {
             return Ok(());
         };
+        let pruned = self.selections.len() - selections.len();
         self.selections = selections;
         self.refresh.runtime = Some(runtime);
+        self.refresh.metrics.record_runtime_refresh(pruned);
         self.rebuild_decoder(next, row_filter)
     }
 
