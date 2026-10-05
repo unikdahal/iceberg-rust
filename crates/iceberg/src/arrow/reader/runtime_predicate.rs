@@ -172,6 +172,11 @@ impl RuntimePredicates {
         }
     }
 
+    /// Returns the provider's current generation, for a cheap change check.
+    pub(super) fn generation(&self) -> u64 {
+        self.provider.generation()
+    }
+
     /// Returns the current predicate bound to `schema`, with NOT pushed to the
     /// leaves because statistics evaluators cannot negate a "might match".
     pub(super) fn current(
