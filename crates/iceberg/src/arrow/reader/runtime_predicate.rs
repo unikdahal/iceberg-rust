@@ -493,3 +493,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_predicate_bench.rs"]
+mod benchmark;
