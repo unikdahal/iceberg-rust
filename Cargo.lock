@@ -4216,8 +4216,7 @@ dependencies = [
 [[package]]
 name = "parquet"
 version = "59.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff322f54b1a0f9288e614ed1f2d329b380af5476420db19f46ffb865e1163d73"
+source = "git+https://github.com/unikdahal/arrow-rs.git?rev=fa20c8b77ff3d613c8b638f4f686f5316eb0138a#fa20c8b77ff3d613c8b638f4f686f5316eb0138a"
 dependencies = [
  "ahash",
  "arrow-array",
