@@ -56,6 +56,9 @@ pub struct ScanMetrics {
     runtime_predicate_tasks: Arc<AtomicU64>,
     runtime_file_tasks_pruned: Arc<AtomicU64>,
     runtime_row_groups_pruned: Arc<AtomicU64>,
+    runtime_predicate_refreshes: Arc<AtomicU64>,
+    runtime_row_groups_pruned_live: Arc<AtomicU64>,
+    runtime_decoder_rebuilds: Arc<AtomicU64>,
 }
 
 impl ScanMetrics {
@@ -65,6 +68,9 @@ impl ScanMetrics {
             runtime_predicate_tasks: Arc::new(AtomicU64::new(0)),
             runtime_file_tasks_pruned: Arc::new(AtomicU64::new(0)),
             runtime_row_groups_pruned: Arc::new(AtomicU64::new(0)),
+            runtime_predicate_refreshes: Arc::new(AtomicU64::new(0)),
+            runtime_row_groups_pruned_live: Arc::new(AtomicU64::new(0)),
+            runtime_decoder_rebuilds: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -80,6 +86,17 @@ impl ScanMetrics {
     pub(crate) fn record_runtime_row_groups_pruned(&self, count: usize) {
         self.runtime_row_groups_pruned
             .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_runtime_refresh(&self, row_groups_pruned: usize) {
+        self.runtime_predicate_refreshes
+            .fetch_add(1, Ordering::Relaxed);
+        self.runtime_row_groups_pruned_live
+            .fetch_add(row_groups_pruned as u64, Ordering::Relaxed);
+        self.runtime_row_groups_pruned
+            .fetch_add(row_groups_pruned as u64, Ordering::Relaxed);
+        self.runtime_decoder_rebuilds
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn bytes_read_counter(&self) -> &Arc<AtomicU64> {
@@ -105,9 +122,27 @@ impl ScanMetrics {
 
     /// Row groups skipped by statistics because of a runtime predicate, beyond
     /// those excluded by the task byte range and the planned and
-    /// equality-delete predicates.
+    /// equality-delete predicates, whether at task start or at a later
+    /// row-group boundary.
     pub fn runtime_row_groups_pruned(&self) -> u64 {
         self.runtime_row_groups_pruned.load(Ordering::Relaxed)
+    }
+
+    /// Times a task adopted a newer runtime predicate at a row-group boundary.
+    pub fn runtime_predicate_refreshes(&self) -> u64 {
+        self.runtime_predicate_refreshes.load(Ordering::Relaxed)
+    }
+
+    /// The part of [`Self::runtime_row_groups_pruned`] removed by refreshes
+    /// while a task was being read, before those row groups were started.
+    pub fn runtime_row_groups_pruned_live(&self) -> u64 {
+        self.runtime_row_groups_pruned_live.load(Ordering::Relaxed)
+    }
+
+    /// Decoder rebuilds. Each refresh costs exactly one, however many row
+    /// groups follow it.
+    pub fn runtime_decoder_rebuilds(&self) -> u64 {
+        self.runtime_decoder_rebuilds.load(Ordering::Relaxed)
     }
 }
 

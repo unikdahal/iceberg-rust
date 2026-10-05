@@ -788,6 +788,7 @@ impl FileScanTaskReader {
                     row_selection_enabled: self.row_selection_enabled,
                     task,
                     use_position_fallback,
+                    metrics: self.scan_metrics.clone(),
                 };
                 RuntimePrunedStream::new(
                     builder.build()?,
