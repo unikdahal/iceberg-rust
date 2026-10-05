@@ -1809,6 +1809,7 @@ async fn runtime_predicate_live_metrics_count_refreshes_and_pruned_groups() {
     );
     batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
     assert_eq!(ids(&batches), vec![0, 1, 2, 3, 200, 201, 202, 203]);
+    assert_eq!(metrics.runtime_predicate_tasks(), 1);
     assert_eq!(metrics.runtime_predicate_refreshes(), 1);
     assert_eq!(metrics.runtime_row_groups_pruned_live(), 1);
     // Nothing was pruned at task start, so the whole total is live pruning.
