@@ -20,7 +20,6 @@
 //! predicates, row-group / row selection, and delete handling into a stream
 //! of transformed Arrow `RecordBatch`es.
 
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -55,11 +54,12 @@ use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::encryption::StandardKeyMetadata;
 use crate::error::{Result, invalid_data};
+use crate::expr::BoundPredicate;
 use crate::expr::visitors::bloom_filter_evaluator::{
     BloomFilterEvaluator, ColumnBloomFilter, collect_bloom_filter_field_ids,
 };
 use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
-use crate::expr::{BoundPredicate, BoundReference, PredicateOperator};
+use crate::expr::visitors::strict_metrics_evaluator::StrictMetricsEvaluator;
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{
     RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_POS,
@@ -68,7 +68,7 @@ use crate::metadata_columns::{
     RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, RESERVED_FIELD_ID_SPEC_ID, is_metadata_field,
 };
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskMetrics, FileScanTaskStream};
-use crate::spec::{Datum, PartitionSpec, PrimitiveType, Struct};
+use crate::spec::{Datum, PartitionSpec, Struct};
 use crate::{Error, ErrorKind};
 
 impl ArrowReader {
@@ -189,8 +189,11 @@ impl FileScanTaskReader {
             return Ok(Box::pin(futures::stream::empty()));
         }
 
+        // A task that can adopt a runtime predicate at a row-group boundary needs the page
+        // index then, even when no predicate exists yet at open (a TopK's first file).
+        let may_refresh = self.runtime_predicates.is_some() && self.row_group_filtering_enabled;
         let should_load_page_index = (self.row_selection_enabled
-            && (task.predicate().is_some() || runtime_predicate.is_some()))
+            && (task.predicate().is_some() || runtime_predicate.is_some() || may_refresh))
             || !task.deletes().is_empty();
         let mut parquet_read_options = self.parquet_read_options;
         parquet_read_options.preload_page_index = should_load_page_index;
@@ -953,10 +956,9 @@ impl FileScanTaskReader {
         )
     }
 
-    /// Whether whole-file statistics prove that every row of the file satisfies `predicate`:
-    /// a conjunction of non-null range comparisons whose bounds already hold for the file's
-    /// lower or upper bound. Anything else, including floats (NaN) and missing statistics,
-    /// answers no, which only costs the row filter.
+    /// Whether whole-file statistics prove that every row of the file satisfies `predicate`,
+    /// so its row filter would only confirm it. Statistics whose type does not match the task
+    /// schema, and evaluation errors, answer no, which only costs the row filter.
     fn file_always_matches(
         predicate: &BoundPredicate,
         metrics: &FileScanTaskMetrics,
@@ -971,59 +973,8 @@ impl FileScanTaskReader {
                     field.field_type.as_primitive_type() == Some(bound.data_type())
                 })
             });
-        if !bounds_match_schema {
-            return false;
-        }
-        let no_nulls = |id: i32| metrics.null_value_counts().get(&id) == Some(&0);
-        let holds = |reference: &BoundReference, literal: &Datum, op: PredicateOperator| {
-            let id = reference.field().id;
-            if !no_nulls(id)
-                || matches!(
-                    literal.data_type(),
-                    PrimitiveType::Float | PrimitiveType::Double
-                )
-            {
-                return false;
-            }
-            match op {
-                PredicateOperator::GreaterThan => metrics
-                    .lower_bounds()
-                    .get(&id)
-                    .and_then(|lower| lower.partial_cmp(literal))
-                    .is_some_and(|order| order == Ordering::Greater),
-                PredicateOperator::GreaterThanOrEq => metrics
-                    .lower_bounds()
-                    .get(&id)
-                    .and_then(|lower| lower.partial_cmp(literal))
-                    .is_some_and(|order| order != Ordering::Less),
-                PredicateOperator::LessThan => metrics
-                    .upper_bounds()
-                    .get(&id)
-                    .and_then(|upper| upper.partial_cmp(literal))
-                    .is_some_and(|order| order == Ordering::Less),
-                PredicateOperator::LessThanOrEq => metrics
-                    .upper_bounds()
-                    .get(&id)
-                    .and_then(|upper| upper.partial_cmp(literal))
-                    .is_some_and(|order| order != Ordering::Greater),
-                _ => false,
-            }
-        };
-        fn all_rows_match(
-            predicate: &BoundPredicate,
-            holds: &dyn Fn(&BoundReference, &Datum, PredicateOperator) -> bool,
-        ) -> bool {
-            match predicate {
-                BoundPredicate::AlwaysTrue => true,
-                BoundPredicate::And(expr) => expr
-                    .inputs()
-                    .iter()
-                    .all(|input| all_rows_match(input, holds)),
-                BoundPredicate::Binary(expr) => holds(expr.term(), expr.literal(), expr.op()),
-                _ => false,
-            }
-        }
-        all_rows_match(predicate, &holds)
+        bounds_match_schema
+            && StrictMetricsEvaluator::eval_metrics(predicate, metrics.into()).unwrap_or(false)
     }
 
     /// Resolves `predicate` against the file and plans its row-group selection.
