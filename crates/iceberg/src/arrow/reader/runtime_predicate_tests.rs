@@ -1889,3 +1889,56 @@ async fn runtime_predicate_cost_does_not_grow_with_row_groups_per_boundary() {
     assert_eq!(metrics.runtime_decoder_rebuilds(), 1);
     assert_eq!(provider.snapshots(), 2);
 }
+
+#[tokio::test]
+async fn runtime_predicate_file_statistics_that_prove_every_row_do_not_change_results() {
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "all_rows.parquet");
+    let metrics = |nulls: Option<u64>| {
+        crate::scan::FileScanTaskMetrics::new(
+            Some(12),
+            HashMap::new(),
+            nulls.map(|count| (1, count)).into_iter().collect(),
+            HashMap::new(),
+            HashMap::from([(1, Datum::int(0))]),
+            HashMap::from([(1, Datum::int(203))]),
+        )
+    };
+    let predicates = [
+        // Every row satisfies these, so the row filter is skipped for the file.
+        (
+            Reference::new("id").greater_than_or_equal_to(Datum::int(0)),
+            all_ids(),
+        ),
+        (Reference::new("id").less_than(Datum::int(204)), all_ids()),
+        (
+            Reference::new("id")
+                .greater_than(Datum::int(-1))
+                .and(Reference::new("id").less_than_or_equal_to(Datum::int(203))),
+            all_ids(),
+        ),
+        // Some rows fail these, so the filter still runs.
+        (
+            Reference::new("id").greater_than_or_equal_to(Datum::int(100)),
+            vec![100, 101, 102, 103, 200, 201, 202, 203],
+        ),
+        (
+            Reference::new("id")
+                .greater_than_or_equal_to(Datum::int(0))
+                .and(Reference::new("id").less_than(Datum::int(102))),
+            vec![0, 1, 2, 3, 100, 101],
+        ),
+    ];
+    // With and without a null count, which is required to skip the filter.
+    for nulls in [Some(0), Some(1), None] {
+        for (predicate, expected) in &predicates {
+            let task = with_file_metrics(
+                scan_task(path.clone(), iceberg_schema(), None),
+                metrics(nulls),
+            );
+            let provider = Arc::new(FixedRuntimePredicate::new(predicate.clone()));
+            let (batches, _) = execute(task, Some(provider)).await;
+            assert_eq!(&ids(&batches), expected, "{predicate} with nulls {nulls:?}");
+        }
+    }
+}
