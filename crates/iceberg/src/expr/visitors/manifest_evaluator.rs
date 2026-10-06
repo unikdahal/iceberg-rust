@@ -401,28 +401,27 @@ impl BoundPredicateVisitor for ManifestFilterVisitor<'_> {
         _predicate: &BoundPredicate,
     ) -> Result<bool> {
         let field = self.field_summary_for_reference(reference);
-        if field.lower_bound.is_none() {
+        let Some(lower_bound) = &field.lower_bound else {
             return ROWS_CANNOT_MATCH;
-        }
+        };
 
         if literals.len() > IN_PREDICATE_LIMIT {
             return ROWS_MIGHT_MATCH;
         }
 
-        if let Some(lower_bound) = &field.lower_bound {
-            let lower_bound =
-                ManifestFilterVisitor::bytes_to_datum(lower_bound, &reference.field().field_type);
-            if literals.iter().all(|datum| &lower_bound > datum) {
-                return ROWS_CANNOT_MATCH;
-            }
-        }
+        let lower_bound =
+            ManifestFilterVisitor::bytes_to_datum(lower_bound, &reference.field().field_type);
+        let upper_bound = field.upper_bound.as_ref().map(|upper_bound| {
+            ManifestFilterVisitor::bytes_to_datum(upper_bound, &reference.field().field_type)
+        });
 
-        if let Some(upper_bound) = &field.upper_bound {
-            let upper_bound =
-                ManifestFilterVisitor::bytes_to_datum(upper_bound, &reference.field().field_type);
-            if literals.iter().all(|datum| &upper_bound < datum) {
-                return ROWS_CANNOT_MATCH;
-            }
+        if literals.iter().all(|datum| {
+            datum.lt(&lower_bound)
+                || upper_bound
+                    .as_ref()
+                    .is_some_and(|upper_bound| datum.gt(upper_bound))
+        }) {
+            return ROWS_CANNOT_MATCH;
         }
 
         ROWS_MIGHT_MATCH
@@ -1366,6 +1365,39 @@ mod test {
                 .build()
                 .eval(&manifest_file)?,
             "Should read: id equal to lower bound (30 == 30)"
+        );
+
+        let filter = Predicate::Set(SetExpression::new(
+            PredicateOperator::In,
+            Reference::new("id"),
+            FnvHashSet::from_iter(vec![
+                Datum::int(INT_MIN_VALUE - 1),
+                Datum::int(INT_MAX_VALUE + 1),
+            ]),
+        ))
+        .bind(schema.clone(), case_sensitive)?;
+        assert!(
+            !ManifestEvaluator::builder(filter)
+                .build()
+                .eval(&manifest_file)?,
+            "Should not read: no literal is within both bounds"
+        );
+
+        let filter = Predicate::Set(SetExpression::new(
+            PredicateOperator::In,
+            Reference::new("id"),
+            FnvHashSet::from_iter(vec![
+                Datum::int(INT_MIN_VALUE - 1),
+                Datum::int(INT_MIN_VALUE + 1),
+                Datum::int(INT_MAX_VALUE + 1),
+            ]),
+        ))
+        .bind(schema.clone(), case_sensitive)?;
+        assert!(
+            ManifestEvaluator::builder(filter)
+                .build()
+                .eval(&manifest_file)?,
+            "Should read: one literal is within both bounds"
         );
 
         Ok(())

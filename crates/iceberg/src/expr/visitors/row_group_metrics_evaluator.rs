@@ -488,28 +488,24 @@ impl BoundPredicateVisitor for RowGroupMetricsEvaluator<'_> {
             return ROW_GROUP_MIGHT_MATCH;
         };
 
-        if let Some(lower_bound) = get_parquet_stat_min_as_datum(&primitive_type, stats)? {
-            if lower_bound.is_nan() {
-                // NaN indicates unreliable bounds. See the InclusiveMetricsEvaluator docs for more.
-                return ROW_GROUP_MIGHT_MATCH;
-            }
-
-            if !literals.iter().any(|datum| datum.ge(&lower_bound)) {
-                // if all values are less than lower bound, rows cannot match.
-                return ROW_GROUP_CANT_MATCH;
-            }
+        let lower_bound = get_parquet_stat_min_as_datum(&primitive_type, stats)?;
+        let upper_bound = get_parquet_stat_max_as_datum(&primitive_type, stats)?;
+        if lower_bound.as_ref().is_some_and(Datum::is_nan)
+            || upper_bound.as_ref().is_some_and(Datum::is_nan)
+        {
+            // NaN indicates unreliable bounds. See the InclusiveMetricsEvaluator docs for more.
+            return ROW_GROUP_MIGHT_MATCH;
         }
 
-        if let Some(upper_bound) = get_parquet_stat_max_as_datum(&primitive_type, stats)? {
-            if upper_bound.is_nan() {
-                // NaN indicates unreliable bounds. See the InclusiveMetricsEvaluator docs for more.
-                return ROW_GROUP_MIGHT_MATCH;
-            }
-
-            if !literals.iter().any(|datum| datum.le(&upper_bound)) {
-                // if all values are greater than upper bound, rows cannot match.
-                return ROW_GROUP_CANT_MATCH;
-            }
+        if literals.iter().all(|datum| {
+            lower_bound
+                .as_ref()
+                .is_some_and(|lower_bound| datum.lt(lower_bound))
+                || upper_bound
+                    .as_ref()
+                    .is_some_and(|upper_bound| datum.gt(upper_bound))
+        }) {
+            return ROW_GROUP_CANT_MATCH;
         }
 
         ROW_GROUP_MIGHT_MATCH
@@ -1751,6 +1747,51 @@ mod tests {
         )?;
 
         assert!(!result);
+        Ok(())
+    }
+
+    #[test]
+    fn eval_in_requires_one_literal_within_both_bounds() -> Result<()> {
+        let row_group_metadata = create_row_group_metadata(
+            1,
+            1,
+            Some(Statistics::float(
+                Some(1.0),
+                Some(2.0),
+                None,
+                Some(0),
+                false,
+            )),
+            1,
+            None,
+        )?;
+
+        let (iceberg_schema_ref, field_id_map) = build_iceberg_schema_and_field_map()?;
+
+        let filter = Reference::new("col_float")
+            .is_in([Datum::float(0.0_f32), Datum::float(3.0_f32)])
+            .bind(iceberg_schema_ref.clone(), false)?;
+        assert!(!RowGroupMetricsEvaluator::eval(
+            &filter,
+            &row_group_metadata,
+            &field_id_map,
+            iceberg_schema_ref.as_ref(),
+        )?);
+
+        let filter = Reference::new("col_float")
+            .is_in([
+                Datum::float(0.0_f32),
+                Datum::float(1.5_f32),
+                Datum::float(3.0_f32),
+            ])
+            .bind(iceberg_schema_ref.clone(), false)?;
+        assert!(RowGroupMetricsEvaluator::eval(
+            &filter,
+            &row_group_metadata,
+            &field_id_map,
+            iceberg_schema_ref.as_ref(),
+        )?);
+
         Ok(())
     }
 
