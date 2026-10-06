@@ -1955,8 +1955,8 @@ impl RuntimePredicateProvider for LargestFirst {
         self.0.snapshot()
     }
 
-    fn prefers_largest_first(&self) -> bool {
-        true
+    fn largest_first_column(&self) -> Option<String> {
+        Some("id".into())
     }
 }
 

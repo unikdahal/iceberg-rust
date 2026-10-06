@@ -36,6 +36,7 @@ use parquet::encryption::decrypt::FileDecryptionProperties;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::statistics::Statistics;
 
+use super::projection::build_field_id_map;
 use super::row_lineage::synthesize_row_id_column;
 use super::runtime_predicate::{
     RuntimePredicates, check_runtime_predicate_columns, intersect_page_selection, intersect_sorted,
@@ -778,14 +779,18 @@ impl FileScanTaskReader {
                 // A bound that tightens toward large values prunes the rest of the file once
                 // its largest row groups are read; a file sorted by the column is otherwise
                 // read from its smallest values up and nothing is pruned.
-                let prefers_largest_first = self
+                if let Some(name) = self
                     .runtime_predicates
                     .as_ref()
-                    .is_some_and(|predicates| predicates.prefers_largest_first());
-                if prefers_largest_first
-                    && let Some(plan) = plans.iter().find(|plan| plan.advisory)
-                    && let [field_id] = plan.field_ids.iter().copied().collect::<Vec<_>>()[..]
-                    && let Some(&column) = plan.field_id_map.get(&field_id)
+                    .and_then(|predicates| predicates.largest_first_column())
+                    && let Some(field) = if task.case_sensitive() {
+                        task.schema().field_by_name(&name)
+                    } else {
+                        task.schema().field_by_name_case_insensitive(&name)
+                    }
+                    && let Ok(Some(columns)) =
+                        build_field_id_map(metadata.metadata().file_metadata().schema_descr())
+                    && let Some(&column) = columns.get(&field.id)
                 {
                     order_by_descending_maximum(&mut selections, metadata.metadata(), column);
                 }

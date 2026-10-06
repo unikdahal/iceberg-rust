@@ -138,13 +138,13 @@ pub trait RuntimePredicateProvider: Send + Sync {
     /// serializes data-file tasks while taking the snapshot and binding it.
     fn snapshot(&self) -> Result<RuntimePredicateSnapshot>;
 
-    /// Whether rows with the largest values of the predicate's column tighten it fastest, as
-    /// for a descending top-k or a MAX. The reader then visits each file's row groups by
-    /// descending maximum of that column instead of in file order, so a file sorted by the
-    /// column needs only its last row groups. Read order is otherwise unspecified; the default
-    /// keeps file order.
-    fn prefers_largest_first(&self) -> bool {
-        false
+    /// The column whose largest values tighten the predicate fastest, as for a descending
+    /// top-k or a MAX. The reader then visits each file's row groups by descending maximum of
+    /// that column instead of in file order, so a file sorted by it needs only its last row
+    /// groups. Named here rather than taken from the predicate, which does not exist yet when
+    /// the first file opens. Read order is otherwise unspecified; the default keeps file order.
+    fn largest_first_column(&self) -> Option<String> {
+        None
     }
 }
 
@@ -186,9 +186,9 @@ impl RuntimePredicates {
         self.provider.generation()
     }
 
-    /// See [`RuntimePredicateProvider::prefers_largest_first`].
-    pub(super) fn prefers_largest_first(&self) -> bool {
-        self.provider.prefers_largest_first()
+    /// See [`RuntimePredicateProvider::largest_first_column`].
+    pub(super) fn largest_first_column(&self) -> Option<String> {
+        self.provider.largest_first_column()
     }
 
     /// Returns the current predicate bound to `schema`, with NOT pushed to the
