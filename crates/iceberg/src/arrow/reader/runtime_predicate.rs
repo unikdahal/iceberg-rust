@@ -137,6 +137,15 @@ pub trait RuntimePredicateProvider: Send + Sync {
     /// Implementations should use in-memory, non-blocking work because refresh
     /// serializes data-file tasks while taking the snapshot and binding it.
     fn snapshot(&self) -> Result<RuntimePredicateSnapshot>;
+
+    /// Whether rows with the largest values of the predicate's column tighten it fastest, as
+    /// for a descending top-k or a MAX. The reader then visits each file's row groups by
+    /// descending maximum of that column instead of in file order, so a file sorted by the
+    /// column needs only its last row groups. Read order is otherwise unspecified; the default
+    /// keeps file order.
+    fn prefers_largest_first(&self) -> bool {
+        false
+    }
 }
 
 /// Retains one bound predicate across a scan's tasks, keyed by generation,
@@ -175,6 +184,11 @@ impl RuntimePredicates {
     /// Returns the provider's current generation, for a cheap change check.
     pub(super) fn generation(&self) -> u64 {
         self.provider.generation()
+    }
+
+    /// See [`RuntimePredicateProvider::prefers_largest_first`].
+    pub(super) fn prefers_largest_first(&self) -> bool {
+        self.provider.prefers_largest_first()
     }
 
     /// Returns the current predicate bound to `schema`, with NOT pushed to the

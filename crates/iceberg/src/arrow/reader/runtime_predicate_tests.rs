@@ -1942,3 +1942,50 @@ async fn runtime_predicate_file_statistics_that_prove_every_row_do_not_change_re
         }
     }
 }
+
+/// Delegates to a fixed predicate and asks for the largest values first.
+struct LargestFirst(FixedRuntimePredicate);
+
+impl RuntimePredicateProvider for LargestFirst {
+    fn generation(&self) -> u64 {
+        self.0.generation()
+    }
+
+    fn snapshot(&self) -> Result<RuntimePredicateSnapshot> {
+        self.0.snapshot()
+    }
+
+    fn prefers_largest_first(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn runtime_predicate_preferring_largest_values_reads_row_groups_by_descending_maximum() {
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "largest_first.parquet");
+    let predicate = || Reference::new("id").greater_than_or_equal_to(Datum::int(1));
+
+    let task = scan_task(path.clone(), iceberg_schema(), None);
+    let (batches, _) = execute(
+        task,
+        Some(Arc::new(LargestFirst(FixedRuntimePredicate::new(
+            predicate(),
+        )))),
+    )
+    .await;
+    assert_eq!(ids(&batches), vec![
+        200, 201, 202, 203, 100, 101, 102, 103, 1, 2, 3
+    ]);
+
+    // Without the preference the file order stays.
+    let task = scan_task(path, iceberg_schema(), None);
+    let (batches, _) = execute(
+        task,
+        Some(Arc::new(FixedRuntimePredicate::new(predicate()))),
+    )
+    .await;
+    assert_eq!(ids(&batches), vec![
+        1, 2, 3, 100, 101, 102, 103, 200, 201, 202, 203
+    ]);
+}

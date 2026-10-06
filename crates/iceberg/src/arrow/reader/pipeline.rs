@@ -28,11 +28,13 @@ use std::sync::atomic::AtomicU64;
 use arrow_schema::{DataType, Field};
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, RowFilter};
-use parquet::arrow::push_decoder::ParquetPushDecoderBuilder;
+use parquet::arrow::push_decoder::{ParquetPushDecoderBuilder, RowGroupSelection};
 use parquet::arrow::{
     PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask, RowNumber,
 };
 use parquet::encryption::decrypt::FileDecryptionProperties;
+use parquet::file::metadata::ParquetMetaData;
+use parquet::file::statistics::Statistics;
 
 use super::row_lineage::synthesize_row_id_column;
 use super::runtime_predicate::{
@@ -771,8 +773,22 @@ impl FileScanTaskReader {
                 // No group can match; an empty selection list must not mean "all".
                 Box::pin(futures::stream::empty())
             } else {
-                let selections =
+                let mut selections =
                     split_row_selection(metadata.metadata(), &row_groups, row_selection);
+                // A bound that tightens toward large values prunes the rest of the file once
+                // its largest row groups are read; a file sorted by the column is otherwise
+                // read from its smallest values up and nothing is pruned.
+                let prefers_largest_first = self
+                    .runtime_predicates
+                    .as_ref()
+                    .is_some_and(|predicates| predicates.prefers_largest_first());
+                if prefers_largest_first
+                    && let Some(plan) = plans.iter().find(|plan| plan.advisory)
+                    && let [field_id] = plan.field_ids.iter().copied().collect::<Vec<_>>()[..]
+                    && let Some(&column) = plan.field_id_map.get(&field_id)
+                {
+                    order_by_descending_maximum(&mut selections, metadata.metadata(), column);
+                }
                 let mut builder = ParquetPushDecoderBuilder::new_with_metadata(metadata.clone())
                     .with_projection(projection_mask)
                     .with_row_group_selections(selections.clone());
@@ -1213,6 +1229,28 @@ impl ArrowReader {
             None => Ok(ArrowReaderOptions::default()),
         }
     }
+}
+
+/// Stably orders row-group selections by the descending maximum statistic of an integer
+/// `column` (dates are stored as int32). Groups without such a statistic keep their order
+/// after the ranked ones.
+fn order_by_descending_maximum(
+    selections: &mut [RowGroupSelection],
+    metadata: &ParquetMetaData,
+    column: usize,
+) {
+    let maximum = |selection: &RowGroupSelection| -> Option<i64> {
+        let group = metadata.row_groups().get(selection.row_group_index())?;
+        match group.columns().get(column)?.statistics()? {
+            Statistics::Int32(stats) => stats.max_opt().map(|value| i64::from(*value)),
+            Statistics::Int64(stats) => stats.max_opt().copied(),
+            _ => None,
+        }
+    };
+    selections.sort_by_key(|selection| {
+        let maximum = maximum(selection);
+        (maximum.is_none(), std::cmp::Reverse(maximum))
+    });
 }
 
 #[cfg(test)]
