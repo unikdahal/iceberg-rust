@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use arrow_arith::boolean::{and, and_kleene, is_not_null, is_null, not, or, or_kleene};
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Float32Type, Float64Type};
+use arrow_array::types::{Date32Type, Float32Type, Float64Type, Int32Type, Int64Type};
 use arrow_array::{Array, ArrayRef, BooleanArray, Datum as ArrowDatum, RecordBatch, Scalar};
 use arrow_buffer::BooleanBuffer;
 use arrow_cast::cast::cast;
@@ -590,9 +590,21 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
                 .map(|lit| get_arrow_datum(lit).unwrap())
                 .collect();
 
+            let mut set: Option<Option<InSet>> = None;
             Ok(Box::new(move |batch| {
                 // update this if arrow ever adds a native is_in kernel
                 let left = project_column(&batch, idx)?;
+
+                // A large literal set costs one comparison pass per literal below, which grows
+                // with the set. Hash membership costs one lookup per row.
+                if literals.len() > IN_SET_THRESHOLD {
+                    let set = set.get_or_insert_with(|| {
+                        InSet::build(left.data_type(), &literals).ok().flatten()
+                    });
+                    if let Some(mask) = set.as_ref().and_then(|set| set.mask(&left)) {
+                        return Ok(mask);
+                    }
+                }
 
                 let mut acc = constant_bool_array(false, batch.num_rows());
                 for literal in &literals {
@@ -642,6 +654,94 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
 /// that Iceberg uses for literals - but they are effectively the same logical type,
 /// i.e. LargeUtf8 and Utf8 or Utf8View and Utf8 or Utf8View and LargeUtf8.
 ///
+/// Literal count above which `IN` switches from one comparison pass per literal to a hash lookup
+/// per row.
+const IN_SET_THRESHOLD: usize = 8;
+
+/// The literals of an `IN` predicate as a hash set over one column type.
+enum InSet {
+    Int32(FnvHashSet<i32>),
+    Int64(FnvHashSet<i64>),
+    Date32(FnvHashSet<i32>),
+    Utf8(FnvHashSet<String>),
+}
+
+impl InSet {
+    /// Builds the set for `column_type`, casting each literal to it first. `None` means the
+    /// column type has no hash path and the caller keeps the comparison kernels.
+    fn build(
+        column_type: &DataType,
+        literals: &[Arc<dyn ArrowDatum + Send + Sync>],
+    ) -> std::result::Result<Option<Self>, ArrowError> {
+        macro_rules! collect {
+            ($variant:ident, $array_type:ty) => {{
+                let mut set = FnvHashSet::default();
+                for literal in literals {
+                    let literal = try_cast_literal(literal, column_type)?;
+                    let (array, _) = literal.get();
+                    if !array.is_null(0) {
+                        set.insert(array.as_primitive::<$array_type>().value(0));
+                    }
+                }
+                Ok(Some(Self::$variant(set)))
+            }};
+        }
+        match column_type {
+            DataType::Int32 => collect!(Int32, Int32Type),
+            DataType::Int64 => collect!(Int64, Int64Type),
+            DataType::Date32 => collect!(Date32, Date32Type),
+            DataType::Utf8 => {
+                let mut set = FnvHashSet::default();
+                for literal in literals {
+                    let literal = try_cast_literal(literal, column_type)?;
+                    let (array, _) = literal.get();
+                    if !array.is_null(0) {
+                        set.insert(array.as_string::<i32>().value(0).to_string());
+                    }
+                }
+                Ok(Some(Self::Utf8(set)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Membership of each row, null where the row is null, like the comparison kernels.
+    /// `None` when `column` is not the type the set was built for.
+    fn mask(&self, column: &ArrayRef) -> Option<BooleanArray> {
+        match (self, column.data_type()) {
+            (Self::Int32(set), DataType::Int32) => Some(
+                column
+                    .as_primitive::<Int32Type>()
+                    .iter()
+                    .map(|value| value.map(|value| set.contains(&value)))
+                    .collect(),
+            ),
+            (Self::Int64(set), DataType::Int64) => Some(
+                column
+                    .as_primitive::<Int64Type>()
+                    .iter()
+                    .map(|value| value.map(|value| set.contains(&value)))
+                    .collect(),
+            ),
+            (Self::Date32(set), DataType::Date32) => Some(
+                column
+                    .as_primitive::<Date32Type>()
+                    .iter()
+                    .map(|value| value.map(|value| set.contains(&value)))
+                    .collect(),
+            ),
+            (Self::Utf8(set), DataType::Utf8) => Some(
+                column
+                    .as_string::<i32>()
+                    .iter()
+                    .map(|value| value.map(|value| set.contains(value)))
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+}
+
 /// The Arrow compute kernels that we use must match the type exactly, so first cast the literal
 /// into the type of the batch we read from Parquet before sending it to the compute kernel.
 fn try_cast_literal(
@@ -835,5 +935,46 @@ mod tests {
             [true, false, true, true]
         );
         assert!(!result.is_null(2));
+    }
+
+    #[test]
+    fn in_set_matches_the_comparison_kernels() {
+        use arrow_array::{ArrayRef, Datum as ArrowDatum, Int64Array, StringArray};
+
+        use super::InSet;
+        use crate::arrow::get_arrow_datum;
+        use crate::spec::Datum;
+
+        let longs: Vec<Arc<dyn ArrowDatum + Send + Sync>> = (0..20)
+            .map(|value| get_arrow_datum(&Datum::long(value * 3)).unwrap())
+            .collect();
+        let column: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(0),
+            Some(1),
+            None,
+            Some(57),
+            Some(58),
+        ]));
+        let set = InSet::build(&DataType::Int64, &longs).unwrap().unwrap();
+        assert_eq!(
+            set.mask(&column).unwrap(),
+            BooleanArray::from(vec![Some(true), Some(false), None, Some(true), Some(false)])
+        );
+        // A set built for one column type never answers for another.
+        let other: ArrayRef = Arc::new(StringArray::from(vec!["a"]));
+        assert!(set.mask(&other).is_none());
+
+        let strings: Vec<Arc<dyn ArrowDatum + Send + Sync>> = ["k1", "k2", "k3"]
+            .iter()
+            .map(|value| get_arrow_datum(&Datum::string(*value)).unwrap())
+            .collect();
+        let column: ArrayRef = Arc::new(StringArray::from(vec![Some("k2"), None, Some("k9")]));
+        let set = InSet::build(&DataType::Utf8, &strings).unwrap().unwrap();
+        assert_eq!(
+            set.mask(&column).unwrap(),
+            BooleanArray::from(vec![Some(true), None, Some(false)])
+        );
+        // Types without a hash path keep the comparison kernels.
+        assert!(InSet::build(&DataType::Float64, &longs).unwrap().is_none());
     }
 }
