@@ -1989,3 +1989,49 @@ async fn runtime_predicate_preferring_largest_values_reads_row_groups_by_descend
         1, 2, 3, 100, 101, 102, 103, 200, 201, 202, 203
     ]);
 }
+
+/// A changing provider that asks for the largest `id` values first.
+struct LargestFirstChanging(Arc<ChangingRuntimePredicate>);
+
+impl RuntimePredicateProvider for LargestFirstChanging {
+    fn generation(&self) -> u64 {
+        self.0.generation()
+    }
+
+    fn snapshot(&self) -> Result<RuntimePredicateSnapshot> {
+        self.0.snapshot()
+    }
+
+    fn largest_first_column(&self) -> Option<String> {
+        Some("id".into())
+    }
+}
+
+#[tokio::test]
+async fn runtime_predicate_live_refresh_keeps_page_selections_with_largest_first_order() {
+    let temp = TempDir::new().unwrap();
+    // Two rows per page, so a refresh selects pages inside each remaining group.
+    let path = write_row_group_file_with_page_size(
+        temp.path().to_str().unwrap(),
+        "largest_first_pages.parquet",
+        &[0, 100, 200],
+        2,
+    );
+    let changing = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let (mut stream, _) = start_runtime_scan(
+        scan_task(path, iceberg_schema(), None),
+        Some(Arc::new(LargestFirstChanging(Arc::clone(&changing)))),
+        true,
+        true,
+        4,
+    );
+    let first = stream.try_next().await.unwrap().unwrap();
+    assert_eq!(ids(std::slice::from_ref(&first)), vec![200, 201, 202, 203]);
+    // The refresh plans pages for the remaining groups, read as 100 then 0.
+    changing.publish(
+        Some(Reference::new("id").greater_than_or_equal_to(Datum::int(2))),
+        1,
+    );
+    let rest: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    assert_eq!(ids(&rest), vec![100, 101, 102, 103, 2, 3]);
+}

@@ -224,10 +224,14 @@ impl RuntimePrunedStream {
             }
         }
         if self.refresh.row_selection_enabled && !kept.is_empty() {
-            let indices: Vec<usize> = kept
+            // Page selections span the selected groups in file order, while the groups may
+            // be read in another order (largest first). Plan and split them in file order,
+            // then attach each to its own group by index.
+            let mut indices: Vec<usize> = kept
                 .iter()
                 .map(RowGroupSelection::row_group_index)
                 .collect();
+            indices.sort_unstable();
             // Page pruning only narrows reads, and the row filter still applies
             // the predicate, so a failure keeps the groups without refinement.
             match ArrowReader::get_row_selection_for_filter_predicate(
@@ -238,11 +242,15 @@ impl RuntimePrunedStream {
                 task.schema(),
             ) {
                 Ok(Some(pages)) => {
-                    let pages = split_row_selection(parquet_metadata, &indices, Some(pages));
+                    let pages: HashMap<usize, RowGroupSelection> =
+                        split_row_selection(parquet_metadata, &indices, Some(pages))
+                            .into_iter()
+                            .map(|pages| (pages.row_group_index(), pages))
+                            .collect();
                     kept = kept
                         .into_iter()
-                        .zip(pages)
-                        .map(|(current, runtime)| {
+                        .map(|current| {
+                            let runtime = &pages[&current.row_group_index()];
                             let combined = match (current.selection(), runtime.selection()) {
                                 (Some(current), Some(runtime)) => {
                                     Some(current.intersection(runtime))
