@@ -495,28 +495,20 @@ impl BoundPredicateVisitor for InclusiveMetricsEvaluator<'_> {
             return ROWS_MIGHT_MATCH;
         }
 
-        if let Some(lower_bound) = self.lower_bound(field_id) {
-            if lower_bound.is_nan() {
-                // NaN indicates unreliable bounds. See the InclusiveMetricsEvaluator docs for more.
-                return ROWS_MIGHT_MATCH;
-            }
-
-            if !literals.iter().any(|datum| datum.ge(lower_bound)) {
-                // if all values are less than lower bound, rows cannot match.
-                return ROWS_CANNOT_MATCH;
-            }
+        let lower_bound = self.lower_bound(field_id);
+        let upper_bound = self.upper_bound(field_id);
+        if lower_bound.is_some_and(Datum::is_nan) || upper_bound.is_some_and(Datum::is_nan) {
+            // NaN indicates unreliable bounds. See the InclusiveMetricsEvaluator docs for more.
+            return ROWS_MIGHT_MATCH;
         }
 
-        if let Some(upper_bound) = self.upper_bound(field_id) {
-            if upper_bound.is_nan() {
-                // NaN indicates unreliable bounds. See the InclusiveMetricsEvaluator docs for more.
-                return ROWS_MIGHT_MATCH;
-            }
-
-            if !literals.iter().any(|datum| datum.le(upper_bound)) {
-                // if all values are greater than upper bound, rows cannot match.
-                return ROWS_CANNOT_MATCH;
-            }
+        // Like Java's evaluator, a literal must lie within both bounds at once: a set with
+        // one value below the lower bound and another above the upper bound cannot match.
+        if !literals.iter().any(|datum| {
+            lower_bound.is_none_or(|lower| datum.ge(lower))
+                && upper_bound.is_none_or(|upper| datum.le(upper))
+        }) {
+            return ROWS_CANNOT_MATCH;
         }
 
         ROWS_MIGHT_MATCH
@@ -1544,6 +1536,31 @@ mod test {
         )
         .unwrap();
         assert!(result, "Should read: range matches");
+    }
+
+    #[test]
+    fn test_in_with_literals_on_both_sides_of_the_bounds() {
+        // id spans INT_MIN_VALUE..=INT_MAX_VALUE in this file. One literal below and one above
+        // the range: neither can match, although each passes one of the two bound checks.
+        let result = InclusiveMetricsEvaluator::eval(
+            &r#in_int("id", &[INT_MIN_VALUE - 1, INT_MAX_VALUE + 1]),
+            &get_test_file_1(),
+            true,
+        )
+        .unwrap();
+        assert!(!result, "Should skip: no literal inside [lower, upper]");
+
+        let result = InclusiveMetricsEvaluator::eval(
+            &r#in_int("id", &[
+                INT_MIN_VALUE - 1,
+                INT_MIN_VALUE + 1,
+                INT_MAX_VALUE + 1,
+            ]),
+            &get_test_file_1(),
+            true,
+        )
+        .unwrap();
+        assert!(result, "Should read: one literal inside [lower, upper]");
     }
 
     #[test]

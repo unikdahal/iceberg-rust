@@ -488,28 +488,22 @@ impl BoundPredicateVisitor for RowGroupMetricsEvaluator<'_> {
             return ROW_GROUP_MIGHT_MATCH;
         };
 
-        if let Some(lower_bound) = get_parquet_stat_min_as_datum(&primitive_type, stats)? {
-            if lower_bound.is_nan() {
-                // NaN indicates unreliable bounds. See the InclusiveMetricsEvaluator docs for more.
-                return ROW_GROUP_MIGHT_MATCH;
-            }
-
-            if !literals.iter().any(|datum| datum.ge(&lower_bound)) {
-                // if all values are less than lower bound, rows cannot match.
-                return ROW_GROUP_CANT_MATCH;
-            }
+        let lower_bound = get_parquet_stat_min_as_datum(&primitive_type, stats)?;
+        let upper_bound = get_parquet_stat_max_as_datum(&primitive_type, stats)?;
+        if lower_bound.as_ref().is_some_and(Datum::is_nan)
+            || upper_bound.as_ref().is_some_and(Datum::is_nan)
+        {
+            // NaN indicates unreliable bounds. See the InclusiveMetricsEvaluator docs for more.
+            return ROW_GROUP_MIGHT_MATCH;
         }
 
-        if let Some(upper_bound) = get_parquet_stat_max_as_datum(&primitive_type, stats)? {
-            if upper_bound.is_nan() {
-                // NaN indicates unreliable bounds. See the InclusiveMetricsEvaluator docs for more.
-                return ROW_GROUP_MIGHT_MATCH;
-            }
-
-            if !literals.iter().any(|datum| datum.le(&upper_bound)) {
-                // if all values are greater than upper bound, rows cannot match.
-                return ROW_GROUP_CANT_MATCH;
-            }
+        // A literal must lie within both bounds at once: a set with one value below the lower
+        // bound and another above the upper bound cannot match this row group.
+        if !literals.iter().any(|datum| {
+            lower_bound.as_ref().is_none_or(|lower| datum.ge(lower))
+                && upper_bound.as_ref().is_none_or(|upper| datum.le(upper))
+        }) {
+            return ROW_GROUP_CANT_MATCH;
         }
 
         ROW_GROUP_MIGHT_MATCH
