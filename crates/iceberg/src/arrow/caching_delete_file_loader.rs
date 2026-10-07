@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, Int64Array, StringArray, StructArray};
 use bytes::Bytes;
+use fnv::FnvHashSet;
 use futures::{StreamExt, TryStreamExt};
 use tokio::sync::oneshot::{Receiver, channel};
 
@@ -31,7 +32,7 @@ use crate::delete_vector::DeleteVector;
 use crate::encryption::{EncryptedInputFile, StandardKeyMetadata};
 use crate::error::invalid_data;
 use crate::expr::Predicate::AlwaysTrue;
-use crate::expr::{Predicate, Reference};
+use crate::expr::{Predicate, PredicateOperator, Reference, SetExpression};
 use crate::io::FileIO;
 use crate::runtime::Runtime;
 use crate::scan::{ArrowRecordBatchStream, FileScanTaskDeleteFile};
@@ -595,6 +596,7 @@ impl CachingDeleteFileLoader {
         equality_ids: HashSet<i32>,
     ) -> Result<Predicate> {
         let mut row_predicates = Vec::new();
+        let mut single_column_deletes: Option<SingleColumnEqualityDeletes> = None;
         let mut batch_schema_iceberg: Option<Schema> = None;
         let accessor = EqDelRecordBatchPartnerAccessor;
 
@@ -619,8 +621,29 @@ impl CachingDeleteFileLoader {
             let mut processor = EqDelColumnProcessor::new(&equality_ids);
             visit_schema_with_partner(schema, &root_array, &mut processor, &accessor)?;
 
+            // For one equality column, keeping rows that match none of the delete keys is
+            // a set-membership test. Float equality must retain the comparison path: Datum
+            // hashing normalizes signed zero and NaNs, whereas Arrow comparisons distinguish
+            // them. Keep the row predicates for compound keys, where each row is a tuple.
+            let use_single_column_set = equality_ids.len() == 1
+                && processor.collected_columns.len() == 1
+                && !matches!(
+                    processor.collected_columns[0].2.as_primitive_type(),
+                    Some(PrimitiveType::Float | PrimitiveType::Double)
+                );
+
             let mut datum_columns_with_names = processor.finish()?;
             if datum_columns_with_names.is_empty() {
+                continue;
+            }
+
+            if use_single_column_set {
+                let (column, field_name) = datum_columns_with_names.pop().unwrap();
+                let deletes = single_column_deletes
+                    .get_or_insert_with(|| SingleColumnEqualityDeletes::new(field_name));
+                for value in column {
+                    deletes.push(value?);
+                }
                 continue;
             }
 
@@ -649,6 +672,10 @@ impl CachingDeleteFileLoader {
             }
         }
 
+        if let Some(deletes) = single_column_deletes {
+            row_predicates.extend(deletes.into_predicates());
+        }
+
         // All row predicates are combined to a single predicate by creating a balanced binary tree.
         // Using a simple fold would result in a deeply nested predicate that can cause a stack overflow.
         while row_predicates.len() > 1 {
@@ -667,6 +694,91 @@ impl CachingDeleteFileLoader {
         match row_predicates.pop() {
             Some(p) => Ok(p),
             None => Ok(AlwaysTrue),
+        }
+    }
+}
+
+/// Accumulates one equality key across batches without allocating a predicate per row.
+/// Small deletes retain the comparison path; larger deletes are deduplicated as they load.
+struct SingleColumnEqualityDeletes {
+    field_name: String,
+    values: EqualityDeleteValues,
+    contains_null: bool,
+}
+
+enum EqualityDeleteValues {
+    Small(Vec<Option<Datum>>),
+    Large(FnvHashSet<Datum>),
+}
+
+impl SingleColumnEqualityDeletes {
+    const COMPARISON_LIMIT: usize = 8;
+
+    fn new(field_name: String) -> Self {
+        Self {
+            field_name,
+            values: EqualityDeleteValues::Small(Vec::new()),
+            contains_null: false,
+        }
+    }
+
+    fn push(&mut self, value: Option<Datum>) {
+        if let EqualityDeleteValues::Small(values) = &mut self.values {
+            if values.len() < Self::COMPARISON_LIMIT {
+                values.push(value);
+                return;
+            }
+
+            let mut unique_values = FnvHashSet::default();
+            for value in values.drain(..) {
+                if let Some(value) = value {
+                    unique_values.insert(value);
+                } else {
+                    self.contains_null = true;
+                }
+            }
+            self.values = EqualityDeleteValues::Large(unique_values);
+        }
+
+        if let Some(value) = value {
+            if let EqualityDeleteValues::Large(values) = &mut self.values {
+                values.insert(value);
+            }
+        } else {
+            self.contains_null = true;
+        }
+    }
+
+    fn into_predicates(self) -> Vec<Predicate> {
+        let reference = Reference::new(self.field_name);
+        match self.values {
+            EqualityDeleteValues::Small(values) => values
+                .into_iter()
+                .map(|value| match value {
+                    Some(value) => reference
+                        .clone()
+                        .is_null()
+                        .or(reference.clone().not_equal_to(value)),
+                    None => reference.clone().is_not_null(),
+                })
+                .collect(),
+            EqualityDeleteValues::Large(values) => {
+                if values.is_empty() {
+                    // Large inputs containing only nulls still delete only null data rows.
+                    return vec![reference.is_not_null()];
+                }
+                let keep_non_null = Predicate::Set(SetExpression::new(
+                    PredicateOperator::NotIn,
+                    reference.clone(),
+                    values,
+                ));
+                let predicate = if self.contains_null {
+                    reference.is_not_null().and(keep_non_null)
+                } else {
+                    reference.is_null().or(keep_non_null)
+                };
+                vec![predicate]
+            }
         }
     }
 }
@@ -838,7 +950,8 @@ mod tests {
 
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        ArrayRef, BinaryArray, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+        ArrayRef, BinaryArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+        StringArray, StructArray,
     };
     use arrow_schema::{DataType, Field, Fields};
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
@@ -848,8 +961,10 @@ mod tests {
 
     use super::*;
     use crate::arrow::delete_filter::tests::setup;
+    use crate::expr::Bind;
+    use crate::expr::visitors::expression_evaluator::ExpressionEvaluator;
     use crate::scan::FileScanTaskDeleteFile;
-    use crate::spec::{DataContentType, Schema};
+    use crate::spec::{DataContentType, DataFileBuilder, Literal, Schema, Struct};
     use crate::test_utils::encode_dv_blob;
 
     #[tokio::test]
@@ -999,6 +1114,176 @@ mod tests {
             predicate.to_string(),
             "((status IS NULL) OR (status != \"A\")) AND ((status IS NULL) OR (status != \"B\"))"
         );
+    }
+
+    async fn parse_single_column_equality_deletes(
+        data_type: DataType,
+        columns: Vec<ArrayRef>,
+    ) -> (Predicate, SchemaRef) {
+        let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![simple_field(
+            "key", data_type, true, "3",
+        )]));
+        let schema = Arc::new(arrow_schema_to_schema(&arrow_schema).unwrap());
+        let stream = futures::stream::iter(columns.into_iter().map(move |column| {
+            RecordBatch::try_new(arrow_schema.clone(), vec![column]).map_err(Into::into)
+        }))
+        .boxed();
+        let predicate = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+            stream,
+            HashSet::from([3]),
+        )
+        .await
+        .unwrap();
+        (predicate, schema)
+    }
+
+    fn assert_equality_delete_keeps(
+        predicate: &Predicate,
+        schema: SchemaRef,
+        rows: impl IntoIterator<Item = (Option<Literal>, bool)>,
+    ) {
+        let evaluator = ExpressionEvaluator::new(predicate.bind(schema, true).unwrap());
+        for (value, expected) in rows {
+            let file = DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path("test.parquet".to_string())
+                .file_format(DataFileFormat::Parquet)
+                .partition(Struct::from_iter([value]))
+                .record_count(1)
+                .file_size_in_bytes(1)
+                .build()
+                .unwrap();
+            assert_eq!(evaluator.eval(&file).unwrap(), expected, "{file:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_large_single_column_equality_deletes_deduplicate_across_batches() {
+        let (predicate, schema) = parse_single_column_equality_deletes(DataType::Int64, vec![
+            Arc::new(Int64Array::from_iter_values(0..6)),
+            Arc::new(Int64Array::from(Vec::<i64>::new())),
+            Arc::new(Int64Array::from_iter_values(6..12)),
+            Arc::new(Int64Array::from(vec![0, 5, 11, 11])),
+        ])
+        .await;
+        let reference = Reference::new("key");
+        assert_eq!(
+            predicate,
+            reference
+                .clone()
+                .is_null()
+                .or(reference.is_not_in((0..12).map(Datum::long)))
+        );
+        assert_equality_delete_keeps(
+            &predicate,
+            schema,
+            [(None, true), (Some(Literal::long(-1)), true)]
+                .into_iter()
+                .chain((0..12).map(|value| (Some(Literal::long(value)), false)))
+                .chain([(Some(Literal::long(12)), true)]),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_large_single_column_equality_deletes_with_nulls_across_batches() {
+        // Nulls arriving before and after the accumulator switches to set membership both
+        // match null data rows, and duplicate non-null keys never change the result.
+        for null_in_first_batch in [true, false] {
+            let mut first = (0..6).map(Some).collect::<Vec<_>>();
+            let mut second = (6..12).map(Some).collect::<Vec<_>>();
+            if null_in_first_batch {
+                first.insert(0, None);
+            }
+            second.extend([Some(0), Some(11), None, None]);
+            let (predicate, schema) = parse_single_column_equality_deletes(DataType::Int64, vec![
+                Arc::new(Int64Array::from(first)),
+                Arc::new(Int64Array::from(second)),
+            ])
+            .await;
+            let reference = Reference::new("key");
+            assert_eq!(
+                predicate,
+                reference
+                    .clone()
+                    .is_not_null()
+                    .and(reference.is_not_in((0..12).map(Datum::long)))
+            );
+            assert_equality_delete_keeps(
+                &predicate,
+                schema,
+                [(None, false), (Some(Literal::long(-1)), true)]
+                    .into_iter()
+                    .chain((0..12).map(|value| (Some(Literal::long(value)), false)))
+                    .chain([(Some(Literal::long(12)), true)]),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_large_single_column_equality_deletes_only_nulls() {
+        let (predicate, schema) = parse_single_column_equality_deletes(DataType::Utf8, vec![
+            Arc::new(StringArray::from(vec![None::<&str>; 6])),
+            Arc::new(StringArray::from(vec![None::<&str>; 6])),
+        ])
+        .await;
+        assert_eq!(predicate, Reference::new("key").is_not_null());
+        assert_equality_delete_keeps(&predicate, schema, [
+            (None, false),
+            (Some(Literal::string("kept")), true),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn test_equality_delete_empty_batches_keep_all_rows() {
+        let (predicate, _) = parse_single_column_equality_deletes(DataType::Int64, vec![
+            Arc::new(Int64Array::from(Vec::<i64>::new())),
+            Arc::new(Int64Array::from(Vec::<i64>::new())),
+        ])
+        .await;
+        assert_eq!(predicate, AlwaysTrue);
+        let stream = futures::stream::empty().boxed();
+        assert_eq!(
+            CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+                stream,
+                HashSet::from([3])
+            )
+            .await
+            .unwrap(),
+            AlwaysTrue
+        );
+    }
+
+    #[tokio::test]
+    async fn test_small_single_column_equality_deletes_preserve_predicate_shape_across_batches() {
+        let (predicate, _) = parse_single_column_equality_deletes(DataType::Int64, vec![
+            Arc::new(Int64Array::from(vec![Some(0), None])),
+            Arc::new(Int64Array::from(vec![Some(0), Some(1)])),
+        ])
+        .await;
+        assert_eq!(
+            predicate.to_string(),
+            "(((key IS NULL) OR (key != 0)) AND (key IS NOT NULL)) AND (((key IS NULL) OR (key != 0)) AND ((key IS NULL) OR (key != 1)))"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_large_floating_point_equality_deletes_retain_comparison_predicates() {
+        for (data_type, column) in [
+            (
+                DataType::Float32,
+                Arc::new(Float32Array::from(vec![0.0, -0.0, f32::NAN, 1.0, 2.0])) as ArrayRef,
+            ),
+            (
+                DataType::Float64,
+                Arc::new(Float64Array::from(vec![0.0, -0.0, f64::NAN, 1.0, 2.0])) as ArrayRef,
+            ),
+        ] {
+            let (predicate, _) =
+                parse_single_column_equality_deletes(data_type, vec![column.clone(), column]).await;
+            let text = predicate.to_string();
+            assert!(!text.contains("NOT IN"), "{text}");
+            assert_eq!(text.matches(" != ").count(), 10);
+        }
     }
 
     /// Create a simple field with metadata.
