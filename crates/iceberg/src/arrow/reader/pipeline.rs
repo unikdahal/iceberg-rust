@@ -54,12 +54,12 @@ use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::encryption::StandardKeyMetadata;
 use crate::error::{Result, invalid_data};
-use crate::expr::BoundPredicate;
 use crate::expr::visitors::bloom_filter_evaluator::{
     BloomFilterEvaluator, ColumnBloomFilter, collect_bloom_filter_field_ids,
 };
 use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
 use crate::expr::visitors::strict_metrics_evaluator::StrictMetricsEvaluator;
+use crate::expr::{BoundPredicate, PredicateOperator};
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{
     RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_POS,
@@ -608,9 +608,9 @@ impl FileScanTaskReader {
             });
             match planned {
                 Ok(mut plan) => {
-                    plan.row_filter = !task.file_metrics().is_some_and(|metrics| {
-                        Self::file_always_matches(&plan.predicate, metrics, &task)
-                    });
+                    plan.row_filter = !task
+                        .file_metrics()
+                        .is_some_and(|metrics| Self::file_always_matches(&plan.predicate, metrics));
                     plans.push(plan)
                 }
                 Err(error) => tracing::debug!(
@@ -925,6 +925,36 @@ impl FileScanTaskReader {
         })
     }
 
+    /// Validates only bounds used by this predicate. Statistics for a dropped
+    /// or promoted, unrelated field cannot invalidate pruning of another field.
+    fn file_bounds_match_predicate(
+        predicate: &BoundPredicate,
+        metrics: &FileScanTaskMetrics,
+    ) -> bool {
+        let reference = match predicate {
+            BoundPredicate::AlwaysTrue | BoundPredicate::AlwaysFalse => return true,
+            BoundPredicate::And(expression) | BoundPredicate::Or(expression) => {
+                return expression
+                    .inputs()
+                    .iter()
+                    .all(|input| Self::file_bounds_match_predicate(input, metrics));
+            }
+            BoundPredicate::Not(expression) => {
+                return Self::file_bounds_match_predicate(expression.inputs()[0], metrics);
+            }
+            BoundPredicate::Unary(expression) => expression.term(),
+            BoundPredicate::Binary(expression) => expression.term(),
+            BoundPredicate::Set(expression) => expression.term(),
+        };
+        let field = reference.field();
+        metrics
+            .lower_bounds()
+            .get(&field.id)
+            .iter()
+            .chain(metrics.upper_bounds().get(&field.id).iter())
+            .all(|bound| field.field_type.as_primitive_type() == Some(bound.data_type()))
+    }
+
     /// Whether a file's whole-file statistics allow a row to match `predicate`.
     /// Statistics whose type does not match the task schema, for example after
     /// a column was promoted, and evaluation errors keep the file.
@@ -933,15 +963,7 @@ impl FileScanTaskReader {
         metrics: &FileScanTaskMetrics,
         task: &FileScanTask,
     ) -> bool {
-        let bounds_match_schema = metrics
-            .lower_bounds()
-            .iter()
-            .chain(metrics.upper_bounds())
-            .all(|(id, bound)| {
-                task.schema().field_by_id(*id).is_some_and(|field| {
-                    field.field_type.as_primitive_type() == Some(bound.data_type())
-                })
-            });
+        let bounds_match_schema = Self::file_bounds_match_predicate(predicate, metrics);
         if !bounds_match_schema {
             return true;
         }
@@ -959,21 +981,38 @@ impl FileScanTaskReader {
     /// Whether whole-file statistics prove that every row of the file satisfies `predicate`,
     /// so its row filter would only confirm it. Statistics whose type does not match the task
     /// schema, and evaluation errors, answer no, which only costs the row filter.
-    fn file_always_matches(
-        predicate: &BoundPredicate,
-        metrics: &FileScanTaskMetrics,
-        task: &FileScanTask,
-    ) -> bool {
-        let bounds_match_schema = metrics
-            .lower_bounds()
-            .iter()
-            .chain(metrics.upper_bounds())
-            .all(|(id, bound)| {
-                task.schema().field_by_id(*id).is_some_and(|field| {
-                    field.field_type.as_primitive_type() == Some(bound.data_type())
-                })
-            });
+    fn file_always_matches(predicate: &BoundPredicate, metrics: &FileScanTaskMetrics) -> bool {
+        let bounds_match_schema = Self::file_bounds_match_predicate(predicate, metrics);
+        // Iceberg's strict evaluator treats null as matching negative equality
+        // and membership predicates. Arrow's row kernels return null instead,
+        // which the row filter drops. Keep those filters unless their columns
+        // are explicitly known to contain no nulls, including inside OR trees.
+        fn null_semantics_match(predicate: &BoundPredicate, metrics: &FileScanTaskMetrics) -> bool {
+            match predicate {
+                BoundPredicate::And(expression) | BoundPredicate::Or(expression) => expression
+                    .inputs()
+                    .iter()
+                    .all(|input| null_semantics_match(input, metrics)),
+                BoundPredicate::Not(_) => false,
+                BoundPredicate::Binary(expression)
+                    if expression.op() == PredicateOperator::NotEq =>
+                {
+                    metrics
+                        .null_value_counts()
+                        .get(&expression.term().field().id)
+                        == Some(&0)
+                }
+                BoundPredicate::Set(expression) if expression.op() == PredicateOperator::NotIn => {
+                    metrics
+                        .null_value_counts()
+                        .get(&expression.term().field().id)
+                        == Some(&0)
+                }
+                _ => true,
+            }
+        }
         bounds_match_schema
+            && null_semantics_match(predicate, metrics)
             && StrictMetricsEvaluator::eval_metrics(predicate, metrics.into()).unwrap_or(false)
     }
 

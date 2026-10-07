@@ -24,7 +24,7 @@ use arrow_array::types::{Decimal128Type, validate_decimal_precision_and_scale};
 use arrow_array::{
     BinaryArray, BooleanArray, Date32Array, Datum as ArrowDatum, Decimal128Array,
     FixedSizeBinaryArray, Float32Array, Float64Array, Int32Array, Int64Array, Scalar, StringArray,
-    TimestampMicrosecondArray, TimestampNanosecondArray,
+    Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use arrow_schema::extension::ExtensionType;
 use arrow_schema::{
@@ -499,7 +499,10 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
             }
             DataType::Float32 => Ok(Type::Primitive(PrimitiveType::Float)),
             DataType::Float64 => Ok(Type::Primitive(PrimitiveType::Double)),
-            DataType::Decimal128(p, s) => Type::decimal(*p as u32, *s as u32)
+            DataType::Decimal32(p, s)
+            | DataType::Decimal64(p, s)
+            | DataType::Decimal128(p, s)
+            | DataType::Decimal256(p, s) => Type::decimal(*p as u32, *s as u32)
                 .map_err(|e| invalid_data!("Failed to create decimal type").with_source(e)),
             DataType::Date32 => Ok(Type::Primitive(PrimitiveType::Date)),
             DataType::Time64(unit) if unit == &TimeUnit::Microsecond => {
@@ -782,6 +785,9 @@ pub(crate) fn get_arrow_datum(datum: &Datum) -> Result<Arc<dyn ArrowDatum + Send
         }
         (PrimitiveType::Date, PrimitiveLiteral::Int(value)) => {
             Ok(Arc::new(Date32Array::new_scalar(*value)))
+        }
+        (PrimitiveType::Time, PrimitiveLiteral::Long(value)) => {
+            Ok(Arc::new(Time64MicrosecondArray::new_scalar(*value)))
         }
         (PrimitiveType::Timestamp, PrimitiveLiteral::Long(value)) => {
             Ok(Arc::new(TimestampMicrosecondArray::new_scalar(*value)))

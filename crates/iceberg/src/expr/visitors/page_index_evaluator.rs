@@ -166,6 +166,26 @@ impl<'a> PageIndexEvaluator<'a> {
             // successful, just a bit slower
             return self.select_all_rows();
         };
+        // An unsigned INT32 bound is encoded in an i32 even when the table
+        // represents the column as Long. Its bit pattern is not a signed
+        // bound; leave such imported columns to the Arrow row filter.
+        let column_descriptor = self
+            .row_group_metadata
+            .column(parquet_column_index)
+            .column_descr();
+        if column_descriptor.converted_type() == parquet::basic::ConvertedType::UINT_32
+            || self
+                .row_group_metadata
+                .column(parquet_column_index)
+                .column_descr()
+                .logical_type_ref()
+                .is_some_and(|logical| {
+                    matches!(logical, parquet::basic::LogicalType::Integer(integer)
+                    if !integer.is_signed && integer.bit_width == 32)
+                })
+        {
+            return self.select_all_rows();
+        }
 
         let row_counts = {
             // Caches row count calculations for columns that appear multiple times in
@@ -248,6 +268,37 @@ impl<'a> PageIndexEvaluator<'a> {
     where
         F: Fn(Option<Datum>, Option<Datum>, PageNullCount) -> Result<bool>,
     {
+        // A physical/table-type mismatch must not construct a Datum with a
+        // literal of the wrong primitive representation: such a bound is
+        // incomparable and could incorrectly reject every page.
+        let compatible = match column_index {
+            ColumnIndexMetaData::BOOLEAN(_) => matches!(field_type, PrimitiveType::Boolean),
+            ColumnIndexMetaData::INT32(_) => matches!(
+                field_type,
+                PrimitiveType::Int
+                    | PrimitiveType::Long
+                    | PrimitiveType::Date
+                    | PrimitiveType::Decimal { .. }
+            ),
+            ColumnIndexMetaData::INT64(_) => matches!(
+                field_type,
+                PrimitiveType::Long
+                    | PrimitiveType::Time
+                    | PrimitiveType::Timestamp
+                    | PrimitiveType::Timestamptz
+                    | PrimitiveType::TimestampNs
+                    | PrimitiveType::TimestamptzNs
+                    | PrimitiveType::Decimal { .. }
+            ),
+            ColumnIndexMetaData::FLOAT(_) => {
+                matches!(field_type, PrimitiveType::Float | PrimitiveType::Double)
+            }
+            ColumnIndexMetaData::DOUBLE(_) => matches!(field_type, PrimitiveType::Double),
+            _ => true,
+        };
+        if !compatible {
+            return Ok(None);
+        }
         let result: Result<Vec<bool>> = match column_index {
             ColumnIndexMetaData::NONE => {
                 return Ok(None);
@@ -302,18 +353,8 @@ impl<'a> PageIndexEvaluator<'a> {
                 .zip(row_counts.iter())
                 .map(|((i, (min, max)), &row_count)| {
                     predicate(
-                        min.map(|&val| {
-                            Datum::new(
-                                field_type.clone(),
-                                PrimitiveLiteral::Float(OrderedFloat::from(val)),
-                            )
-                        }),
-                        max.map(|&val| {
-                            Datum::new(
-                                field_type.clone(),
-                                PrimitiveLiteral::Float(OrderedFloat::from(val)),
-                            )
-                        }),
+                        min.map(|&val| Self::float32_bound_to_datum(field_type, val)),
+                        max.map(|&val| Self::float32_bound_to_datum(field_type, val)),
                         PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
                     )
                 })
@@ -414,11 +455,20 @@ impl<'a> PageIndexEvaluator<'a> {
     /// primitive type.
     fn int32_bound_to_datum(field_type: &PrimitiveType, val: i32) -> Datum {
         match field_type {
+            PrimitiveType::Long => Datum::long(i64::from(val)),
             PrimitiveType::Decimal { .. } => Datum::new(
                 field_type.clone(),
                 PrimitiveLiteral::Int128(i128::from(val)),
             ),
             _ => Datum::new(field_type.clone(), PrimitiveLiteral::Int(val)),
+        }
+    }
+
+    /// FLOAT bounds widen exactly when the table column was promoted to DOUBLE.
+    fn float32_bound_to_datum(field_type: &PrimitiveType, val: f32) -> Datum {
+        match field_type {
+            PrimitiveType::Double => Datum::double(f64::from(val)),
+            _ => Datum::float(val),
         }
     }
 

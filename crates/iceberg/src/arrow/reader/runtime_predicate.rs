@@ -17,7 +17,7 @@
 
 //! Execution-time predicates published to the Arrow reader.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use parquet::arrow::arrow_reader::RowSelection;
@@ -27,7 +27,7 @@ use super::ArrowReader;
 use crate::arrow::record_batch_transformer::column_needs_type_promotion;
 use crate::arrow::type_to_arrow_type;
 use crate::expr::{Bind, BoundPredicate, Predicate};
-use crate::spec::{Schema, SchemaRef};
+use crate::spec::{PrimitiveType, Schema, SchemaRef};
 use crate::{Error, ErrorKind, Result};
 
 /// An immutable view of a runtime predicate at one point in execution.
@@ -76,6 +76,10 @@ impl RuntimePredicateSnapshot {
 ///   advisory: the reader skips the runtime predicate and does not retry them.
 ///   Errors while decoding its columns or evaluating it on rows are not
 ///   skipped.
+/// * Floating-point comparison and set predicates are currently skipped:
+///   the statistics evaluators and Arrow row filters do not agree on every
+///   NaN and signed-zero comparison. Floating-point null and NaN tests are
+///   supported.
 ///
 /// Pass a provider to `ArrowReaderBuilder::with_runtime_predicate_provider`.
 /// This is the reader layer only: `TableScan::to_arrow` does not accept a
@@ -154,7 +158,7 @@ pub trait RuntimePredicateProvider: Send + Sync {
 /// Failures are cached as `None` for that key.
 pub(super) struct RuntimePredicates {
     provider: Arc<dyn RuntimePredicateProvider>,
-    cached: Mutex<Option<CachedPredicate>>,
+    cached: RwLock<Option<CachedPredicate>>,
 }
 
 struct CachedPredicate {
@@ -177,7 +181,7 @@ impl RuntimePredicates {
     pub(super) fn new(provider: Arc<dyn RuntimePredicateProvider>) -> Self {
         Self {
             provider,
-            cached: Mutex::new(None),
+            cached: RwLock::new(None),
         }
     }
 
@@ -199,11 +203,20 @@ impl RuntimePredicates {
         case_sensitive: bool,
         data_file_path: &str,
     ) -> Option<Arc<BoundPredicate>> {
-        // Hold the lock for the whole refresh so concurrent misses wait for it
+        // Stable publications are shared reads: parallel data-file tasks must
+        // not serialize merely to clone the same immutable bound predicate.
+        let generation = self.provider.generation();
+        if let Some(cached) = self.cached.read().unwrap().as_ref()
+            && cached.matches(generation, schema, case_sensitive)
+        {
+            return cached.predicate.clone();
+        }
+
+        // Hold the write lock for the whole refresh so concurrent misses wait for it
         // instead of repeating the snapshot and binding, and a slow refresh
         // cannot overwrite a newer one. Read the generation after locking so
         // waiters reuse a completed refresh, including a failed one.
-        let mut cache = self.cached.lock().unwrap();
+        let mut cache = self.cached.write().unwrap();
         let generation = self.provider.generation();
         if let Some(cached) = cache.as_ref()
             && cached.matches(generation, schema, case_sensitive)
@@ -226,7 +239,13 @@ impl RuntimePredicates {
                 let generation = snapshot.generation();
                 let bound = snapshot
                     .into_predicate()
-                    .map(|predicate| predicate.rewrite_not().bind(schema.clone(), case_sensitive))
+                    .map(|predicate| {
+                        let bound = predicate
+                            .rewrite_not()
+                            .bind(schema.clone(), case_sensitive)?;
+                        check_runtime_predicate_semantics(&bound)?;
+                        Ok::<_, Error>(bound)
+                    })
                     .transpose();
                 match bound {
                     Ok(bound) => (generation, bound.map(Arc::new)),
@@ -250,6 +269,37 @@ impl RuntimePredicates {
         });
         result
     }
+}
+
+/// Statistics and row filtering must agree before any data can be skipped.
+/// Floating-point equality in the statistics evaluators canonicalizes zeros
+/// and NaNs, while Arrow compares their bit patterns. Parquet's floating-point
+/// bounds also exclude NaNs that an Arrow ordering predicate may match.
+fn check_runtime_predicate_semantics(predicate: &BoundPredicate) -> Result<()> {
+    let reference = match predicate {
+        BoundPredicate::And(expression) | BoundPredicate::Or(expression) => {
+            for input in expression.inputs() {
+                check_runtime_predicate_semantics(input)?;
+            }
+            return Ok(());
+        }
+        BoundPredicate::Not(expression) => {
+            return check_runtime_predicate_semantics(expression.inputs()[0]);
+        }
+        BoundPredicate::Binary(expression) => expression.term(),
+        BoundPredicate::Set(expression) => expression.term(),
+        _ => return Ok(()),
+    };
+    if matches!(
+        reference.field().field_type.as_primitive_type(),
+        Some(PrimitiveType::Float | PrimitiveType::Double)
+    ) {
+        return Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Runtime floating-point comparisons do not have consistent pruning semantics",
+        ));
+    }
+    Ok(())
 }
 
 /// Fails if `predicate` references a column the file lacks (its default is
@@ -352,7 +402,7 @@ pub(super) fn intersect_page_selection(
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
-    use std::sync::{Barrier, OnceLock, Weak};
+    use std::sync::{Barrier, Mutex, OnceLock, Weak};
     use std::time::Duration;
 
     use super::*;
@@ -382,7 +432,7 @@ mod tests {
                 // The cache stays locked for the whole refresh, so concurrent
                 // misses wait for this snapshot instead of starting their own.
                 let predicates = self.predicates.get().unwrap().upgrade().unwrap();
-                assert!(predicates.cached.try_lock().is_err());
+                assert!(predicates.cached.try_read().is_err());
                 self.release
                     .lock()
                     .unwrap()
@@ -452,7 +502,7 @@ mod tests {
         assert_eq!(
             predicates
                 .cached
-                .lock()
+                .read()
                 .unwrap()
                 .as_ref()
                 .unwrap()
@@ -482,13 +532,29 @@ mod tests {
             assert_eq!(provider.snapshots.load(Ordering::Relaxed), 2);
         } else {
             let current = current.unwrap();
-            let reused = results
-                .iter()
-                .filter(|result| Arc::ptr_eq(result.as_ref().unwrap(), &current))
-                .count();
-            assert_eq!(reused, CALLERS - usize::from(publish_during_snapshot));
-            // Arc identity verifies that waiters reuse the bound predicate,
-            // rather than just deduplicating snapshots and binding separately.
+            // A caller may sample generation 1 before publication and then
+            // acquire the read lock after the first refresh. Reusing that
+            // still-safe bound is valid; scheduling decides which waiters
+            // observe generation 2. Every caller must reuse one of the two
+            // bindings, rather than binding an equivalent predicate again.
+            let original = results.iter().find_map(|result| {
+                let bound = result.as_ref().unwrap();
+                (!Arc::ptr_eq(bound, &current)).then_some(bound)
+            });
+            if publish_during_snapshot {
+                let original = original.expect("the gated snapshot captures generation 1");
+                let expected = Reference::new("id")
+                    .greater_than_or_equal_to(Datum::long(100))
+                    .bind(schema.clone(), false)
+                    .unwrap();
+                assert_eq!(original.as_ref(), &expected);
+                assert!(results.iter().all(|result| {
+                    let bound = result.as_ref().unwrap();
+                    Arc::ptr_eq(bound, original) || Arc::ptr_eq(bound, &current)
+                }));
+            } else {
+                assert!(original.is_none());
+            }
             assert!(Arc::ptr_eq(
                 &current,
                 &predicates
@@ -513,6 +579,53 @@ mod tests {
     #[test]
     fn concurrent_runtime_predicate_refresh_snapshots_and_binds_once() {
         concurrent_refresh(false, false);
+    }
+
+    #[test]
+    fn runtime_predicate_cache_hits_allow_concurrent_readers() {
+        struct Provider(AtomicU64);
+        impl RuntimePredicateProvider for Provider {
+            fn generation(&self) -> u64 {
+                1
+            }
+
+            fn snapshot(&self) -> Result<RuntimePredicateSnapshot> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(RuntimePredicateSnapshot::new(
+                    Some(Reference::new("id").greater_than(Datum::long(0))),
+                    1,
+                ))
+            }
+        }
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let provider = Arc::new(Provider(AtomicU64::new(0)));
+        let predicates = RuntimePredicates::new(provider.clone());
+        let expected = predicates.current(&schema, true, "first.parquet").unwrap();
+        std::thread::scope(|scope| {
+            // A cache hit needs no exclusive access even while another task is
+            // reading the cached publication.
+            let cache_reader = predicates.cached.read().unwrap();
+            let (completed_tx, completed_rx) = mpsc::channel();
+            let predicates = &predicates;
+            let schema = &schema;
+            let expected = &expected;
+            scope.spawn(move || {
+                let current = predicates
+                    .current(schema, true, "parallel.parquet")
+                    .unwrap();
+                completed_tx.send(Arc::ptr_eq(&current, expected)).unwrap();
+            });
+            assert!(completed_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+            drop(cache_reader);
+        });
+        assert_eq!(provider.0.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -576,7 +689,7 @@ mod tests {
         assert_eq!(
             predicates
                 .cached
-                .lock()
+                .read()
                 .unwrap()
                 .as_ref()
                 .unwrap()
@@ -603,7 +716,7 @@ mod tests {
         assert_eq!(
             predicates
                 .cached
-                .lock()
+                .read()
                 .unwrap()
                 .as_ref()
                 .unwrap()

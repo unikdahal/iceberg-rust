@@ -564,6 +564,250 @@ async fn runtime_predicate_preserves_position_and_equality_deletes() {
 }
 
 #[tokio::test]
+async fn runtime_predicate_reader_preserves_promoted_columns_with_out_of_range_equality_deletes() {
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path().to_str().unwrap();
+    let data_path = write_three_row_group_file(dir, "old-int-data.parquet");
+    let schema = Arc::new(
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "payload", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let out_of_range = i64::from(i32::MAX) + 1;
+    for (index, keys) in [
+        vec![out_of_range],
+        vec![i64::from(i32::MIN) - 1],
+        (out_of_range..out_of_range + 20).collect(),
+        std::iter::once(0)
+            .chain([100, 200])
+            .chain(out_of_range..out_of_range + 20)
+            .collect(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let equality_path = format!("{dir}/long-deletes-{index}.parquet");
+        write_delete(&equality_path, vec![field("id", DataType::Int64, 1)], vec![
+            Arc::new(Int64Array::from(keys.clone())),
+        ]);
+        let delete = FileScanTaskDeleteFile::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&equality_path).unwrap().len())
+            .with_file_path(equality_path)
+            .with_file_type(DataContentType::EqualityDeletes)
+            .with_file_format(DataFileFormat::Parquet)
+            .with_partition_spec_id(0)
+            .with_equality_ids(Some(vec![1]))
+            .build();
+        let task = scan_task_with_deletes(data_path.clone(), schema.clone(), None, vec![delete]);
+        let expected: Vec<_> = all_ids()
+            .into_iter()
+            .map(i64::from)
+            .filter(|value| !keys.contains(value))
+            .collect();
+        for provider in [
+            None,
+            Some(Arc::new(ChangingRuntimePredicate::new(None, 0))
+                as Arc<dyn RuntimePredicateProvider>),
+        ] {
+            let (batches, _) = execute(task.clone(), provider).await;
+            let actual: Vec<_> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            assert_eq!(actual, expected, "delete keys {keys:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn runtime_predicate_reader_compares_after_lossless_physical_numeric_promotion() {
+    use arrow_array::types::Int8Type;
+    use arrow_array::{
+        Decimal32Array, Decimal64Array, Decimal256Array, DictionaryArray, Int8Array, Int16Array,
+        UInt8Array, UInt16Array, UInt32Array,
+    };
+    use arrow_buffer::i256;
+
+    let dictionary = DictionaryArray::<Int8Type>::try_new(
+        Int8Array::from(vec![Some(0), None, Some(1), Some(2)]),
+        Arc::new(Int8Array::from(vec![1, 2, 3])),
+    )
+    .unwrap();
+    let cases: Vec<(&str, ArrayRef, PrimitiveType, Datum)> = vec![
+        (
+            "int8",
+            Arc::new(Int8Array::from(vec![Some(1), None, Some(2), Some(3)])),
+            PrimitiveType::Int,
+            Datum::int(1000),
+        ),
+        (
+            "int16",
+            Arc::new(Int16Array::from(vec![Some(1), None, Some(2), Some(3)])),
+            PrimitiveType::Long,
+            Datum::long(100_000),
+        ),
+        (
+            "uint8",
+            Arc::new(UInt8Array::from(vec![Some(1), None, Some(2), Some(3)])),
+            PrimitiveType::Int,
+            Datum::int(1000),
+        ),
+        (
+            "uint16",
+            Arc::new(UInt16Array::from(vec![Some(1), None, Some(2), Some(3)])),
+            PrimitiveType::Int,
+            Datum::int(100_000),
+        ),
+        (
+            "uint32",
+            Arc::new(UInt32Array::from(vec![
+                Some(1),
+                None,
+                Some(u32::MAX),
+                Some(3),
+            ])),
+            PrimitiveType::Long,
+            Datum::long(i64::from(u32::MAX) + 1),
+        ),
+        (
+            "dictionary-int8",
+            Arc::new(dictionary),
+            PrimitiveType::Int,
+            Datum::int(1000),
+        ),
+        (
+            "decimal32",
+            Arc::new(
+                Decimal32Array::from(vec![Some(1), None, Some(2), Some(3)])
+                    .with_precision_and_scale(8, 0)
+                    .unwrap(),
+            ),
+            PrimitiveType::Decimal {
+                precision: 12,
+                scale: 0,
+            },
+            Datum::decimal_from_str("10000000000").unwrap(),
+        ),
+        (
+            "decimal64",
+            Arc::new(
+                Decimal64Array::from(vec![Some(1), None, Some(2), Some(3)])
+                    .with_precision_and_scale(15, 0)
+                    .unwrap(),
+            ),
+            PrimitiveType::Decimal {
+                precision: 30,
+                scale: 0,
+            },
+            Datum::decimal_from_str("10000000000000000000000000").unwrap(),
+        ),
+        (
+            "decimal256",
+            Arc::new(
+                Decimal256Array::from(vec![
+                    Some(i256::from_i128(1)),
+                    None,
+                    Some(i256::from_i128(2)),
+                    Some(i256::from_i128(3)),
+                ])
+                .with_precision_and_scale(20, 0)
+                .unwrap(),
+            ),
+            PrimitiveType::Decimal {
+                precision: 30,
+                scale: 0,
+            },
+            Datum::decimal_from_str("10000000000000000000000000").unwrap(),
+        ),
+    ];
+    let temp = TempDir::new().unwrap();
+    for (name, values, target, beyond_source) in cases {
+        let path = temp.path().join(format!("promotion-{name}.parquet"));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            field("id", DataType::Int32, 1),
+            Field::new("value", values.data_type().clone(), true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(vec![0, 1, 2, 3])),
+            values,
+        ])
+        .unwrap();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), arrow_schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let target_type = Type::Primitive(target);
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "value", target_type.clone()).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let datum = |value: i64| match target_type {
+            Type::Primitive(PrimitiveType::Decimal { .. }) => {
+                Datum::decimal_from_str(value.to_string())
+                    .unwrap()
+                    .to(&target_type)
+                    .unwrap()
+            }
+            _ => Datum::long(value).to(&target_type).unwrap(),
+        };
+        let keys = || {
+            std::iter::once(datum(1))
+                .chain(std::iter::once(beyond_source.clone()))
+                .chain((4..20).map(datum))
+                .collect::<Vec<_>>()
+        };
+        for (predicate, expected) in [
+            (
+                Reference::new("value").less_than(beyond_source.clone()),
+                vec![0, 2, 3],
+            ),
+            (
+                Reference::new("value").not_equal_to(beyond_source.clone()),
+                vec![0, 2, 3],
+            ),
+            (Reference::new("value").is_in(keys()), vec![0]),
+            (Reference::new("value").is_not_in(keys()), vec![2, 3]),
+        ] {
+            let planned = predicate.clone().bind(schema.clone(), false).unwrap();
+            let task = scan_task(
+                path.to_str().unwrap().to_string(),
+                schema.clone(),
+                Some(planned),
+            );
+            for provider in [
+                None,
+                Some(Arc::new(ChangingRuntimePredicate::new(None, 0))
+                    as Arc<dyn RuntimePredicateProvider>),
+            ] {
+                let (batches, _) = execute(task.clone(), provider).await;
+                assert_eq!(ids(&batches), expected, "{name}: {predicate}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn runtime_predicate_respects_task_byte_range() {
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
@@ -1450,6 +1694,29 @@ async fn runtime_predicate_file_statistics_keep_possible_matches_and_fail_open()
 }
 
 #[tokio::test]
+async fn runtime_predicate_file_pruning_ignores_incompatible_statistics_of_unreferenced_fields() {
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "unrelated-stats.parquet");
+    let mut metrics = three_group_file_metrics();
+    // One dropped field and one promoted field: neither participates in `id`.
+    metrics.lower_bounds.insert(99, Datum::long(0));
+    metrics.upper_bounds.insert(99, Datum::long(10));
+    metrics.lower_bounds.insert(2, Datum::int(0));
+    metrics.upper_bounds.insert(2, Datum::int(10));
+    let task = with_file_metrics(scan_task(path, iceberg_schema(), None), metrics);
+    let (batches, metrics) = execute(
+        task,
+        Some(Arc::new(FixedRuntimePredicate::new(
+            Reference::new("id").greater_than(Datum::int(203)),
+        ))),
+    )
+    .await;
+    assert!(batches.is_empty());
+    assert_eq!(metrics.bytes_read(), 0);
+    assert_eq!(metrics.runtime_file_tasks_pruned(), 1);
+}
+
+#[tokio::test]
 async fn runtime_predicate_metrics_attribute_only_runtime_pruning() {
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
@@ -1941,6 +2208,173 @@ async fn runtime_predicate_file_statistics_that_prove_every_row_do_not_change_re
             assert_eq!(&ids(&batches), expected, "{predicate} with nulls {nulls:?}");
         }
     }
+}
+
+#[tokio::test]
+async fn runtime_predicate_negative_predicates_preserve_null_filtering_with_file_metrics() {
+    let temp = TempDir::new().unwrap();
+    let schema = Arc::new(
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "value", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap(),
+    );
+    for values in [vec![None, Some(10), None, Some(11)], vec![None; 4]] {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            field("id", DataType::Int32, 1),
+            Field::new("value", DataType::Int32, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+        let path = temp
+            .path()
+            .join(format!("nulls-{}.parquet", values.iter().flatten().count()));
+        let batch = RecordBatch::try_new(Arc::clone(&arrow_schema), vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+            Arc::new(Int32Array::from(values.clone())),
+        ])
+        .unwrap();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), arrow_schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let metrics = crate::scan::FileScanTaskMetrics::new(
+            Some(4),
+            HashMap::from([(1, 4), (2, 4)]),
+            HashMap::from([
+                (1, 0),
+                (
+                    2,
+                    values.iter().filter(|value| value.is_none()).count() as u64,
+                ),
+            ]),
+            HashMap::new(),
+            std::iter::once((1, Datum::int(1)))
+                .chain(
+                    values
+                        .iter()
+                        .flatten()
+                        .min()
+                        .map(|&value| (2, Datum::int(value))),
+                )
+                .collect(),
+            std::iter::once((1, Datum::int(4)))
+                .chain(
+                    values
+                        .iter()
+                        .flatten()
+                        .max()
+                        .map(|&value| (2, Datum::int(value))),
+                )
+                .collect(),
+        );
+        let expected: Vec<_> = values
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| value.map(|_| index as i32 + 1))
+            .collect();
+        let negative = Reference::new("value").not_equal_to(Datum::int(0));
+        let predicates = [
+            negative.clone(),
+            Reference::new("value").is_not_in([Datum::int(0), Datum::int(1)]),
+            negative.or(Reference::new("id").less_than(Datum::int(0))),
+        ];
+        for predicate in predicates {
+            let task = scan_task(path.to_str().unwrap().to_string(), schema.clone(), None);
+            let static_task = scan_task(
+                path.to_str().unwrap().to_string(),
+                schema.clone(),
+                Some(predicate.clone().bind(schema.clone(), false).unwrap()),
+            );
+            let (static_batches, _) = execute(static_task, None).await;
+            assert_eq!(ids(&static_batches), expected, "static {predicate}");
+            for task in [task.clone(), with_file_metrics(task, metrics.clone())] {
+                let (batches, _) = execute(
+                    task,
+                    Some(Arc::new(FixedRuntimePredicate::new(predicate.clone()))),
+                )
+                .await;
+                assert_eq!(ids(&batches), expected, "runtime {predicate}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn runtime_predicate_float_comparisons_fail_open_before_statistics_pruning() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("float-semantics.parquet");
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        field("id", DataType::Int32, 1),
+        field("value", DataType::Float64, 2),
+    ]));
+    let values = vec![-0.0, 0.0, f64::NAN, -f64::NAN];
+    let batch = RecordBatch::try_new(Arc::clone(&arrow_schema), vec![
+        Arc::new(Int32Array::from(vec![0, 1, 2, 3])),
+        Arc::new(Float64Array::from(values)),
+    ])
+    .unwrap();
+    let mut writer =
+        ArrowWriter::try_new(File::create(&path).unwrap(), arrow_schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let schema = Arc::new(
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "value", Type::Primitive(PrimitiveType::Double)).into(),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let planned = Reference::new("id")
+        .greater_than(Datum::int(0))
+        .bind(schema.clone(), false)
+        .unwrap();
+    let task = scan_task(path.to_str().unwrap().to_string(), schema, Some(planned));
+    let metrics = crate::scan::FileScanTaskMetrics::new(
+        Some(4),
+        HashMap::from([(2, 4)]),
+        HashMap::from([(2, 0)]),
+        HashMap::from([(2, 2)]),
+        HashMap::from([(2, Datum::double(-0.0))]),
+        HashMap::from([(2, Datum::double(0.0))]),
+    );
+    for predicate in [
+        Reference::new("value").equal_to(Datum::double(0.0)),
+        Reference::new("value").not_equal_to(Datum::double(f64::NAN)),
+        Reference::new("value").greater_than(Datum::double(0.0)),
+        Reference::new("value").less_than(Datum::double(0.0)),
+        Reference::new("value").is_in([Datum::double(0.0), Datum::double(1.0)]),
+        Reference::new("value").is_not_in([Datum::double(0.0), Datum::double(1.0)]),
+    ] {
+        for task in [
+            task.clone(),
+            with_file_metrics(task.clone(), metrics.clone()),
+        ] {
+            let (batches, scan_metrics) = execute(
+                task,
+                Some(Arc::new(FixedRuntimePredicate::new(predicate.clone()))),
+            )
+            .await;
+            assert_eq!(ids(&batches), vec![1, 2, 3], "{predicate}");
+            assert_eq!(scan_metrics.runtime_predicate_tasks(), 0);
+        }
+    }
+    // Unary NaN predicates do not compare NaN payloads or signed zero and
+    // remain usable on floating-point columns.
+    let (batches, _) = execute(
+        task,
+        Some(Arc::new(FixedRuntimePredicate::new(
+            Reference::new("value").is_nan(),
+        ))),
+    )
+    .await;
+    assert_eq!(ids(&batches), vec![2, 3]);
 }
 
 /// Delegates to a fixed predicate and asks for the largest values first.
