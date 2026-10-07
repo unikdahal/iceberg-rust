@@ -24,7 +24,7 @@ use fnv::FnvHashSet;
 use futures::{StreamExt, TryStreamExt};
 use tokio::sync::oneshot::{Receiver, channel};
 
-use super::delete_filter::{DeleteFilter, PosDelLoadAction};
+use super::delete_filter::{DeleteFilter, EqDelLoadResult, PosDelLoadAction, PosDelLoadGuard};
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
 use crate::arrow::scan_metrics::ScanMetrics;
 use crate::arrow::{arrow_primitive_to_literal, arrow_schema_to_schema};
@@ -58,13 +58,14 @@ enum DeleteFileContext {
     ExistingEqDel,
     ExistingPosDel,
     PosDels {
-        file_path: String,
+        load_guard: PosDelLoadGuard,
         stream: ArrowRecordBatchStream,
     },
     FreshEqDel {
+        file_path: String,
         batch_stream: ArrowRecordBatchStream,
         equality_ids: HashSet<i32>,
-        sender: tokio::sync::oneshot::Sender<Predicate>,
+        sender: tokio::sync::oneshot::Sender<EqDelLoadResult>,
     },
     // A V3 deletion vector: the raw deletion-vector-v1 blob bytes, the data file whose rows it
     // deletes, and the manifest's expected cardinality. The blob is decoded and validated in the
@@ -81,7 +82,7 @@ enum DeleteFileContext {
 // results are fully merged into the DeleteFileManager's state
 enum ParsedDeleteFileContext {
     DelVecs {
-        file_path: String,
+        load_guard: PosDelLoadGuard,
         results: HashMap<String, DeleteVector>,
     },
     // A single deletion vector decoded from a Puffin blob, keyed by the data file it applies to.
@@ -230,12 +231,15 @@ impl CachingDeleteFileLoader {
 
                 while let Some(item) = results_stream.next().await {
                     match item? {
-                        ParsedDeleteFileContext::DelVecs { file_path, results } => {
+                        ParsedDeleteFileContext::DelVecs {
+                            load_guard,
+                            results,
+                        } => {
                             for (data_file_path, delete_vector) in results.into_iter() {
                                 del_filter.upsert_delete_vector(data_file_path, delete_vector);
                             }
                             // Mark the positional delete file as fully loaded so waiters can proceed
-                            del_filter.finish_pos_del_load(&file_path);
+                            load_guard.finish();
                         }
                         ParsedDeleteFileContext::DelVec {
                             data_file_path,
@@ -279,46 +283,70 @@ impl CachingDeleteFileLoader {
                         // We must wait here to ensure the data is ready before returning,
                         // otherwise ArrowReader might get an empty/partial result.
                         notified.await;
+                        del_filter.positional_delete_load_result(&task.file_path)?;
                         Ok(DeleteFileContext::ExistingPosDel)
                     }
-                    PosDelLoadAction::Load => Ok(DeleteFileContext::PosDels {
-                        file_path: task.file_path.clone(),
-                        stream: basic_delete_file_loader
+                    PosDelLoadAction::Failed(error) => Err(error),
+                    PosDelLoadAction::Load(load_guard) => {
+                        let stream = basic_delete_file_loader
+                            .parquet_to_batch_stream(
+                                &task.file_path,
+                                task.file_size_in_bytes,
+                                task.key_metadata.as_deref(),
+                            )
+                            .await;
+                        match stream {
+                            Ok(stream) => Ok(DeleteFileContext::PosDels { load_guard, stream }),
+                            Err(error) => Err(load_guard.fail(error)),
+                        }
+                    }
+                }
+            }
+
+            DataContentType::EqualityDeletes => {
+                let Some(sender) = del_filter.try_start_eq_del_load(&task.file_path) else {
+                    return Ok(DeleteFileContext::ExistingEqDel);
+                };
+
+                // Per the Iceberg spec, evolve schema for equality deletes but only for the
+                // equality_ids columns, not all table columns.
+                let evolved = async {
+                    let equality_ids_vec = task
+                        .equality_ids
+                        .clone()
+                        .filter(|ids| !ids.is_empty())
+                        .ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::DataInvalid,
+                                "Equality delete file is missing or has empty equality_ids",
+                            )
+                        })?;
+                    let evolved_stream = BasicDeleteFileLoader::evolve_schema(
+                        basic_delete_file_loader
                             .parquet_to_batch_stream(
                                 &task.file_path,
                                 task.file_size_in_bytes,
                                 task.key_metadata.as_deref(),
                             )
                             .await?,
-                    }),
+                        schema,
+                        &equality_ids_vec,
+                    )
+                    .await?;
+                    Ok::<_, Error>((equality_ids_vec, evolved_stream))
                 }
-            }
-
-            DataContentType::EqualityDeletes => {
-                let Some(notify) = del_filter.try_start_eq_del_load(&task.file_path) else {
-                    return Ok(DeleteFileContext::ExistingEqDel);
+                .await;
+                let (equality_ids_vec, evolved_stream) = match evolved {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let error = Arc::new(error);
+                        let returned = DeleteFilter::cached_load_error(&task.file_path, &error);
+                        let _ = sender.send(Err(error));
+                        return Err(returned);
+                    }
                 };
-
-                let (sender, receiver) = channel();
-                del_filter.insert_equality_delete(&task.file_path, receiver);
-
-                // Per the Iceberg spec, evolve schema for equality deletes but only for the
-                // equality_ids columns, not all table columns.
-                let equality_ids_vec = task.equality_ids.clone().unwrap();
-                let evolved_stream = BasicDeleteFileLoader::evolve_schema(
-                    basic_delete_file_loader
-                        .parquet_to_batch_stream(
-                            &task.file_path,
-                            task.file_size_in_bytes,
-                            task.key_metadata.as_deref(),
-                        )
-                        .await?,
-                    schema,
-                    &equality_ids_vec,
-                )
-                .await?;
-
                 Ok(DeleteFileContext::FreshEqDel {
+                    file_path: task.file_path.clone(),
                     batch_stream: evolved_stream,
                     sender,
                     equality_ids: HashSet::from_iter(equality_ids_vec),
@@ -448,10 +476,14 @@ impl CachingDeleteFileLoader {
         match ctx {
             DeleteFileContext::ExistingEqDel => Ok(ParsedDeleteFileContext::EqDel),
             DeleteFileContext::ExistingPosDel => Ok(ParsedDeleteFileContext::ExistingPosDel),
-            DeleteFileContext::PosDels { file_path, stream } => {
-                let del_vecs = Self::parse_positional_deletes_record_batch_stream(stream).await?;
+            DeleteFileContext::PosDels { load_guard, stream } => {
+                let del_vecs =
+                    match Self::parse_positional_deletes_record_batch_stream(stream).await {
+                        Ok(vectors) => vectors,
+                        Err(error) => return Err(load_guard.fail(error)),
+                    };
                 Ok(ParsedDeleteFileContext::DelVecs {
-                    file_path,
+                    load_guard,
                     results: del_vecs,
                 })
             }
@@ -470,16 +502,26 @@ impl CachingDeleteFileLoader {
                 })
             }
             DeleteFileContext::FreshEqDel {
+                file_path,
                 sender,
                 batch_stream,
                 equality_ids,
             } => {
-                let predicate =
+                let parsed =
                     Self::parse_equality_deletes_record_batch_stream(batch_stream, equality_ids)
-                        .await?;
+                        .await;
+                let predicate = match parsed {
+                    Ok(predicate) => predicate,
+                    Err(error) => {
+                        let error = Arc::new(error);
+                        let returned = DeleteFilter::cached_load_error(&file_path, &error);
+                        let _ = sender.send(Err(error));
+                        return Err(returned);
+                    }
+                };
 
                 sender
-                    .send(predicate)
+                    .send(Ok(predicate))
                     .map_err(|err| {
                         Error::new(
                             ErrorKind::Unexpected,
@@ -966,6 +1008,103 @@ mod tests {
     use crate::scan::FileScanTaskDeleteFile;
     use crate::spec::{DataContentType, DataFileBuilder, Literal, Schema, Struct};
     use crate::test_utils::encode_dv_blob;
+
+    #[tokio::test]
+    async fn test_positional_open_failure_does_not_leave_a_loading_cache_entry() {
+        let directory = TempDir::new().unwrap();
+        let tasks = setup(directory.path());
+        let task = &tasks[0];
+        let mut delete = task.deletes()[0].clone();
+        delete.file_path = format!("{}/missing-pos-delete.parquet", directory.path().display());
+        let loader = CachingDeleteFileLoader::new(FileIO::new_with_fs(), 2, Runtime::current());
+        let mut first = None;
+        for _ in 0..2 {
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                loader.load_deletes(std::slice::from_ref(&delete), task.schema_ref()),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+            if let Some((kind, retryable)) = first {
+                assert_eq!(error.kind(), kind);
+                assert_eq!(error.retryable(), retryable);
+            } else {
+                first = Some((error.kind(), error.retryable()));
+            }
+            assert!(error.to_string().contains("missing-pos-delete.parquet"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_positional_parse_failure_wakes_waiters_and_preserves_error() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let path = "parse-failed-pos.parquet";
+        let PosDelLoadAction::Load(load_guard) = filter.try_start_pos_del_load(path) else {
+            panic!("expected load ownership")
+        };
+        let PosDelLoadAction::WaitFor(waiter) = filter.try_start_pos_del_load(path) else {
+            panic!("expected waiter")
+        };
+        let stream = futures::stream::iter(vec![Err(Error::new(
+            ErrorKind::DataInvalid,
+            "injected positional parse failure",
+        )
+        .with_retryable(true))])
+        .boxed();
+        let result =
+            CachingDeleteFileLoader::parse_file_content_for_task(DeleteFileContext::PosDels {
+                load_guard,
+                stream,
+            })
+            .await;
+        assert!(result.is_err());
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .unwrap();
+        let error = filter.positional_delete_load_result(path).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(error.retryable());
+        assert!(
+            error
+                .to_string()
+                .contains("injected positional parse failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_equality_ids_publish_error_instead_of_panicking() {
+        let directory = TempDir::new().unwrap();
+        let tasks = setup(directory.path());
+        let task = &tasks[0];
+        for ids in [None, Some(Vec::new())] {
+            let mut delete = task.deletes()[0].clone();
+            delete.file_type = DataContentType::EqualityDeletes;
+            delete.equality_ids = ids;
+            let loader = CachingDeleteFileLoader::new(FileIO::new_with_fs(), 2, Runtime::current());
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                loader.load_deletes(std::slice::from_ref(&delete), task.schema_ref()),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::DataInvalid);
+            let cached = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                loader
+                    .delete_filter
+                    .get_equality_delete_predicate_for_delete_file_path(&delete.file_path),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(cached.kind(), ErrorKind::DataInvalid);
+            assert!(cached.to_string().contains("equality_ids"));
+        }
+    }
 
     #[tokio::test]
     async fn test_delete_file_loader_parse_equality_deletes() {
