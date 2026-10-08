@@ -160,6 +160,7 @@ struct PlannedPredicate {
     advisory: bool,
     /// False when whole-file statistics prove every row satisfies the predicate, so the
     /// row filter would only spend time confirming it. Row-group and page pruning still use it.
+    /// Also false for advisory predicates that prune no row groups or pages in the file.
     row_filter: bool,
 }
 
@@ -590,6 +591,15 @@ impl FileScanTaskReader {
                     &task,
                     use_position_fallback,
                 )
+            })
+            .and_then(|plan| {
+                // The row filter is built after row-group and page pruning, so reject
+                // predicates it cannot express now; their pruning must not apply either.
+                ArrowReader::get_arrow_predicate(
+                    &[(plan.predicate.as_ref(), &plan.field_ids, &plan.field_id_map)],
+                    record_batch_stream_builder.parquet_schema(),
+                )?;
+                Ok(plan)
             });
             match planned {
                 Ok(plan) => plans.push(plan),
@@ -599,53 +609,13 @@ impl FileScanTaskReader {
                 ),
             }
         }
-        // The planned and runtime predicates form one Arrow predicate, so
-        // columns they share are decoded once and neither runs on the other's
-        // survivors. Separate Arrow predicates decoded shared columns twice and
-        // measured up to 2.4x slower than planned-only when the runtime
-        // predicate removed few rows.
-        let arrow_predicate = {
-            // Scoped so the builder borrow does not live across later awaits.
-            let row_filter_predicate = |plans: &[PlannedPredicate]| {
-                let predicates: Vec<_> = plans
-                    .iter()
-                    .filter(|plan| plan.row_filter)
-                    .map(|plan| (plan.predicate.as_ref(), &plan.field_ids, &plan.field_id_map))
-                    .collect();
-                ArrowReader::get_arrow_predicate(
-                    &predicates,
-                    record_batch_stream_builder.parquet_schema(),
-                )
-            };
-            if !plans.iter().any(|plan| plan.row_filter) {
-                None
-            } else {
-                match row_filter_predicate(&plans) {
-                    Ok(arrow_predicate) => Some(arrow_predicate),
-                    Err(error) if plans.last().is_some_and(|plan| plan.advisory) => {
-                        tracing::debug!(
-                            "Skipping runtime predicate for {}: {error}",
-                            task.data_file_path()
-                        );
-                        plans.pop();
-                        if !plans.iter().any(|plan| plan.row_filter) {
-                            None
-                        } else {
-                            Some(row_filter_predicate(&plans)?)
-                        }
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-        };
         if plans.iter().any(|plan| plan.advisory) {
             self.scan_metrics.record_runtime_predicate_task();
         }
-        let row_filter =
-            arrow_predicate.map(|arrow_predicate| RowFilter::new(vec![arrow_predicate]));
 
         // Count the candidate groups the runtime predicate removed beyond the
         // task byte range and the planned and equality-delete predicates.
+        let mut runtime_row_groups_pruned = 0;
         if let Some(runtime_groups) = plans
             .iter()
             .find(|plan| plan.advisory)
@@ -660,9 +630,10 @@ impl FileScanTaskReader {
                 None => groups.len(),
             };
             let with_runtime = intersect_sorted(&without_runtime, runtime_groups);
-            self.scan_metrics.record_runtime_row_groups_pruned(
-                candidates(&without_runtime).saturating_sub(candidates(&with_runtime)),
-            );
+            runtime_row_groups_pruned =
+                candidates(&without_runtime).saturating_sub(candidates(&with_runtime));
+            self.scan_metrics
+                .record_runtime_row_groups_pruned(runtime_row_groups_pruned);
         }
 
         for plan in &plans {
@@ -703,6 +674,7 @@ impl FileScanTaskReader {
             }
         }
 
+        let mut runtime_pages_pruned = false;
         if self.row_selection_enabled {
             for plan in &plans {
                 let selection = ArrowReader::get_row_selection_for_filter_predicate(
@@ -712,6 +684,15 @@ impl FileScanTaskReader {
                     &plan.field_id_map,
                     task.schema(),
                 );
+                if plan.advisory
+                    && selection
+                        .as_ref()
+                        .ok()
+                        .and_then(|s| s.as_ref())
+                        .is_some_and(|s| s.skipped_row_count() > 0)
+                {
+                    runtime_pages_pruned = true;
+                }
                 row_selection = intersect_page_selection(
                     row_selection,
                     selection,
@@ -720,6 +701,68 @@ impl FileScanTaskReader {
                 )?;
             }
         }
+
+        // An advisory runtime predicate (from Comet dynamic filters: join/TopK/aggregate)
+        // is compiled into a Parquet RowFilter ONLY if it pruned >= 1 row group or >= 1 page
+        // in this file. When no pages or row groups are skipped, Parquet resolves RowSelection
+        // to Mask policy, which decodes every payload value anyway, so an in-reader row filter
+        // only adds predicate-column decode and selection overhead.
+        //
+        // Correctness argument: advisory predicates are never required for query correctness
+        // because downstream operators always re-verify surviving rows (e.g. Comet HashJoinExec
+        // checks join keys against the build table regardless of whether the reader filtered rows).
+        // Planned (static) predicates and equality/positional delete predicates are NEVER affected.
+        let advisory_pruned = runtime_row_groups_pruned > 0 || runtime_pages_pruned;
+        for plan in &mut plans {
+            if plan.advisory {
+                let file_always_matches = task
+                    .file_metrics()
+                    .is_some_and(|metrics| Self::file_always_matches(&plan.predicate, metrics));
+                plan.row_filter = !file_always_matches && advisory_pruned;
+            }
+        }
+
+        // The planned and runtime predicates form one Arrow predicate, so
+        // columns they share are decoded once and neither runs on the other's
+        // survivors. Separate Arrow predicates decoded shared columns twice and
+        // measured up to 2.4x slower than planned-only when the runtime
+        // predicate removed few rows.
+        let arrow_predicate = {
+            // Scoped so the builder borrow does not live across later awaits.
+            let row_filter_predicate = |plans: &[PlannedPredicate]| {
+                let predicates: Vec<_> = plans
+                    .iter()
+                    .filter(|plan| plan.row_filter)
+                    .map(|plan| (plan.predicate.as_ref(), &plan.field_ids, &plan.field_id_map))
+                    .collect();
+                ArrowReader::get_arrow_predicate(
+                    &predicates,
+                    record_batch_stream_builder.parquet_schema(),
+                )
+            };
+            if !plans.iter().any(|plan| plan.row_filter) {
+                None
+            } else {
+                match row_filter_predicate(&plans) {
+                    Ok(arrow_predicate) => Some(arrow_predicate),
+                    Err(error) if plans.last().is_some_and(|plan| plan.advisory) => {
+                        tracing::debug!(
+                            "Skipping runtime predicate for {}: {error}",
+                            task.data_file_path()
+                        );
+                        plans.pop();
+                        if !plans.iter().any(|plan| plan.row_filter) {
+                            None
+                        } else {
+                            Some(row_filter_predicate(&plans)?)
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        };
+        let row_filter =
+            arrow_predicate.map(|arrow_predicate| RowFilter::new(vec![arrow_predicate]));
 
         let positional_delete_indexes = delete_filter.get_delete_vector(&task);
 
@@ -1107,9 +1150,12 @@ impl FileScanTaskReader {
         // This proof applies equally to planned filters, equality-delete
         // predicates and advisory runtime bounds. Keep the group/page plan,
         // but avoid decoding predicate-only columns just to confirm every row.
-        let row_filter = !task
-            .file_metrics()
-            .is_some_and(|metrics| Self::file_always_matches(&predicate, metrics));
+        // Advisory predicates defer row_filter enablement until page- or group-pruning
+        // efficacy is established in `process()`.
+        let row_filter = !advisory
+            && !task
+                .file_metrics()
+                .is_some_and(|metrics| Self::file_always_matches(&predicate, metrics));
         Ok(PlannedPredicate {
             predicate,
             field_ids: iceberg_field_ids,

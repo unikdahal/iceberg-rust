@@ -1176,10 +1176,11 @@ async fn runtime_predicate_prunes_pages_within_a_row_group() {
         }
     };
     let expected: Vec<i32> = (2 * PAGE_ROWS..3 * PAGE_ROWS).collect();
-    // Without page selection the row filter decodes every page.
+    // Without page selection nothing is pruned, so the advisory predicate gets no
+    // row filter and every row passes through for downstream operators to re-check.
     let (unpruned_ids, unpruned) = read(false).await;
     let (pruned_ids, pruned) = read(true).await;
-    assert_eq!(unpruned_ids, expected);
+    assert_eq!(unpruned_ids, (0..4 * PAGE_ROWS).collect::<Vec<i32>>());
     assert_eq!(pruned_ids, expected);
     assert!(pruned < unpruned, "pruned={pruned} unpruned={unpruned}");
 }
@@ -2553,7 +2554,13 @@ async fn runtime_predicate_negative_predicates_preserve_null_filtering_with_file
                     Some(Arc::new(FixedRuntimePredicate::new(predicate.clone()))),
                 )
                 .await;
-                assert_eq!(ids(&batches), expected, "runtime {predicate}");
+                // An advisory predicate that prunes nothing gets no row filter, so
+                // it may return extra rows but must never drop a matching one.
+                let actual = ids(&batches);
+                assert!(
+                    expected.iter().all(|id| actual.contains(id)),
+                    "runtime {predicate}: expected {expected:?} within {actual:?}"
+                );
             }
         }
     }
@@ -2629,7 +2636,9 @@ async fn runtime_predicate_float_comparisons_fail_open_before_statistics_pruning
         ))),
     )
     .await;
-    assert_eq!(ids(&batches), vec![2, 3]);
+    // The predicate prunes no row group or page, so it gets no row filter and
+    // the planned `id > 0` rows pass through unfiltered.
+    assert_eq!(ids(&batches), vec![1, 2, 3]);
 }
 
 /// Delegates to a fixed predicate and asks for the largest values first.
@@ -2663,8 +2672,10 @@ async fn runtime_predicate_preferring_largest_values_reads_row_groups_by_descend
         )))),
     )
     .await;
+    // No row group is pruned, so the advisory predicate gets no row filter and
+    // row 0 is returned for downstream operators to drop.
     assert_eq!(ids(&batches), vec![
-        200, 201, 202, 203, 100, 101, 102, 103, 1, 2, 3
+        200, 201, 202, 203, 100, 101, 102, 103, 0, 1, 2, 3
     ]);
 
     // Without the preference the file order stays.
@@ -2675,7 +2686,7 @@ async fn runtime_predicate_preferring_largest_values_reads_row_groups_by_descend
     )
     .await;
     assert_eq!(ids(&batches), vec![
-        1, 2, 3, 100, 101, 102, 103, 200, 201, 202, 203
+        0, 1, 2, 3, 100, 101, 102, 103, 200, 201, 202, 203
     ]);
 }
 
@@ -2723,4 +2734,183 @@ async fn runtime_predicate_live_refresh_keeps_page_selections_with_largest_first
     );
     let rest: Vec<RecordBatch> = stream.try_collect().await.unwrap();
     assert_eq!(ids(&rest), vec![100, 101, 102, 103, 2, 3]);
+}
+
+#[tokio::test]
+async fn runtime_predicate_advisory_without_pruning_does_not_filter_rows() {
+    let temp = TempDir::new().unwrap();
+    // 1 row group with 4 rows (ids 0, 1, 2, 3), 1 page.
+    let path = write_row_group_file_with_page_size(
+        temp.path().to_str().unwrap(),
+        "no_prune.parquet",
+        &[0],
+        1024,
+    );
+    let task = scan_task(path, iceberg_schema(), None);
+    // Advisory predicate id == 2 does not prune the row group (min=0, max=3)
+    // or the single page (min=0, max=3). Because it pruned no row groups and no pages,
+    // it must not be compiled into a RowFilter; all rows pass through to downstream operators.
+    let provider = Arc::new(FixedRuntimePredicate::new(
+        Reference::new("id").equal_to(Datum::int(2)),
+    ));
+    let (batches, metrics) = execute(task, Some(provider)).await;
+    assert_eq!(ids(&batches), vec![0, 1, 2, 3]);
+    assert_eq!(metrics.runtime_row_groups_pruned(), 0);
+}
+
+#[tokio::test]
+async fn runtime_predicate_advisory_with_row_group_pruning_applies_row_filter() {
+    let temp = TempDir::new().unwrap();
+    // 2 row groups: [0, 1, 2, 3] and [100, 101, 102, 103].
+    let path = write_row_group_file_with_page_size(
+        temp.path().to_str().unwrap(),
+        "rg_prune.parquet",
+        &[0, 100],
+        1024,
+    );
+    let task = scan_task(path, iceberg_schema(), None);
+    // Advisory predicate id == 102 prunes row group 0. Because >= 1 row group was pruned,
+    // the advisory predicate is compiled into a RowFilter and applied to the surviving group.
+    let provider = Arc::new(FixedRuntimePredicate::new(
+        Reference::new("id").equal_to(Datum::int(102)),
+    ));
+    let (batches, metrics) = execute(task, Some(provider)).await;
+    assert_eq!(ids(&batches), vec![102]);
+    assert_eq!(metrics.runtime_row_groups_pruned(), 1);
+}
+
+#[tokio::test]
+async fn runtime_predicate_advisory_with_page_pruning_applies_row_filter() {
+    let temp = TempDir::new().unwrap();
+    // 1 row group with 2 pages: page 0 has [0, 1], page 1 has [2, 3].
+    let path = write_row_group_file_with_page_size(
+        temp.path().to_str().unwrap(),
+        "page_prune.parquet",
+        &[0],
+        2,
+    );
+    let task = scan_task(path, iceberg_schema(), None);
+    // Advisory predicate id == 3 does not prune the row group (min=0, max=3),
+    // but prunes page 0 (min=0, max=1). Because >= 1 page was pruned,
+    // the advisory predicate is compiled into a RowFilter and applied to page 1.
+    let provider = Arc::new(FixedRuntimePredicate::new(
+        Reference::new("id").equal_to(Datum::int(3)),
+    ));
+    let (batches, metrics) = execute(task, Some(provider)).await;
+    assert_eq!(ids(&batches), vec![3]);
+    assert_eq!(metrics.runtime_row_groups_pruned(), 0);
+}
+
+#[tokio::test]
+async fn planned_predicate_without_pruning_still_filters_rows() {
+    let temp = TempDir::new().unwrap();
+    // 1 row group with 4 rows (ids 0, 1, 2, 3), 1 page.
+    let path = write_row_group_file_with_page_size(
+        temp.path().to_str().unwrap(),
+        "planned_no_prune.parquet",
+        &[0],
+        1024,
+    );
+    let schema = iceberg_schema();
+    let planned = Reference::new("id")
+        .equal_to(Datum::int(2))
+        .bind(Arc::clone(&schema), false)
+        .unwrap();
+    let task = scan_task(path, schema, Some(planned));
+    // A planned (static) predicate must always apply row filtering regardless
+    // of whether row-group or page pruning occurred.
+    let (batches, _) = execute(task, None).await;
+    assert_eq!(ids(&batches), vec![2]);
+}
+
+#[tokio::test]
+async fn runtime_predicate_advisory_without_pruning_leaves_deletes_unaffected() {
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path().to_str().unwrap();
+    // 1 row group with 4 rows (ids 0, 1, 2, 3).
+    let data_path = write_row_group_file_with_page_size(dir, "delete_data.parquet", &[0], 1024);
+
+    let position_path = format!("{dir}/pos_del.parquet");
+    let equality_path = format!("{dir}/eq_del.parquet");
+
+    const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: i32 = 2_147_483_546;
+    const FIELD_ID_POSITIONAL_DELETE_POS: i32 = 2_147_483_545;
+
+    // Positional delete deletes position 0 (id 0).
+    write_delete(
+        &position_path,
+        vec![
+            field(
+                "file_path",
+                DataType::Utf8,
+                FIELD_ID_POSITIONAL_DELETE_FILE_PATH,
+            ),
+            field("pos", DataType::Int64, FIELD_ID_POSITIONAL_DELETE_POS),
+        ],
+        vec![
+            Arc::new(StringArray::from(vec![data_path.as_str()])),
+            Arc::new(Int64Array::from(vec![0])),
+        ],
+    );
+
+    // Equality delete deletes id 3.
+    write_delete(&equality_path, vec![field("id", DataType::Int32, 1)], vec![
+        Arc::new(Int32Array::from(vec![3])),
+    ]);
+
+    let delete = |path: String, file_type, equality_ids| {
+        FileScanTaskDeleteFile::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&path).unwrap().len())
+            .with_file_path(path)
+            .with_file_type(file_type)
+            .with_file_format(DataFileFormat::Parquet)
+            .with_partition_spec_id(0)
+            .with_equality_ids(equality_ids)
+            .build()
+    };
+    let pos_delete = delete(position_path, DataContentType::PositionDeletes, None);
+    let eq_delete = delete(
+        equality_path,
+        DataContentType::EqualityDeletes,
+        Some(vec![1]),
+    );
+
+    let task = scan_task_with_deletes(data_path, iceberg_schema(), None, vec![
+        pos_delete, eq_delete,
+    ]);
+
+    // Advisory predicate id == 2 prunes nothing (0 row groups, 0 pages).
+    // Advisory row filter is not applied (row 1 is not filtered out).
+    // Positional delete removes id 0, and equality delete removes id 3.
+    // Surviving rows: [1, 2].
+    let provider = Arc::new(FixedRuntimePredicate::new(
+        Reference::new("id").equal_to(Datum::int(2)),
+    ));
+    let (batches, _) = execute(task, Some(provider)).await;
+    assert_eq!(ids(&batches), vec![1, 2]);
+}
+
+#[tokio::test]
+async fn runtime_predicate_live_refresh_without_pruning_does_not_attach_row_filter() {
+    let temp = TempDir::new().unwrap();
+    // 2 row groups with 4 rows each: [0, 1, 2, 3] and [4, 5, 6, 7], 1 page per group.
+    let path = write_row_group_file_with_page_size(
+        temp.path().to_str().unwrap(),
+        "live_no_prune.parquet",
+        &[0, 4],
+        1024,
+    );
+    let task = scan_task(path, iceberg_schema(), None);
+    let changing = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let (mut stream, _) = start_runtime_scan(task, Some(changing.clone()), true, true, 4);
+    // Read first row group [0, 1, 2, 3].
+    let first = stream.try_next().await.unwrap().unwrap();
+    assert_eq!(ids(std::slice::from_ref(&first)), vec![0, 1, 2, 3]);
+
+    // Publish runtime predicate id == 6 at boundary.
+    // Row group 1 has min=4, max=7, so id == 6 does not prune row group 1 or its page.
+    // It must not attach a row filter; all rows of row group 1 pass through.
+    changing.publish(Some(Reference::new("id").equal_to(Datum::int(6))), 1);
+    let rest: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    assert_eq!(ids(&rest), vec![4, 5, 6, 7]);
 }
