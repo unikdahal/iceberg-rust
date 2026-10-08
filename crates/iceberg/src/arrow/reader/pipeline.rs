@@ -354,21 +354,6 @@ impl FileScanTaskReader {
             use_position_fallback, // Whether to use position-based (true) or field-ID-based (false) projection
         )?;
 
-        // A metadata-only projection leaves `project_field_ids_without_metadata` empty,
-        // which `get_arrow_projection_mask` maps to "read all columns" (so `COUNT(*)` still
-        // gets a row count). Downgrade that to "read no data columns": `install_row_number`
-        // put the RowNumber virtual column on every metadata-only projection as a row-count
-        // source independent of the data columns, so the count survives with zero data
-        // columns read. `COUNT(*)` (an empty projection) has no RowNumber and keeps reading
-        // all columns to preserve the row count.
-        //
-        // This runs BEFORE the union so any physical metadata leaf is added onto a `none`
-        // base, pruning the read to just that leaf (`union` with an `all` base stays `all`).
-        if project_field_ids_without_metadata.is_empty() && install_row_number {
-            projection_mask =
-                ProjectionMask::none(record_batch_stream_builder.parquet_schema().num_columns());
-        }
-
         // Union in the physical leaves of any metadata columns we will coalesce. Their
         // reserved field ids are not in the task schema, so they can't be requested through
         // `get_arrow_projection_mask` (which resolves ids against the task schema); add
@@ -4183,21 +4168,21 @@ mod tests {
     async fn test_empty_projection_preserves_row_count() {
         let tmp_dir = TempDir::new().unwrap();
         let dir = tmp_dir.path().to_str().unwrap();
-        let file_path = write_plain_parquet(dir, "empty_projection.parquet", vec![], vec![]);
-        let schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(1)
-                .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                ])
-                .build()
-                .unwrap(),
-        );
-        let task = metadata_projection_task(file_path, schema, vec![]);
-        let (batches, _) = scan_task(task).await;
+        let file_path =
+            write_parquet_with_wide_column(dir, "empty_projection.parquet", vec![], vec![]);
+        let schema = id_and_wide_schema();
+        let task = metadata_projection_task(file_path.clone(), schema.clone(), vec![]);
+        let (batches, count_bytes) = scan_task(task).await;
 
         // A bare COUNT(*)-style empty projection must still report the row count.
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3);
+        assert!(batches.iter().all(|batch| batch.num_columns() == 0));
+        let (_, projected_bytes) =
+            scan_task(metadata_projection_task(file_path, schema, vec![1, 2])).await;
+        assert!(
+            count_bytes < projected_bytes,
+            "empty projection must not decode data columns: count={count_bytes}, projected={projected_bytes}"
+        );
     }
 }

@@ -629,7 +629,7 @@ async fn runtime_predicate_preserves_position_and_equality_deletes() {
                 .greater_than_or_equal_to(Datum::int(100))
                 .and(Reference::new("id").less_than_or_equal_to(Datum::int(103))),
         ));
-        let (runtime, metrics) = execute(task, Some(provider)).await;
+        let (runtime, metrics) = execute(task.clone(), Some(provider.clone())).await;
         assert_eq!(ids(&runtime), expected);
         assert_eq!(
             ids(&baseline)
@@ -639,6 +639,36 @@ async fn runtime_predicate_preserves_position_and_equality_deletes() {
             expected
         );
         assert!(metrics.bytes_read() < baseline_metrics.bytes_read());
+
+        // COUNT(*) needs no output columns, but still applies both delete forms
+        // and the predicate before counting. Exercise both ordinary and live
+        // decoders with the same row groups and original row positions.
+        let mut count_task = serde_json::to_value(task).unwrap();
+        count_task["project_field_ids"] = serde_json::json!([]);
+        let count_task: FileScanTask = serde_json::from_value(count_task).unwrap();
+        let (baseline_count, _) = execute(count_task.clone(), None).await;
+        assert_eq!(
+            baseline_count
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            ids(&baseline).len()
+        );
+        let (runtime_count, count_metrics) = execute(count_task, Some(provider)).await;
+        assert_eq!(
+            runtime_count
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            expected.len()
+        );
+        assert!(
+            baseline_count
+                .iter()
+                .chain(&runtime_count)
+                .all(|batch| batch.num_columns() == 0)
+        );
+        assert!(count_metrics.bytes_read() < metrics.bytes_read());
     }
 }
 
@@ -1668,6 +1698,54 @@ fn with_file_metrics(
     let mut json = serde_json::to_value(task).unwrap();
     json["file_metrics"] = serde_json::to_value(metrics).unwrap();
     serde_json::from_value(json).unwrap()
+}
+
+#[tokio::test]
+async fn empty_projection_counts_filtered_rows_without_reading_payload() {
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "count_rows.parquet");
+    let schema = iceberg_schema();
+    for planned in [
+        None,
+        Some(Reference::new("id").greater_than_or_equal_to(Datum::int(100))),
+        Some(Reference::new("id").less_than(Datum::int(0))),
+    ] {
+        for live in [false, true] {
+            let predicate = planned
+                .clone()
+                .map(|predicate| predicate.bind(schema.clone(), false).unwrap());
+            let provider = live.then(|| {
+                Arc::new(FixedRuntimePredicate::new(
+                    Reference::new("id").less_than_or_equal_to(Datum::int(101)),
+                )) as Arc<dyn RuntimePredicateProvider>
+            });
+            let projected = scan_task_with_deletes_and_projection(
+                path.clone(),
+                schema.clone(),
+                predicate.clone(),
+                vec![],
+                vec![1, 2],
+            );
+            let empty = scan_task_with_deletes_and_projection(
+                path.clone(),
+                schema.clone(),
+                predicate,
+                vec![],
+                vec![],
+            );
+            let (reference, reference_metrics) = execute(projected, provider.clone()).await;
+            let (counted, count_metrics) = execute(empty, provider).await;
+            let expected = ids(&reference).len();
+            assert_eq!(
+                counted.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                expected
+            );
+            assert!(counted.iter().all(|batch| batch.num_columns() == 0));
+            if expected > 0 {
+                assert!(count_metrics.bytes_read() < reference_metrics.bytes_read());
+            }
+        }
+    }
 }
 
 #[tokio::test]

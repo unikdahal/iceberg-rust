@@ -121,7 +121,10 @@ impl ArrowReader {
         }
 
         if field_ids.is_empty() {
-            return Ok(ProjectionMask::all());
+            // A COUNT(*)-style scan has no output fields. Parquet still emits
+            // zero-column batches with the selected row count; predicates and
+            // equality deletes request their own columns through the row filter.
+            return Ok(ProjectionMask::none(parquet_schema.num_columns()));
         }
 
         // Reading variant columns is not supported yet (see #2188 follow-ups): reject any
