@@ -63,8 +63,6 @@ struct DeleteFileFilterState {
 pub(crate) struct DeleteFilter {
     state: Arc<RwLock<DeleteFileFilterState>>,
     runtime: Runtime,
-    #[cfg(test)]
-    load_waiters: Arc<tokio::sync::Semaphore>,
 }
 
 /// Action to take when trying to start loading a positional delete file
@@ -119,19 +117,7 @@ impl DeleteFilter {
         Self {
             state: Arc::new(RwLock::new(DeleteFileFilterState::default())),
             runtime,
-            #[cfg(test)]
-            load_waiters: Arc::new(tokio::sync::Semaphore::new(0)),
         }
-    }
-
-    /// Test barrier for loads that have entered the shared-cache waiting path.
-    #[cfg(test)]
-    pub(crate) async fn wait_for_load_waiters(&self, count: u32) {
-        self.load_waiters
-            .acquire_many(count)
-            .await
-            .unwrap()
-            .forget();
     }
 
     /// Retrieve a delete vector for the data file associated with a given file scan task
@@ -201,8 +187,6 @@ impl DeleteFilter {
             match state {
                 PosDelState::Loaded => return PosDelLoadAction::AlreadyLoaded,
                 PosDelState::Loading(notify) => {
-                    #[cfg(test)]
-                    self.load_waiters.add_permits(1);
                     return PosDelLoadAction::WaitFor(notify.clone().notified_owned());
                 }
                 PosDelState::Failed(error) => {
@@ -289,11 +273,7 @@ impl DeleteFilter {
             let notified = {
                 match self.state.read().unwrap().equality_deletes.get(file_path) {
                     None => return Ok(None),
-                    Some(EqDelState::Loading(notifier)) => {
-                        #[cfg(test)]
-                        self.load_waiters.add_permits(1);
-                        notifier.clone().notified_owned()
-                    }
+                    Some(EqDelState::Loading(notifier)) => notifier.clone().notified_owned(),
                     Some(EqDelState::Loaded(predicate)) => {
                         return Ok(Some(predicate.clone()));
                     }
@@ -392,6 +372,41 @@ pub(crate) mod tests {
     use crate::spec::{DataFileFormat, Datum, NestedField, PrimitiveType, Schema, Type};
 
     type ArrowSchemaRef = Arc<ArrowSchema>;
+
+    /// Number of `Notified` futures currently registered on in-flight loads.
+    ///
+    /// Each waiter holds an owned clone of the load's `Notify`, so the strong count above the
+    /// baseline holders (the state entry itself, plus the spawned completion task for equality
+    /// deletes) is the number of registered waiters.
+    fn registered_load_waiters(filter: &DeleteFilter) -> usize {
+        let state = filter.state.read().unwrap();
+        let positional = state
+            .positional_deletes
+            .values()
+            .filter_map(|s| match s {
+                PosDelState::Loading(notify) => Some(Arc::strong_count(notify) - 1),
+                _ => None,
+            })
+            .sum::<usize>();
+        let equality = state
+            .equality_deletes
+            .values()
+            .filter_map(|s| match s {
+                EqDelState::Loading(notify) => Some(Arc::strong_count(notify) - 2),
+                _ => None,
+            })
+            .sum::<usize>();
+        positional + equality
+    }
+
+    /// Yields until at least `count` waiters are registered on in-flight loads.
+    ///
+    /// Callers bound this with a timeout; there is no sleep.
+    pub(crate) async fn wait_for_load_waiters(filter: &DeleteFilter, count: usize) {
+        while registered_load_waiters(filter) < count {
+            tokio::task::yield_now().await;
+        }
+    }
 
     const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: u64 = 2147483546;
     const FIELD_ID_POSITIONAL_DELETE_POS: u64 = 2147483545;
