@@ -367,6 +367,85 @@ async fn runtime_predicate_is_anded_with_task_predicate() {
     assert_eq!(ids(&batches), vec![100, 101, 102, 103]);
 }
 
+/// Predicate columns on either side of an output column are fetched together.
+/// The bytes read over the gap must be reused by the output stage, rather than
+/// fetched a second time. Multiple groups also exercise buffer reclamation.
+#[tokio::test]
+async fn runtime_predicate_reuses_coalesced_output_ranges() {
+    let temp = TempDir::new().unwrap();
+    let schema = Arc::new(
+        Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "payload", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(3, "key", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let fields = [
+        (1, "id", DataType::Int32),
+        (2, "payload", DataType::Utf8),
+        (3, "key", DataType::Int32),
+    ]
+    .into_iter()
+    .map(|(id, name, ty)| {
+        Field::new(name, ty, false).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            id.to_string(),
+        )]))
+    })
+    .collect::<Vec<_>>();
+    let arrow_schema = Arc::new(ArrowSchema::new(fields));
+    let path = temp.path().join("coalesced.parquet");
+    let props = WriterProperties::builder()
+        .set_compression(Compression::UNCOMPRESSED)
+        .set_dictionary_enabled(false)
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(&path).unwrap(),
+        arrow_schema.clone(),
+        Some(props),
+    )
+    .unwrap();
+    for base in [0, 100, 200] {
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from_iter_values(base..base + 4)),
+            Arc::new(StringArray::from(vec!["x".repeat(65_536); 4])),
+            Arc::new(Int32Array::from_iter_values(base..base + 4)),
+        ])
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.flush().unwrap();
+    }
+    writer.close().unwrap();
+    let planned = Reference::new("id")
+        .greater_than_or_equal_to(Datum::int(0))
+        .bind(schema.clone(), false)
+        .unwrap();
+    let task = scan_task_with_deletes_and_projection(
+        path.to_str().unwrap().to_string(),
+        schema,
+        Some(planned),
+        vec![],
+        vec![1, 2, 3],
+    );
+    let (baseline, baseline_metrics) = execute(task.clone(), None).await;
+    let provider = Arc::new(FixedRuntimePredicate::new(
+        Reference::new("key").greater_than_or_equal_to(Datum::int(0)),
+    ));
+    let (runtime, runtime_metrics) = execute(task, Some(provider)).await;
+    assert_eq!(ids(&runtime), ids(&baseline));
+    assert_eq!(runtime_metrics.runtime_predicate_tasks(), 1);
+    assert!(
+        runtime_metrics.bytes_read() <= baseline_metrics.bytes_read(),
+        "runtime={} baseline={}",
+        runtime_metrics.bytes_read(),
+        baseline_metrics.bytes_read(),
+    );
+}
+
 #[tokio::test]
 async fn runtime_predicate_failures_keep_the_planned_filter() {
     let temp = TempDir::new().unwrap();

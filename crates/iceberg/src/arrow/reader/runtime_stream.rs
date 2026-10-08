@@ -34,7 +34,6 @@ use parquet::DecodeResult;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ParquetRecordBatchReader, RowFilter, RowSelection,
 };
-use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::push_decoder::{ParquetPushDecoder, RowGroupSelection};
 use parquet::file::metadata::ParquetMetaData;
 
@@ -99,6 +98,9 @@ pub(super) struct RuntimePrunedStream {
     /// in file order.
     selections: Vec<RowGroupSelection>,
     refresh: BoundaryRefresh,
+    /// The frontier count identifies the group owning any overfetched bytes.
+    /// It also changes when the decoder internally skips a fully filtered group.
+    buffered_frontier: Option<usize>,
 }
 
 impl RuntimePrunedStream {
@@ -116,6 +118,7 @@ impl RuntimePrunedStream {
             metadata,
             selections,
             refresh,
+            buffered_frontier: None,
         }
     }
 
@@ -340,10 +343,23 @@ impl RuntimePrunedStream {
                 .expect("decoder exists while streaming");
             match decoder.try_next_reader()? {
                 DecodeResult::NeedsData(ranges) => {
-                    let bytes = self.file_reader.get_byte_ranges(ranges.clone()).await?;
-                    decoder.push_ranges(ranges, bytes)?;
+                    let frontier = decoder.row_groups_remaining();
+                    if self.buffered_frontier != Some(frontier) {
+                        // No future group is prefetched. Release coalesced ranges
+                        // from an internally skipped group before fetching the next.
+                        decoder.clear_all_ranges();
+                        self.buffered_frontier = Some(frontier);
+                    }
+                    let (fetched_ranges, bytes) = self.file_reader.fetch_ranges(&ranges).await?;
+                    decoder.push_ranges(fetched_ranges, bytes)?;
                 }
-                DecodeResult::Data(reader) => self.active_reader = Some(reader),
+                DecodeResult::Data(reader) => {
+                    // The reader owns its column chunks now. Extra coalesced bytes
+                    // need not survive this group or accumulate across the file.
+                    decoder.clear_all_ranges();
+                    self.buffered_frontier = None;
+                    self.active_reader = Some(reader);
+                }
                 DecodeResult::Finished => return Ok(None),
             }
         }

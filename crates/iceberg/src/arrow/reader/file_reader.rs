@@ -66,6 +66,28 @@ impl ArrowFileReader {
         };
         (make(), make())
     }
+
+    /// Returns the ranges actually fetched, including coalesced gaps. The push
+    /// decoder can reuse those bytes between its predicate and output stages.
+    /// Its caller must release them when advancing to another row group.
+    pub(super) async fn fetch_ranges(
+        &self,
+        ranges: &[Range<u64>],
+    ) -> parquet::errors::Result<(Vec<Range<u64>>, Vec<Bytes>)> {
+        let fetch_ranges = merge_ranges(ranges, self.parquet_read_options.range_coalesce_bytes());
+        let concurrency = self.parquet_read_options.range_fetch_concurrency().max(1);
+        let fetched = futures::stream::iter(fetch_ranges.iter().cloned())
+            .map(|range| async move {
+                self.r
+                    .read(range)
+                    .await
+                    .map_err(|e| parquet::errors::ParquetError::External(Box::new(e)))
+            })
+            .buffered(concurrency)
+            .try_collect()
+            .await?;
+        Ok((fetch_ranges, fetched))
+    }
 }
 
 impl AsyncFileReader for ArrowFileReader {
@@ -85,24 +107,8 @@ impl AsyncFileReader for ArrowFileReader {
         &mut self,
         ranges: Vec<Range<u64>>,
     ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
-        let coalesce_bytes = self.parquet_read_options.range_coalesce_bytes();
-        let concurrency = self.parquet_read_options.range_fetch_concurrency().max(1);
-
         async move {
-            // Merge nearby ranges to reduce the number of object store requests.
-            let fetch_ranges = merge_ranges(&ranges, coalesce_bytes);
-            let r = &self.r;
-
-            // Fetch merged ranges concurrently.
-            let fetched: Vec<Bytes> = futures::stream::iter(fetch_ranges.iter().cloned())
-                .map(|range| async move {
-                    r.read(range)
-                        .await
-                        .map_err(|e| parquet::errors::ParquetError::External(Box::new(e)))
-                })
-                .buffered(concurrency)
-                .try_collect()
-                .await?;
+            let (fetch_ranges, fetched) = self.fetch_ranges(&ranges).await?;
 
             // Slice the fetched data back into the originally requested ranges.
             Ok(ranges
@@ -254,6 +260,24 @@ mod tests {
         async fn read(&self, range: Range<u64>) -> crate::Result<bytes::Bytes> {
             Ok(self.data.slice(range.start as usize..range.end as usize))
         }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_ranges_preserves_coalesced_gaps() {
+        let mock = MockFileRead::new(2048);
+        let expected = mock.data.slice(0..300);
+        let reader = ArrowFileReader::new(FileMetadata { size: 2048 }, Box::new(mock))
+            .with_parquet_read_options(
+                ParquetReadOptions::builder()
+                    .with_range_coalesce_bytes(100)
+                    .build(),
+            );
+        let (ranges, buffers) = reader.fetch_ranges(&[200..300, 0..100]).await.unwrap();
+        assert_eq!(ranges, vec![0..300]);
+        assert_eq!(buffers, vec![expected]);
+        let (ranges, buffers) = reader.fetch_ranges(&[]).await.unwrap();
+        assert!(ranges.is_empty());
+        assert!(buffers.is_empty());
     }
 
     #[tokio::test]
