@@ -43,7 +43,7 @@ use crate::arrow::ScanMetrics;
 use crate::expr::BoundPredicate;
 use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
 use crate::scan::{ArrowRecordBatchStream, FileScanTask};
-use crate::{Error, Result};
+use crate::{Error, ErrorKind, Result};
 
 /// Splits a selection over the concatenated rows of `row_groups` (ascending)
 /// into one selection per row group. `None` selects every row.
@@ -103,6 +103,15 @@ pub(super) struct RuntimePrunedStream {
     buffered_frontier: Option<usize>,
 }
 
+/// The decoder is only absent while it is being rebuilt, so a missing decoder means the
+/// stream was polled again after a failed rebuild.
+fn missing_decoder() -> Error {
+    Error::new(
+        ErrorKind::Unexpected,
+        "Runtime-pruned stream has no parquet decoder; it was polled after a failed rebuild",
+    )
+}
+
 impl RuntimePrunedStream {
     pub(super) fn new(
         decoder: ParquetPushDecoder,
@@ -123,10 +132,7 @@ impl RuntimePrunedStream {
     }
 
     fn refresh_at_boundary(&mut self) -> Result<()> {
-        let decoder = self
-            .decoder
-            .as_ref()
-            .expect("decoder exists while streaming");
+        let decoder = self.decoder.as_ref().ok_or_else(missing_decoder)?;
         if !decoder.is_at_row_group_boundary() || decoder.row_groups_remaining() == 0 {
             return Ok(());
         }
@@ -327,7 +333,7 @@ impl RuntimePrunedStream {
             .selections
             .first()
             .is_none_or(|selection| selection.row_group_index() != next);
-        let decoder = self.decoder.take().expect("decoder exists while streaming");
+        let decoder = self.decoder.take().ok_or_else(missing_decoder)?;
         let mut decoder = decoder
             .into_builder()?
             .with_row_group_selections(self.selections.clone())
@@ -350,10 +356,7 @@ impl RuntimePrunedStream {
                 self.active_reader = None;
             }
             self.refresh_at_boundary()?;
-            let decoder = self
-                .decoder
-                .as_mut()
-                .expect("decoder exists while streaming");
+            let decoder = self.decoder.as_mut().ok_or_else(missing_decoder)?;
             match decoder.try_next_reader()? {
                 DecodeResult::NeedsData(ranges) => {
                     let frontier = decoder.row_groups_remaining();
