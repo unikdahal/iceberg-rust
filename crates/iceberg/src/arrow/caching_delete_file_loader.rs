@@ -69,15 +69,17 @@ impl Future for DeleteLoad {
     type Output = Result<DeleteFilter>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.get_mut().receiver).poll(cx).map(|result| {
-            result.unwrap_or_else(|error| {
-                Err(Error::new(
-                    ErrorKind::Unexpected,
-                    "Delete loading stopped before completing",
-                )
-                .with_source(error))
+        Pin::new(&mut self.get_mut().receiver)
+            .poll(cx)
+            .map(|result| {
+                result.unwrap_or_else(|error| {
+                    Err(Error::new(
+                        ErrorKind::Unexpected,
+                        "Delete loading stopped before completing",
+                    )
+                    .with_source(error))
+                })
             })
-        })
     }
 }
 
@@ -1133,11 +1135,9 @@ mod tests {
         let expected = Reference::new("y")
             .is_null()
             .or(Reference::new("y").not_equal_to(Datum::long(1)))
-            .or(
-                Reference::new("z")
-                    .is_null()
-                    .or(Reference::new("z").not_equal_to(Datum::long(100))),
-            )
+            .or(Reference::new("z")
+                .is_null()
+                .or(Reference::new("z").not_equal_to(Datum::long(100))))
             .and(
                 Reference::new("y")
                     .is_null()
@@ -1198,10 +1198,9 @@ mod tests {
         .unwrap()
         .unwrap();
         let vector = filter.get_delete_vector(task).unwrap();
-        assert_eq!(
-            vector.lock().unwrap().iter().collect::<Vec<_>>(),
-            vec![0, 1, 3, 5, 6, 8, 1022, 1023]
-        );
+        assert_eq!(vector.lock().unwrap().iter().collect::<Vec<_>>(), vec![
+            0, 1, 3, 5, 6, 8, 1022, 1023
+        ]);
     }
 
     #[tokio::test]
@@ -1276,6 +1275,13 @@ mod tests {
             .unwrap()
             .forget();
         let waiter = loader.load_deletes(&deletes, schema);
+        // Both of B's files must be waiting on A before A is cancelled.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            loader.delete_filter.wait_for_load_waiters(2),
+        )
+        .await
+        .unwrap();
         drop(owner);
         gate.release.close();
         let filter = tokio::time::timeout(Duration::from_secs(5), waiter)
@@ -1283,10 +1289,9 @@ mod tests {
             .unwrap()
             .unwrap();
         let vector = filter.get_delete_vector(task).unwrap();
-        assert_eq!(
-            vector.lock().unwrap().iter().collect::<Vec<_>>(),
-            vec![0, 1, 3, 5, 6, 8, 1022, 1023]
-        );
+        assert_eq!(vector.lock().unwrap().iter().collect::<Vec<_>>(), vec![
+            0, 1, 3, 5, 6, 8, 1022, 1023
+        ]);
         assert_equality_delete_contents(&filter, &equality_delete.file_path).await;
     }
 
@@ -2788,10 +2793,7 @@ mod tests {
         );
 
         let loader = CachingDeleteFileLoader::new(file_io, 10, Runtime::current());
-        let err = loader
-            .load_deletes(&[dv], schema)
-            .await
-            .unwrap_err();
+        let err = loader.load_deletes(&[dv], schema).await.unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert!(err.message().contains("expected 2 from record_count"));

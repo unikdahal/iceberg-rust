@@ -63,6 +63,8 @@ struct DeleteFileFilterState {
 pub(crate) struct DeleteFilter {
     state: Arc<RwLock<DeleteFileFilterState>>,
     runtime: Runtime,
+    #[cfg(test)]
+    load_waiters: Arc<tokio::sync::Semaphore>,
 }
 
 /// Action to take when trying to start loading a positional delete file
@@ -117,7 +119,19 @@ impl DeleteFilter {
         Self {
             state: Arc::new(RwLock::new(DeleteFileFilterState::default())),
             runtime,
+            #[cfg(test)]
+            load_waiters: Arc::new(tokio::sync::Semaphore::new(0)),
         }
+    }
+
+    /// Test barrier for loads that have entered the shared-cache waiting path.
+    #[cfg(test)]
+    pub(crate) async fn wait_for_load_waiters(&self, count: u32) {
+        self.load_waiters
+            .acquire_many(count)
+            .await
+            .unwrap()
+            .forget();
     }
 
     /// Retrieve a delete vector for the data file associated with a given file scan task
@@ -187,6 +201,8 @@ impl DeleteFilter {
             match state {
                 PosDelState::Loaded => return PosDelLoadAction::AlreadyLoaded,
                 PosDelState::Loading(notify) => {
+                    #[cfg(test)]
+                    self.load_waiters.add_permits(1);
                     return PosDelLoadAction::WaitFor(notify.clone().notified_owned());
                 }
                 PosDelState::Failed(error) => {
@@ -273,7 +289,11 @@ impl DeleteFilter {
             let notified = {
                 match self.state.read().unwrap().equality_deletes.get(file_path) {
                     None => return Ok(None),
-                    Some(EqDelState::Loading(notifier)) => notifier.clone().notified_owned(),
+                    Some(EqDelState::Loading(notifier)) => {
+                        #[cfg(test)]
+                        self.load_waiters.add_permits(1);
+                        notifier.clone().notified_owned()
+                    }
                     Some(EqDelState::Loaded(predicate)) => {
                         return Ok(Some(predicate.clone()));
                     }
@@ -433,7 +453,11 @@ pub(crate) mod tests {
         .unwrap()
         .unwrap();
         assert!(predicate.is_none());
-        assert!(filter.try_start_eq_del_load("cancelled-eq.parquet").is_some());
+        assert!(
+            filter
+                .try_start_eq_del_load("cancelled-eq.parquet")
+                .is_some()
+        );
     }
 
     #[tokio::test]
