@@ -68,7 +68,7 @@ use crate::metadata_columns::{
     RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, RESERVED_FIELD_ID_SPEC_ID, is_metadata_field,
 };
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskMetrics, FileScanTaskStream};
-use crate::spec::{Datum, PartitionSpec, Struct};
+use crate::spec::{Datum, PartitionSpec, PrimitiveLiteral, Struct};
 use crate::{Error, ErrorKind};
 
 impl ArrowReader {
@@ -961,12 +961,59 @@ impl FileScanTaskReader {
         )
     }
 
+    /// Checks whether floating-point comparisons for Binary and Set predicates
+    /// can safely skip Arrow row filtering when strict metrics prove all rows match.
+    ///
+    /// Iceberg float ordering (NaN highest, -0.0 == +0.0) differs from Arrow kernels
+    /// (IEEE total order: -0.0 < +0.0, NaN == NaN). The shortcut is safe only when:
+    /// - `nan_value_counts` is present and == 0 (guaranteeing no NaNs exist in the file);
+    /// - No predicate literal is NaN (any payload or sign);
+    /// - No predicate literal is ±0.0, AND lower and upper bounds are both present and the
+    ///   interval excludes 0.0 (lower > 0 or upper < 0), so signed-zero ordering cannot matter.
+    fn float_predicate_semantics_match<'a>(
+        field_id: i32,
+        literals: impl Iterator<Item = &'a Datum>,
+        metrics: &FileScanTaskMetrics,
+    ) -> bool {
+        if metrics.nan_value_counts().get(&field_id) != Some(&0) {
+            return false;
+        }
+
+        for literal in literals {
+            if literal.is_nan() {
+                return false;
+            }
+            match literal.literal() {
+                PrimitiveLiteral::Float(val) if val.0 == 0.0_f32 => return false,
+                PrimitiveLiteral::Double(val) if val.0 == 0.0_f64 => return false,
+                _ => {}
+            }
+        }
+
+        let (Some(lower), Some(upper)) = (
+            metrics.lower_bounds().get(&field_id),
+            metrics.upper_bounds().get(&field_id),
+        ) else {
+            return false;
+        };
+
+        match (lower.literal(), upper.literal()) {
+            (PrimitiveLiteral::Float(lower_val), PrimitiveLiteral::Float(upper_val)) => {
+                lower_val.0 > 0.0_f32 || upper_val.0 < 0.0_f32
+            }
+            (PrimitiveLiteral::Double(lower_val), PrimitiveLiteral::Double(upper_val)) => {
+                lower_val.0 > 0.0_f64 || upper_val.0 < 0.0_f64
+            }
+            _ => false,
+        }
+    }
+
     /// Whether whole-file statistics prove that every row of the file satisfies `predicate`,
     /// so its row filter would only confirm it. Statistics whose type does not match the task
     /// schema, and evaluation errors, answer no, which only costs the row filter.
-    /// Floating-point binary and set predicates keep their row filters: the strict evaluator
-    /// uses Iceberg float ordering (NaN highest, -0.0 == +0.0), while Arrow's row kernels use
-    /// IEEE total order.
+    /// Floating-point binary and set predicates keep their row filters unless provably safe:
+    /// the strict evaluator uses Iceberg float ordering (NaN highest, -0.0 == +0.0), while Arrow's
+    /// row kernels use IEEE total order.
     fn file_always_matches(predicate: &BoundPredicate, metrics: &FileScanTaskMetrics) -> bool {
         let bounds_match_schema = Self::file_bounds_match_predicate(predicate, metrics);
         // Iceberg's strict evaluator treats null as matching negative equality
@@ -983,29 +1030,43 @@ impl FileScanTaskReader {
                     .iter()
                     .all(|input| row_filter_semantics_match(input, metrics)),
                 BoundPredicate::Not(_) => false,
-                BoundPredicate::Binary(expression)
-                    if expression.term().field().field_type.is_floating_type() =>
-                {
-                    false
+                BoundPredicate::Binary(expression) => {
+                    if expression.term().field().field_type.is_floating_type()
+                        && !FileScanTaskReader::float_predicate_semantics_match(
+                            expression.term().field().id,
+                            std::iter::once(expression.literal()),
+                            metrics,
+                        )
+                    {
+                        return false;
+                    }
+                    if expression.op() == PredicateOperator::NotEq {
+                        metrics
+                            .null_value_counts()
+                            .get(&expression.term().field().id)
+                            == Some(&0)
+                    } else {
+                        true
+                    }
                 }
-                BoundPredicate::Set(expression)
-                    if expression.term().field().field_type.is_floating_type() =>
-                {
-                    false
-                }
-                BoundPredicate::Binary(expression)
-                    if expression.op() == PredicateOperator::NotEq =>
-                {
-                    metrics
-                        .null_value_counts()
-                        .get(&expression.term().field().id)
-                        == Some(&0)
-                }
-                BoundPredicate::Set(expression) if expression.op() == PredicateOperator::NotIn => {
-                    metrics
-                        .null_value_counts()
-                        .get(&expression.term().field().id)
-                        == Some(&0)
+                BoundPredicate::Set(expression) => {
+                    if expression.term().field().field_type.is_floating_type()
+                        && !FileScanTaskReader::float_predicate_semantics_match(
+                            expression.term().field().id,
+                            expression.literals().iter(),
+                            metrics,
+                        )
+                    {
+                        return false;
+                    }
+                    if expression.op() == PredicateOperator::NotIn {
+                        metrics
+                            .null_value_counts()
+                            .get(&expression.term().field().id)
+                            == Some(&0)
+                    } else {
+                        true
+                    }
                 }
                 _ => true,
             }
@@ -1359,6 +1420,209 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn file_always_matches_allows_safe_floating_point_comparisons() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "key", Type::Primitive(PrimitiveType::Float)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        // Safe baseline: no NaNs, no nulls, positive bounds [2.0, 5.0], predicate > 1.0.
+        let safe_metrics = FileScanTaskMetrics::new(
+            Some(2),
+            HashMap::from([(1, 2)]),
+            HashMap::from([(1, 0)]),
+            HashMap::from([(1, 0)]),
+            HashMap::from([(1, Datum::float(2.0_f32))]),
+            HashMap::from([(1, Datum::float(5.0_f32))]),
+        );
+        let safe_predicate = Reference::new("key")
+            .greater_than(Datum::float(1.0_f32))
+            .bind(schema.clone(), false)
+            .unwrap();
+        assert!(
+            super::StrictMetricsEvaluator::eval_metrics(&safe_predicate, (&safe_metrics).into(),)
+                .unwrap()
+        );
+        assert!(super::FileScanTaskReader::file_always_matches(
+            &safe_predicate,
+            &safe_metrics,
+        ));
+
+        // Unsafe variation: nan_count > 0.
+        let nan_metrics = FileScanTaskMetrics::new(
+            Some(2),
+            HashMap::from([(1, 2)]),
+            HashMap::from([(1, 0)]),
+            HashMap::from([(1, 1)]),
+            HashMap::from([(1, Datum::float(2.0_f32))]),
+            HashMap::from([(1, Datum::float(5.0_f32))]),
+        );
+        assert!(!super::FileScanTaskReader::file_always_matches(
+            &safe_predicate,
+            &nan_metrics,
+        ));
+
+        // Unsafe variation: nan_count missing.
+        let missing_nan_metrics = FileScanTaskMetrics::new(
+            Some(2),
+            HashMap::from([(1, 2)]),
+            HashMap::from([(1, 0)]),
+            HashMap::new(),
+            HashMap::from([(1, Datum::float(2.0_f32))]),
+            HashMap::from([(1, Datum::float(5.0_f32))]),
+        );
+        assert!(!super::FileScanTaskReader::file_always_matches(
+            &safe_predicate,
+            &missing_nan_metrics,
+        ));
+
+        // Unsafe variation: NaN literal.
+        let nan_pred = Reference::new("key")
+            .greater_than(Datum::float(f32::NAN))
+            .bind(schema.clone(), false)
+            .unwrap();
+        assert!(!super::FileScanTaskReader::file_always_matches(
+            &nan_pred,
+            &safe_metrics,
+        ));
+
+        // Unsafe variation: ±0 literal.
+        for zero_literal in [0.0_f32, -0.0_f32] {
+            let zero_pred = Reference::new("key")
+                .greater_than(Datum::float(zero_literal))
+                .bind(schema.clone(), false)
+                .unwrap();
+            assert!(!super::FileScanTaskReader::file_always_matches(
+                &zero_pred,
+                &safe_metrics,
+            ));
+        }
+
+        // Unsafe variation: bounds straddling 0.
+        let straddling_metrics = FileScanTaskMetrics::new(
+            Some(2),
+            HashMap::from([(1, 2)]),
+            HashMap::from([(1, 0)]),
+            HashMap::from([(1, 0)]),
+            HashMap::from([(1, Datum::float(-1.0_f32))]),
+            HashMap::from([(1, Datum::float(5.0_f32))]),
+        );
+        let straddling_pred = Reference::new("key")
+            .not_equal_to(Datum::float(10.0_f32))
+            .bind(schema.clone(), false)
+            .unwrap();
+        assert!(
+            super::StrictMetricsEvaluator::eval_metrics(
+                &straddling_pred,
+                (&straddling_metrics).into(),
+            )
+            .unwrap()
+        );
+        assert!(!super::FileScanTaskReader::file_always_matches(
+            &straddling_pred,
+            &straddling_metrics,
+        ));
+
+        // Unsafe variation: bounds missing.
+        let missing_bounds_metrics = FileScanTaskMetrics::new(
+            Some(2),
+            HashMap::from([(1, 2)]),
+            HashMap::from([(1, 0)]),
+            HashMap::from([(1, 0)]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        assert!(!super::FileScanTaskReader::file_always_matches(
+            &safe_predicate,
+            &missing_bounds_metrics,
+        ));
+
+        // Unsafe variation: NotEq with nulls.
+        let null_metrics = FileScanTaskMetrics::new(
+            Some(2),
+            HashMap::from([(1, 2)]),
+            HashMap::from([(1, 1)]),
+            HashMap::from([(1, 0)]),
+            HashMap::from([(1, Datum::float(2.0_f32))]),
+            HashMap::from([(1, Datum::float(5.0_f32))]),
+        );
+        let not_eq_pred = Reference::new("key")
+            .not_equal_to(Datum::float(1.0_f32))
+            .bind(schema.clone(), false)
+            .unwrap();
+        assert!(
+            super::StrictMetricsEvaluator::eval_metrics(&not_eq_pred, (&null_metrics).into(),)
+                .unwrap()
+        );
+        assert!(!super::FileScanTaskReader::file_always_matches(
+            &not_eq_pred,
+            &null_metrics,
+        ));
+        assert!(super::FileScanTaskReader::file_always_matches(
+            &not_eq_pred,
+            &safe_metrics,
+        ));
+
+        // Safe Set predicate: IS IN [2.0, 3.0] where bounds are [2.0, 2.0].
+        let single_val_metrics = FileScanTaskMetrics::new(
+            Some(2),
+            HashMap::from([(1, 2)]),
+            HashMap::from([(1, 0)]),
+            HashMap::from([(1, 0)]),
+            HashMap::from([(1, Datum::float(2.0_f32))]),
+            HashMap::from([(1, Datum::float(2.0_f32))]),
+        );
+        let in_pred = Reference::new("key")
+            .is_in([Datum::float(2.0_f32), Datum::float(3.0_f32)])
+            .bind(schema.clone(), false)
+            .unwrap();
+        assert!(super::FileScanTaskReader::file_always_matches(
+            &in_pred,
+            &single_val_metrics,
+        ));
+
+        // Unsafe Set predicate with 0.0 literal.
+        let in_zero_pred = Reference::new("key")
+            .is_in([Datum::float(0.0_f32), Datum::float(2.0_f32)])
+            .bind(schema.clone(), false)
+            .unwrap();
+        assert!(!super::FileScanTaskReader::file_always_matches(
+            &in_zero_pred,
+            &single_val_metrics,
+        ));
+
+        // Double precision safe case: bounds [2.0, 5.0], predicate > 1.0.
+        let double_schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "key", Type::Primitive(PrimitiveType::Double)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let double_metrics = FileScanTaskMetrics::new(
+            Some(2),
+            HashMap::from([(1, 2)]),
+            HashMap::from([(1, 0)]),
+            HashMap::from([(1, 0)]),
+            HashMap::from([(1, Datum::double(2.0_f64))]),
+            HashMap::from([(1, Datum::double(5.0_f64))]),
+        );
+        let double_pred = Reference::new("key")
+            .greater_than(Datum::double(1.0_f64))
+            .bind(double_schema, false)
+            .unwrap();
+        assert!(super::FileScanTaskReader::file_always_matches(
+            &double_pred,
+            &double_metrics,
+        ));
     }
 
     #[test]
