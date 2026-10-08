@@ -607,12 +607,7 @@ impl FileScanTaskReader {
                 )
             });
             match planned {
-                Ok(mut plan) => {
-                    plan.row_filter = !task
-                        .file_metrics()
-                        .is_some_and(|metrics| Self::file_always_matches(&plan.predicate, metrics));
-                    plans.push(plan)
-                }
+                Ok(plan) => plans.push(plan),
                 Err(error) => tracing::debug!(
                     "Skipping runtime predicate for {}: {error}",
                     task.data_file_path()
@@ -817,7 +812,10 @@ impl FileScanTaskReader {
                         .clone()
                         .expect("provider configured for live-capable task"),
                     seen_generation: observed_generation.unwrap_or_default(),
-                    planned: plans.iter().find(|plan| !plan.advisory).map(resolve),
+                    planned: plans
+                        .iter()
+                        .find(|plan| !plan.advisory && plan.row_filter)
+                        .map(resolve),
                     runtime: plans.iter().find(|plan| plan.advisory).map(resolve),
                     row_selection_enabled: self.row_selection_enabled,
                     task,
@@ -1044,13 +1042,19 @@ impl FileScanTaskReader {
         if self.bloom_filter_enabled {
             collect_bloom_filter_field_ids(&predicate)?;
         }
+        // This proof applies equally to planned filters, equality-delete
+        // predicates and advisory runtime bounds. Keep the group/page plan,
+        // but avoid decoding predicate-only columns just to confirm every row.
+        let row_filter = !task
+            .file_metrics()
+            .is_some_and(|metrics| Self::file_always_matches(&predicate, metrics));
         Ok(PlannedPredicate {
             predicate,
             field_ids: iceberg_field_ids,
             field_id_map,
             row_groups,
             advisory,
-            row_filter: true,
+            row_filter,
         })
     }
 

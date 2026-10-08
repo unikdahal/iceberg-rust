@@ -1671,6 +1671,36 @@ fn with_file_metrics(
 }
 
 #[tokio::test]
+async fn planned_all_match_filter_does_not_decode_predicate_only_column() {
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "planned_all.parquet");
+    let schema = iceberg_schema();
+    let predicate = Reference::new("id")
+        .greater_than_or_equal_to(Datum::int(0))
+        .bind(schema.clone(), false)
+        .unwrap();
+    let task =
+        scan_task_with_deletes_and_projection(path, schema, Some(predicate), vec![], vec![2]);
+    let metrics = crate::scan::FileScanTaskMetrics::new(
+        Some(12),
+        HashMap::from([(1, 12)]),
+        HashMap::from([(1, 0)]),
+        HashMap::new(),
+        HashMap::from([(1, Datum::int(0))]),
+        HashMap::from([(1, Datum::int(203))]),
+    );
+    let (unproven, unproven_metrics) = execute(task.clone(), None).await;
+    let (proven, proven_metrics) = execute(with_file_metrics(task, metrics), None).await;
+    assert_eq!(proven, unproven);
+    assert!(
+        proven_metrics.bytes_read() < unproven_metrics.bytes_read(),
+        "proven={} unproven={}",
+        proven_metrics.bytes_read(),
+        unproven_metrics.bytes_read(),
+    );
+}
+
+#[tokio::test]
 async fn runtime_predicate_file_rejection_precedes_data_and_delete_io() {
     for delete_type in [
         None,
@@ -2278,6 +2308,17 @@ async fn runtime_predicate_file_statistics_that_prove_every_row_do_not_change_re
     // With and without a null count, which is required to skip the filter.
     for nulls in [Some(0), Some(1), None] {
         for (predicate, expected) in &predicates {
+            let planned = predicate.clone().bind(iceberg_schema(), false).unwrap();
+            let static_task = with_file_metrics(
+                scan_task(path.clone(), iceberg_schema(), Some(planned)),
+                metrics(nulls),
+            );
+            let (batches, _) = execute(static_task, None).await;
+            assert_eq!(
+                &ids(&batches),
+                expected,
+                "planned {predicate} with nulls {nulls:?}"
+            );
             let task = with_file_metrics(
                 scan_task(path.clone(), iceberg_schema(), None),
                 metrics(nulls),
@@ -2369,8 +2410,13 @@ async fn runtime_predicate_negative_predicates_preserve_null_filtering_with_file
                 schema.clone(),
                 Some(predicate.clone().bind(schema.clone(), false).unwrap()),
             );
-            let (static_batches, _) = execute(static_task, None).await;
-            assert_eq!(ids(&static_batches), expected, "static {predicate}");
+            for static_task in [
+                static_task.clone(),
+                with_file_metrics(static_task, metrics.clone()),
+            ] {
+                let (static_batches, _) = execute(static_task, None).await;
+                assert_eq!(ids(&static_batches), expected, "static {predicate}");
+            }
             for task in [task.clone(), with_file_metrics(task, metrics.clone())] {
                 let (batches, _) = execute(
                     task,
