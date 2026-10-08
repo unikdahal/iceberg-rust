@@ -179,16 +179,14 @@ impl<'a> TableScanBuilder<'a> {
     /// Statistics are dropped by default to keep planning and task serialization
     /// cheap. When retained, [`FileScanTask::file_metrics`] lets a reader with an
     /// execution-time predicate reject a file before opening it.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn include_column_stats(mut self) -> Self {
+    pub fn include_column_stats(mut self) -> Self {
         self.column_stats = ColumnStatsRequest::All;
         self
     }
 
     /// Retains manifest statistics only for the named columns on planned
     /// [`FileScanTask`]s. The record count is always retained.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn include_column_stats_for(
+    pub fn include_column_stats_for(
         mut self,
         column_names: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {

@@ -1460,6 +1460,8 @@ pub fn iceberg::scan::TableScan::fmt(&self, f: &mut core::fmt::Formatter<'_>) ->
 pub struct iceberg::scan::TableScanBuilder<'a>
 impl<'a> iceberg::scan::TableScanBuilder<'a>
 pub fn iceberg::scan::TableScanBuilder<'a>::build(self) -> iceberg::Result<iceberg::scan::TableScan>
+pub fn iceberg::scan::TableScanBuilder<'a>::include_column_stats(self) -> Self
+pub fn iceberg::scan::TableScanBuilder<'a>::include_column_stats_for(self, column_names: impl core::iter::traits::collect::IntoIterator<Item = impl core::convert::Into<alloc::string::String>>) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select(self, column_names: impl core::iter::traits::collect::IntoIterator<Item = impl alloc::string::ToString>) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select_all(self) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select_empty(self) -> Self
