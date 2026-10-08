@@ -166,7 +166,6 @@ struct PlannedPredicate {
     advisory: bool,
     /// False when whole-file statistics prove every row satisfies the predicate, so the
     /// row filter would only spend time confirming it. Row-group and page pruning still use it.
-    /// Also false for advisory predicates that prune no row groups or pages in the file.
     row_filter: bool,
 }
 
@@ -179,12 +178,6 @@ struct ResolvedProjection {
     live_metadata: Option<ArrowReaderMetadata>,
     use_position_fallback: bool,
     project_row_id: bool,
-}
-
-/// Selected row group indices and count of row groups pruned by advisory runtime predicates.
-struct SelectedRowGroups {
-    indices: Option<Vec<usize>>,
-    runtime_pruned_count: usize,
 }
 
 /// Context for constructing the batch stream and its underlying decoders.
@@ -234,23 +227,25 @@ impl FileScanTaskReader {
             projection.use_position_fallback,
         )?;
 
-        let selected_row_groups = self
-            .select_row_groups(&task, &plans, &mut projection.record_batch_stream_builder)
-            .await?;
-
-        let (row_selection, runtime_pages_pruned) = self.select_pages_by_index(
-            &task,
-            &plans,
-            projection.record_batch_stream_builder.metadata(),
-            &selected_row_groups.indices,
-        )?;
-
-        let advisory_pruned = selected_row_groups.runtime_pruned_count > 0 || runtime_pages_pruned;
-        let row_filter = Self::gate_advisory_and_compile_row_filter(
+        let row_filter = Self::compile_row_filter(
             &task,
             &mut plans,
             projection.record_batch_stream_builder.parquet_schema(),
-            advisory_pruned,
+        )?;
+
+        if plans.iter().any(|plan| plan.advisory) {
+            self.scan_metrics.record_runtime_predicate_task();
+        }
+
+        let selected_row_group_indices = self
+            .select_row_groups(&task, &plans, &mut projection.record_batch_stream_builder)
+            .await?;
+
+        let row_selection = self.select_pages_by_index(
+            &task,
+            &plans,
+            projection.record_batch_stream_builder.metadata(),
+            &selected_row_group_indices,
         )?;
 
         let row_selection = Self::merge_positional_delete_selection(
@@ -260,14 +255,14 @@ impl FileScanTaskReader {
                 .record_batch_stream_builder
                 .metadata()
                 .row_groups(),
-            &selected_row_groups.indices,
+            &selected_row_group_indices,
             row_selection,
         )?;
 
         self.build_record_batch_stream(StreamContext {
             task,
             projection,
-            selected_row_group_indices: selected_row_groups.indices,
+            selected_row_group_indices,
             row_selection,
             row_filter,
             plans: &plans,
@@ -694,15 +689,6 @@ impl FileScanTaskReader {
             )
             .and_then(|()| {
                 self.plan_predicate(predicate, true, stream_builder, task, use_position_fallback)
-            })
-            .and_then(|plan| {
-                // The row filter is built after row-group and page pruning, so reject
-                // predicates it cannot express now; their pruning must not apply either.
-                ArrowReader::get_arrow_predicate(
-                    &[(plan.predicate.as_ref(), &plan.field_ids, &plan.field_id_map)],
-                    stream_builder.parquet_schema(),
-                )?;
-                Ok(plan)
             });
             match planned {
                 Ok(plan) => plans.push(plan),
@@ -711,9 +697,6 @@ impl FileScanTaskReader {
                     task.data_file_path()
                 ),
             }
-        }
-        if plans.iter().any(|plan| plan.advisory) {
-            self.scan_metrics.record_runtime_predicate_task();
         }
 
         Ok(plans)
@@ -725,7 +708,7 @@ impl FileScanTaskReader {
         task: &FileScanTask,
         plans: &[PlannedPredicate],
         stream_builder: &mut ParquetRecordBatchStreamBuilder<ArrowFileReader>,
-    ) -> Result<SelectedRowGroups> {
+    ) -> Result<Option<Vec<usize>>> {
         // There are three possible sources for potential lists of selected RowGroup indices,
         // and two for `RowSelection`s.
         // Selected RowGroup index lists can come from three sources:
@@ -756,7 +739,6 @@ impl FileScanTaskReader {
 
         // Count the candidate groups the runtime predicate removed beyond the
         // task byte range and the planned and equality-delete predicates.
-        let mut runtime_row_groups_pruned = 0;
         if let Some(runtime_groups) = plans
             .iter()
             .find(|plan| plan.advisory)
@@ -771,10 +753,9 @@ impl FileScanTaskReader {
                 None => groups.len(),
             };
             let with_runtime = intersect_sorted(&without_runtime, runtime_groups);
-            runtime_row_groups_pruned =
-                candidates(&without_runtime).saturating_sub(candidates(&with_runtime));
-            self.scan_metrics
-                .record_runtime_row_groups_pruned(runtime_row_groups_pruned);
+            self.scan_metrics.record_runtime_row_groups_pruned(
+                candidates(&without_runtime).saturating_sub(candidates(&with_runtime)),
+            );
         }
 
         for plan in plans {
@@ -811,10 +792,7 @@ impl FileScanTaskReader {
             }
         }
 
-        Ok(SelectedRowGroups {
-            indices: selected_row_group_indices,
-            runtime_pruned_count: runtime_row_groups_pruned,
-        })
+        Ok(selected_row_group_indices)
     }
 
     /// Evaluates page indexes against planned predicates to prune pages within selected row groups.
@@ -824,9 +802,8 @@ impl FileScanTaskReader {
         plans: &[PlannedPredicate],
         metadata: &Arc<ParquetMetaData>,
         selected_row_group_indices: &Option<Vec<usize>>,
-    ) -> Result<(Option<RowSelection>, bool)> {
+    ) -> Result<Option<RowSelection>> {
         let mut row_selection = None;
-        let mut runtime_pages_pruned = false;
         if self.row_selection_enabled {
             for plan in plans {
                 let selection = ArrowReader::get_row_selection_for_filter_predicate(
@@ -836,15 +813,6 @@ impl FileScanTaskReader {
                     &plan.field_id_map,
                     task.schema(),
                 );
-                if plan.advisory
-                    && selection
-                        .as_ref()
-                        .ok()
-                        .and_then(|s| s.as_ref())
-                        .is_some_and(|s| s.skipped_row_count() > 0)
-                {
-                    runtime_pages_pruned = true;
-                }
                 row_selection = intersect_page_selection(
                     row_selection,
                     selection,
@@ -853,32 +821,15 @@ impl FileScanTaskReader {
                 )?;
             }
         }
-        Ok((row_selection, runtime_pages_pruned))
+        Ok(row_selection)
     }
 
-    /// Gates advisory predicates on pruning efficacy and compiles them into an Arrow RowFilter.
-    fn gate_advisory_and_compile_row_filter(
+    /// Compiles active planned predicates into an Arrow RowFilter.
+    fn compile_row_filter(
         task: &FileScanTask,
         plans: &mut Vec<PlannedPredicate>,
         parquet_schema: &SchemaDescriptor,
-        advisory_pruned: bool,
     ) -> Result<Option<RowFilter>> {
-        // An advisory runtime predicate becomes a row filter only if it pruned a row group or
-        // a page of this file. When nothing is skipped, the reader decodes every payload value
-        // anyway, so a row filter would only add a predicate decode and a selection pass.
-        //
-        // Advisory predicates only narrow what the reader returns: the operator that supplied
-        // one (a join, Top-K or aggregate) still applies its own condition to every row, so
-        // returning unfiltered rows is correct. Planned and delete predicates always filter.
-        for plan in plans.iter_mut() {
-            if plan.advisory {
-                let file_always_matches = task
-                    .file_metrics()
-                    .is_some_and(|metrics| Self::file_always_matches(&plan.predicate, metrics));
-                plan.row_filter = !file_always_matches && advisory_pruned;
-            }
-        }
-
         // The planned and runtime predicates form one Arrow predicate, so
         // columns they share are decoded once and neither runs on the other's
         // survivors. Separate Arrow predicates decoded shared columns twice and
@@ -1337,12 +1288,9 @@ impl FileScanTaskReader {
         // This proof applies equally to planned filters, equality-delete
         // predicates and advisory runtime bounds. Keep the group/page plan,
         // but avoid decoding predicate-only columns just to confirm every row.
-        // Advisory predicates defer row_filter enablement until page- or group-pruning
-        // efficacy is established in `process()`.
-        let row_filter = !advisory
-            && !task
-                .file_metrics()
-                .is_some_and(|metrics| Self::file_always_matches(&predicate, metrics));
+        let row_filter = !task
+            .file_metrics()
+            .is_some_and(|metrics| Self::file_always_matches(&predicate, metrics));
         Ok(PlannedPredicate {
             predicate,
             field_ids: iceberg_field_ids,

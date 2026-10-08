@@ -172,7 +172,7 @@ impl RuntimePrunedStream {
             .count();
         self.selections.drain(..started);
 
-        let (runtime, selections, has_pruning) = match self.restrict_remaining(predicate) {
+        let (runtime, selections) = match self.restrict_remaining(predicate) {
             Ok(restricted) => restricted,
             Err(error) => {
                 tracing::debug!(
@@ -182,12 +182,6 @@ impl RuntimePrunedStream {
                 return Ok(());
             }
         };
-        // As at file open, refine the row filter only when the advisory predicate skips a row
-        // group or page; otherwise the previous filter stays and the supplying operator
-        // re-checks its own condition.
-        if !has_pruning {
-            return Ok(());
-        }
         let Some(row_filter) = self.compile_row_filter(&runtime) else {
             return Ok(());
         };
@@ -211,7 +205,7 @@ impl RuntimePrunedStream {
     fn restrict_remaining(
         &self,
         predicate: Arc<BoundPredicate>,
-    ) -> Result<(ResolvedPredicate, Vec<RowGroupSelection>, bool)> {
+    ) -> Result<(ResolvedPredicate, Vec<RowGroupSelection>)> {
         let parquet_metadata = self.metadata.metadata();
         let task = &self.refresh.task;
         check_runtime_predicate_columns(
@@ -238,8 +232,6 @@ impl RuntimePrunedStream {
                 kept.push(selection.clone());
             }
         }
-        let has_rg_pruning = kept.len() < self.selections.len();
-        let mut has_page_pruning = false;
         if self.refresh.row_selection_enabled && !kept.is_empty() {
             // Page selections span the selected groups in file order, while the groups may
             // be read in another order (largest first). Plan and split them in file order,
@@ -259,9 +251,6 @@ impl RuntimePrunedStream {
                 task.schema(),
             ) {
                 Ok(Some(pages)) => {
-                    if pages.skipped_row_count() > 0 {
-                        has_page_pruning = true;
-                    }
                     let pages: HashMap<usize, RowGroupSelection> =
                         split_row_selection(parquet_metadata, &indices, Some(pages))
                             .into_iter()
@@ -289,7 +278,6 @@ impl RuntimePrunedStream {
                 ),
             }
         }
-        let has_pruning = has_rg_pruning || has_page_pruning;
         Ok((
             ResolvedPredicate {
                 predicate,
@@ -297,7 +285,6 @@ impl RuntimePrunedStream {
                 field_id_map,
             },
             kept,
-            has_pruning,
         ))
     }
 
