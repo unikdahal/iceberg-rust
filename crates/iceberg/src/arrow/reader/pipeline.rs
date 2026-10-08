@@ -68,7 +68,7 @@ use crate::metadata_columns::{
     RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, RESERVED_FIELD_ID_SPEC_ID, is_metadata_field,
 };
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskMetrics, FileScanTaskStream};
-use crate::spec::{Datum, PartitionSpec, Struct};
+use crate::spec::{Datum, PartitionSpec, PrimitiveType, Struct};
 use crate::{Error, ErrorKind};
 
 impl ArrowReader {
@@ -964,19 +964,41 @@ impl FileScanTaskReader {
     /// Whether whole-file statistics prove that every row of the file satisfies `predicate`,
     /// so its row filter would only confirm it. Statistics whose type does not match the task
     /// schema, and evaluation errors, answer no, which only costs the row filter.
+    /// Floating-point binary and set predicates keep their row filters: the strict evaluator
+    /// uses Iceberg float ordering (NaN highest, -0.0 == +0.0), while Arrow's row kernels use
+    /// IEEE total order.
     fn file_always_matches(predicate: &BoundPredicate, metrics: &FileScanTaskMetrics) -> bool {
         let bounds_match_schema = Self::file_bounds_match_predicate(predicate, metrics);
         // Iceberg's strict evaluator treats null as matching negative equality
         // and membership predicates. Arrow's row kernels return null instead,
         // which the row filter drops. Keep those filters unless their columns
         // are explicitly known to contain no nulls, including inside OR trees.
-        fn null_semantics_match(predicate: &BoundPredicate, metrics: &FileScanTaskMetrics) -> bool {
+        fn row_filter_semantics_match(
+            predicate: &BoundPredicate,
+            metrics: &FileScanTaskMetrics,
+        ) -> bool {
             match predicate {
                 BoundPredicate::And(expression) | BoundPredicate::Or(expression) => expression
                     .inputs()
                     .iter()
-                    .all(|input| null_semantics_match(input, metrics)),
+                    .all(|input| row_filter_semantics_match(input, metrics)),
                 BoundPredicate::Not(_) => false,
+                BoundPredicate::Binary(expression)
+                    if matches!(
+                        expression.term().field().field_type.as_primitive_type(),
+                        Some(PrimitiveType::Float | PrimitiveType::Double)
+                    ) =>
+                {
+                    false
+                }
+                BoundPredicate::Set(expression)
+                    if matches!(
+                        expression.term().field().field_type.as_primitive_type(),
+                        Some(PrimitiveType::Float | PrimitiveType::Double)
+                    ) =>
+                {
+                    false
+                }
                 BoundPredicate::Binary(expression)
                     if expression.op() == PredicateOperator::NotEq =>
                 {
@@ -995,7 +1017,7 @@ impl FileScanTaskReader {
             }
         }
         bounds_match_schema
-            && null_semantics_match(predicate, metrics)
+            && row_filter_semantics_match(predicate, metrics)
             && StrictMetricsEvaluator::eval_metrics(predicate, metrics.into()).unwrap_or(false)
     }
 
@@ -1256,13 +1278,119 @@ mod tests {
     use crate::Runtime;
     use crate::arrow::ArrowReaderBuilder;
     use crate::arrow::test_utils::write_encrypted_parquet;
+    use crate::expr::{Bind, Reference};
     use crate::io::FileIO;
     use crate::metadata_columns::{
         RESERVED_COL_NAME_POS, RESERVED_COL_NAME_ROW_ID, RESERVED_FIELD_ID_FILE,
         RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID,
     };
-    use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
-    use crate::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, SchemaRef, Type};
+    use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskMetrics, FileScanTaskStream};
+    use crate::spec::{DataFileFormat, Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type};
+
+    #[test]
+    fn file_always_matches_keeps_floating_point_comparisons() {
+        for (field_type, nan, negative_zero, positive_zero, one) in [
+            (
+                PrimitiveType::Float,
+                Datum::float(f32::NAN),
+                Datum::float(-0.0),
+                Datum::float(0.0),
+                Datum::float(1.0),
+            ),
+            (
+                PrimitiveType::Double,
+                Datum::double(f64::NAN),
+                Datum::double(-0.0),
+                Datum::double(0.0),
+                Datum::double(1.0),
+            ),
+        ] {
+            let schema = Arc::new(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::optional(1, "key", Type::Primitive(field_type)).into(),
+                    ])
+                    .build()
+                    .unwrap(),
+            );
+            for nan_count in [1, 2] {
+                let bounds = if nan_count == 2 {
+                    HashMap::new()
+                } else {
+                    HashMap::from([(1, negative_zero.clone())])
+                };
+                let metrics = FileScanTaskMetrics::new(
+                    Some(2),
+                    HashMap::from([(1, 2)]),
+                    HashMap::from([(1, 0)]),
+                    HashMap::from([(1, nan_count)]),
+                    bounds.clone(),
+                    bounds,
+                );
+                for predicate in [
+                    Reference::new("key").not_equal_to(nan.clone()),
+                    Reference::new("key").is_not_in([nan.clone(), one.clone()]),
+                ] {
+                    let predicate = predicate.bind(schema.clone(), false).unwrap();
+                    assert!(
+                        super::StrictMetricsEvaluator::eval_metrics(&predicate, (&metrics).into())
+                            .unwrap()
+                    );
+                    assert!(!super::FileScanTaskReader::file_always_matches(
+                        &predicate, &metrics
+                    ));
+                }
+            }
+            let metrics = FileScanTaskMetrics::new(
+                Some(2),
+                HashMap::from([(1, 2)]),
+                HashMap::from([(1, 0)]),
+                HashMap::from([(1, 0)]),
+                HashMap::from([(1, negative_zero.clone())]),
+                HashMap::from([(1, negative_zero)]),
+            );
+            for predicate in [
+                Reference::new("key").equal_to(positive_zero.clone()),
+                Reference::new("key").is_in([positive_zero, nan]),
+            ] {
+                let predicate = predicate.bind(schema.clone(), false).unwrap();
+                assert!(
+                    super::StrictMetricsEvaluator::eval_metrics(&predicate, (&metrics).into())
+                        .unwrap()
+                );
+                assert!(!super::FileScanTaskReader::file_always_matches(
+                    &predicate, &metrics
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn file_always_matches_preserves_integer_not_eq() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "key", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let predicate = Reference::new("key")
+            .not_equal_to(Datum::int(1))
+            .bind(schema, false)
+            .unwrap();
+        let metrics = FileScanTaskMetrics::new(
+            Some(2),
+            HashMap::from([(1, 2)]),
+            HashMap::from([(1, 0)]),
+            HashMap::new(),
+            HashMap::from([(1, Datum::int(2))]),
+            HashMap::from([(1, Datum::int(3))]),
+        );
+        assert!(super::FileScanTaskReader::file_always_matches(
+            &predicate, &metrics
+        ));
+    }
 
     // INT96 encoding: [nanos_low_u32, nanos_high_u32, julian_day_u32]
     // Julian day 2_440_588 = Unix epoch (1970-01-01)

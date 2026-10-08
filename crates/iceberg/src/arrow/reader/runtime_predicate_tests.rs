@@ -1779,6 +1779,58 @@ async fn planned_all_match_filter_does_not_decode_predicate_only_column() {
 }
 
 #[tokio::test]
+async fn nan_equality_deletes_with_file_metrics_preserve_empty_projection_counts() {
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path().to_str().unwrap();
+    let data_path = format!("{dir}/nan_data.parquet");
+    let delete_path = format!("{dir}/nan_delete.parquet");
+    let key = field("key", DataType::Float64, 1).with_nullable(true);
+    write_delete(&data_path, vec![key.clone()], vec![
+        Arc::new(Float64Array::from(vec![Some(f64::NAN), Some(f64::NAN)])),
+    ]);
+    write_delete(&delete_path, vec![key], vec![
+        Arc::new(Float64Array::from(vec![Some(f64::NAN)])),
+    ]);
+    let schema = Arc::new(
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "key", Type::Primitive(PrimitiveType::Double)).into(),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let delete = FileScanTaskDeleteFile::builder()
+        .with_file_size_in_bytes(std::fs::metadata(&delete_path).unwrap().len())
+        .with_file_path(delete_path)
+        .with_file_type(DataContentType::EqualityDeletes)
+        .with_file_format(DataFileFormat::Parquet)
+        .with_partition_spec_id(0)
+        .with_equality_ids(Some(vec![1]))
+        .build();
+    let metrics = crate::scan::FileScanTaskMetrics::new(
+        Some(2),
+        HashMap::from([(1, 2)]),
+        HashMap::from([(1, 0)]),
+        HashMap::from([(1, 2)]),
+        HashMap::new(),
+        HashMap::new(),
+    );
+    for projection in [vec![1], vec![]] {
+        let task = scan_task_with_deletes_and_projection(
+            data_path.clone(),
+            schema.clone(),
+            None,
+            vec![delete.clone()],
+            projection,
+        );
+        let (unproven, _) = execute(task.clone(), None).await;
+        let (proven, _) = execute(with_file_metrics(task, metrics.clone()), None).await;
+        assert_eq!(unproven.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+        assert_eq!(proven.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    }
+}
+
+#[tokio::test]
 async fn runtime_predicate_file_rejection_precedes_data_and_delete_io() {
     for delete_type in [
         None,
