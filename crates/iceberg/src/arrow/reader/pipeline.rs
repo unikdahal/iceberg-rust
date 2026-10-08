@@ -68,7 +68,7 @@ use crate::metadata_columns::{
     RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, RESERVED_FIELD_ID_SPEC_ID, is_metadata_field,
 };
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskMetrics, FileScanTaskStream};
-use crate::spec::{Datum, PartitionSpec, PrimitiveType, Struct};
+use crate::spec::{Datum, PartitionSpec, Struct};
 use crate::{Error, ErrorKind};
 
 impl ArrowReader {
@@ -984,18 +984,12 @@ impl FileScanTaskReader {
                     .all(|input| row_filter_semantics_match(input, metrics)),
                 BoundPredicate::Not(_) => false,
                 BoundPredicate::Binary(expression)
-                    if matches!(
-                        expression.term().field().field_type.as_primitive_type(),
-                        Some(PrimitiveType::Float | PrimitiveType::Double)
-                    ) =>
+                    if expression.term().field().field_type.is_floating_type() =>
                 {
                     false
                 }
                 BoundPredicate::Set(expression)
-                    if matches!(
-                        expression.term().field().field_type.as_primitive_type(),
-                        Some(PrimitiveType::Float | PrimitiveType::Double)
-                    ) =>
+                    if expression.term().field().field_type.is_floating_type() =>
                 {
                     false
                 }
@@ -1284,7 +1278,9 @@ mod tests {
         RESERVED_COL_NAME_POS, RESERVED_COL_NAME_ROW_ID, RESERVED_FIELD_ID_FILE,
         RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID,
     };
-    use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskMetrics, FileScanTaskStream};
+    use crate::scan::{
+        FileScanTask, FileScanTaskDeleteFile, FileScanTaskMetrics, FileScanTaskStream,
+    };
     use crate::spec::{DataFileFormat, Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type};
 
     #[test]
@@ -1293,9 +1289,9 @@ mod tests {
             (
                 PrimitiveType::Float,
                 Datum::float(f32::NAN),
-                Datum::float(-0.0),
-                Datum::float(0.0),
-                Datum::float(1.0),
+                Datum::float(-0.0_f32),
+                Datum::float(0.0_f32),
+                Datum::float(1.0_f32),
             ),
             (
                 PrimitiveType::Double,

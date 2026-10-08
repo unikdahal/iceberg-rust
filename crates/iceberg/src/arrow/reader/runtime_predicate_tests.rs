@@ -1785,12 +1785,12 @@ async fn nan_equality_deletes_with_file_metrics_preserve_empty_projection_counts
     let data_path = format!("{dir}/nan_data.parquet");
     let delete_path = format!("{dir}/nan_delete.parquet");
     let key = field("key", DataType::Float64, 1).with_nullable(true);
-    write_delete(&data_path, vec![key.clone()], vec![
-        Arc::new(Float64Array::from(vec![Some(f64::NAN), Some(f64::NAN)])),
-    ]);
-    write_delete(&delete_path, vec![key], vec![
-        Arc::new(Float64Array::from(vec![Some(f64::NAN)])),
-    ]);
+    write_delete(&data_path, vec![key.clone()], vec![Arc::new(
+        Float64Array::from(vec![Some(f64::NAN), Some(f64::NAN)]),
+    )]);
+    write_delete(&delete_path, vec![key], vec![Arc::new(Float64Array::from(
+        vec![Some(f64::NAN)],
+    ))]);
     let schema = Arc::new(
         Schema::builder()
             .with_fields(vec![
