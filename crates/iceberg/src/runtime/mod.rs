@@ -36,6 +36,13 @@ use crate::{Error, ErrorKind, Result};
 /// [`tokio::task::JoinError`] preserved as the source.
 pub struct JoinHandle<T>(TokioJoinHandle<T>);
 
+impl<T> JoinHandle<T> {
+    /// Cancel the task, dropping its future when the runtime next polls it.
+    pub(crate) fn abort(&self) {
+        self.0.abort();
+    }
+}
+
 impl<T> Unpin for JoinHandle<T> {}
 
 impl<T: Send + 'static> Future for JoinHandle<T> {

@@ -16,7 +16,10 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use arrow_array::{Array, ArrayRef, Int64Array, StringArray, StructArray};
 use bytes::Bytes;
@@ -34,7 +37,7 @@ use crate::error::invalid_data;
 use crate::expr::Predicate::AlwaysTrue;
 use crate::expr::{Predicate, PredicateOperator, Reference, SetExpression};
 use crate::io::FileIO;
-use crate::runtime::Runtime;
+use crate::runtime::{JoinHandle, Runtime};
 use crate::scan::{ArrowRecordBatchStream, FileScanTaskDeleteFile};
 use crate::spec::{
     DataContentType, DataFileFormat, Datum, ListType, MapType, NestedField, NestedFieldRef,
@@ -51,6 +54,29 @@ pub(crate) struct CachingDeleteFileLoader {
     /// calls to `load_deletes` (e.g., across multiple file scan tasks).
     delete_filter: DeleteFilter,
     runtime: Runtime,
+}
+
+/// Owns delete loading until completion or cancellation of the scan task.
+/// The cache is per-scan, so all waiters drop together on scan cancellation.
+/// Aborting drops the positional load guards and equality senders, which complete
+/// any remaining cache waiters with an error rather than leaving them pending.
+pub(crate) struct DeleteLoad {
+    receiver: Receiver<Result<DeleteFilter>>,
+    task: JoinHandle<()>,
+}
+
+impl Future for DeleteLoad {
+    type Output = std::result::Result<Result<DeleteFilter>, tokio::sync::oneshot::error::RecvError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().receiver).poll(cx)
+    }
+}
+
+impl Drop for DeleteLoad {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 // Intermediate context during processing of a delete file task.
@@ -187,7 +213,7 @@ impl CachingDeleteFileLoader {
         &self,
         delete_file_entries: &[FileScanTaskDeleteFile],
         schema: SchemaRef,
-    ) -> Receiver<Result<DeleteFilter>> {
+    ) -> DeleteLoad {
         let (tx, rx) = channel();
 
         let stream_items = delete_file_entries
@@ -206,7 +232,7 @@ impl CachingDeleteFileLoader {
         let del_filter = self.delete_filter.clone();
         let concurrency_limit_data_files = self.concurrency_limit_data_files;
         let basic_delete_file_loader = self.basic_delete_file_loader.clone();
-        self.runtime.io().spawn(async move {
+        let task = self.runtime.io().spawn(async move {
             let result = async move {
                 let mut del_filter = del_filter;
                 let basic_delete_file_loader = basic_delete_file_loader.clone();
@@ -259,7 +285,7 @@ impl CachingDeleteFileLoader {
             let _ = tx.send(result);
         });
 
-        rx
+        DeleteLoad { receiver: rx, task }
     }
 
     async fn load_file_for_task(
@@ -989,6 +1015,8 @@ mod tests {
     use std::collections::HashMap;
     use std::fs::File;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     use arrow_array::cast::AsArray;
     use arrow_array::{
@@ -1009,6 +1037,155 @@ mod tests {
     use crate::spec::{DataContentType, DataFileBuilder, Literal, Schema, Struct};
     use crate::test_utils::encode_dv_blob;
 
+    #[derive(Debug)]
+    struct ReadGate {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        dropped: tokio::sync::Notify,
+        completed_bytes: AtomicU64,
+    }
+
+    impl ReadGate {
+        fn new() -> Self {
+            Self {
+                started: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+                dropped: tokio::sync::Notify::new(),
+                completed_bytes: AtomicU64::new(0),
+            }
+        }
+    }
+
+    struct GatedFileRead {
+        inner: Box<dyn crate::io::FileRead>,
+        gate: Arc<ReadGate>,
+    }
+
+    struct ReadDropGuard(Arc<ReadGate>);
+
+    impl Drop for ReadDropGuard {
+        fn drop(&mut self) {
+            self.0.dropped.notify_one();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::io::FileRead for GatedFileRead {
+        async fn read(&self, range: std::ops::Range<u64>) -> Result<Bytes> {
+            let _guard = ReadDropGuard(Arc::clone(&self.gate));
+            self.gate.started.notify_one();
+            self.gate.release.notified().await;
+            let bytes = self.inner.read(range).await?;
+            self.gate
+                .completed_bytes
+                .fetch_add(bytes.len() as u64, Ordering::SeqCst);
+            Ok(bytes)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_drop_delete_load_aborts_read_and_wakes_positional_waiters() {
+        let directory = TempDir::new().unwrap();
+        let tasks = setup(directory.path());
+        let task = &tasks[0];
+        let delete = &task.deletes()[0];
+        let gate = Arc::new(ReadGate::new());
+        let file_io = crate::io::FileIOBuilder::new(Arc::new(MetadataCountingStorageFactory {
+            read_gate: Some(Arc::clone(&gate)),
+            ..Default::default()
+        }))
+        .build();
+        let metrics = ScanMetrics::new();
+        let loader = CachingDeleteFileLoader::new(file_io, 2, Runtime::current())
+            .with_scan_metrics(metrics.clone());
+        let owner = loader.load_deletes(std::slice::from_ref(delete), task.schema_ref());
+        tokio::time::timeout(Duration::from_secs(5), gate.started.notified())
+            .await
+            .unwrap();
+        let bytes_before_drop = metrics.bytes_read();
+        assert!(bytes_before_drop > 0);
+
+        // Register before aborting to exercise notification of an existing waiter.
+        let PosDelLoadAction::WaitFor(notified) = loader
+            .delete_filter
+            .try_start_pos_del_load(&delete.file_path)
+        else {
+            panic!("expected an in-progress positional load")
+        };
+        let waiter = loader.load_deletes(std::slice::from_ref(delete), task.schema_ref());
+        drop(owner);
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), gate.dropped.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), notified)
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(error.retryable());
+        assert!(error.to_string().contains("cancelled"));
+        tokio::task::yield_now().await;
+        assert_eq!(gate.completed_bytes.load(Ordering::SeqCst), 0);
+        assert_eq!(metrics.bytes_read(), bytes_before_drop);
+    }
+
+    #[tokio::test]
+    async fn test_drop_delete_load_aborts_read_and_wakes_equality_waiters() {
+        let directory = TempDir::new().unwrap();
+        let tasks = setup(directory.path());
+        let task = &tasks[0];
+        let mut delete = task.deletes()[0].clone();
+        delete.file_type = DataContentType::EqualityDeletes;
+        delete.equality_ids = Some(vec![1]);
+        let gate = Arc::new(ReadGate::new());
+        let file_io = crate::io::FileIOBuilder::new(Arc::new(MetadataCountingStorageFactory {
+            read_gate: Some(Arc::clone(&gate)),
+            ..Default::default()
+        }))
+        .build();
+        let metrics = ScanMetrics::new();
+        let loader = CachingDeleteFileLoader::new(file_io, 2, Runtime::current())
+            .with_scan_metrics(metrics.clone());
+        let owner = loader.load_deletes(std::slice::from_ref(&delete), task.schema_ref());
+        tokio::time::timeout(Duration::from_secs(5), gate.started.notified())
+            .await
+            .unwrap();
+        let bytes_before_drop = metrics.bytes_read();
+        assert!(bytes_before_drop > 0);
+        let filter = tokio::time::timeout(
+            Duration::from_secs(5),
+            loader.load_deletes(std::slice::from_ref(&delete), task.schema_ref()),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let mut waiter =
+            Box::pin(filter.get_equality_delete_predicate_for_delete_file_path(&delete.file_path));
+        assert!(futures::poll!(&mut waiter).is_pending());
+
+        drop(owner);
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), gate.dropped.notified())
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(error.retryable());
+        assert!(error.to_string().contains("cancelled"));
+        tokio::task::yield_now().await;
+        assert_eq!(gate.completed_bytes.load(Ordering::SeqCst), 0);
+        assert_eq!(metrics.bytes_read(), bytes_before_drop);
+    }
+
     #[tokio::test]
     async fn test_positional_open_failure_does_not_leave_a_loading_cache_entry() {
         let directory = TempDir::new().unwrap();
@@ -1020,7 +1197,7 @@ mod tests {
         let mut first = None;
         for _ in 0..2 {
             let error = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
+                Duration::from_secs(5),
                 loader.load_deletes(std::slice::from_ref(&delete), task.schema_ref()),
             )
             .await
@@ -1060,7 +1237,7 @@ mod tests {
             })
             .await;
         assert!(result.is_err());
-        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+        tokio::time::timeout(Duration::from_secs(5), waiter)
             .await
             .unwrap();
         let error = filter.positional_delete_load_result(path).unwrap_err();
@@ -1084,7 +1261,7 @@ mod tests {
             delete.equality_ids = ids;
             let loader = CachingDeleteFileLoader::new(FileIO::new_with_fs(), 2, Runtime::current());
             let error = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
+                Duration::from_secs(5),
                 loader.load_deletes(std::slice::from_ref(&delete), task.schema_ref()),
             )
             .await
@@ -1093,7 +1270,7 @@ mod tests {
             .unwrap_err();
             assert_eq!(error.kind(), ErrorKind::DataInvalid);
             let cached = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
+                Duration::from_secs(5),
                 loader
                     .delete_filter
                     .get_equality_delete_predicate_for_delete_file_path(&delete.file_path),
@@ -1553,6 +1730,8 @@ mod tests {
         /// Fail every metadata request with a retryable error.
         #[serde(skip)]
         fail_metadata: bool,
+        #[serde(skip)]
+        read_gate: Option<Arc<ReadGate>>,
     }
 
     #[async_trait::async_trait]
@@ -1563,7 +1742,7 @@ mod tests {
         }
 
         async fn metadata(&self, path: &str) -> Result<crate::io::FileMetadata> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail_metadata {
                 return Err(
                     Error::new(ErrorKind::Unexpected, "metadata temporarily unavailable")
@@ -1578,7 +1757,14 @@ mod tests {
         }
 
         async fn reader(&self, path: &str) -> Result<Box<dyn crate::io::FileRead>> {
-            crate::io::LocalFsStorage::new().reader(path).await
+            let reader = crate::io::LocalFsStorage::new().reader(path).await?;
+            match &self.read_gate {
+                Some(gate) => Ok(Box::new(GatedFileRead {
+                    inner: reader,
+                    gate: Arc::clone(gate),
+                })),
+                None => Ok(reader),
+            }
         }
 
         async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
@@ -1625,6 +1811,8 @@ mod tests {
         calls: Arc<std::sync::atomic::AtomicUsize>,
         #[serde(skip)]
         fail_metadata: bool,
+        #[serde(skip)]
+        read_gate: Option<Arc<ReadGate>>,
     }
 
     #[typetag::serde(name = "test_metadata_counting_storage_factory")]
@@ -1633,6 +1821,7 @@ mod tests {
             Ok(Arc::new(MetadataCountingStorage {
                 calls: Arc::clone(&self.calls),
                 fail_metadata: self.fail_metadata,
+                read_gate: self.read_gate.clone(),
             }))
         }
     }

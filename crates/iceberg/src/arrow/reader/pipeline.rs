@@ -198,7 +198,7 @@ impl FileScanTaskReader {
         let mut parquet_read_options = self.parquet_read_options;
         parquet_read_options.preload_page_index = should_load_page_index;
 
-        let delete_filter_rx = self
+        let delete_load = self
             .delete_file_loader
             .load_deletes(task.deletes(), task.schema_ref());
 
@@ -517,7 +517,7 @@ impl FileScanTaskReader {
             record_batch_stream_builder = record_batch_stream_builder.with_batch_size(batch_size);
         }
 
-        let delete_filter = delete_filter_rx.await.unwrap()?;
+        let delete_filter = delete_load.await.unwrap()?;
         let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
 
         // In addition to the optional predicate supplied in the `FileScanTask`,
