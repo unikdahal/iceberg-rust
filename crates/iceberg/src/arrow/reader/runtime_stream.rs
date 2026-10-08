@@ -176,9 +176,9 @@ impl RuntimePrunedStream {
                 return Ok(());
             }
         };
-        // Apply an advisory runtime predicate as row_filter ONLY if it pruned >= 1 row group
-        // or >= 1 page. Otherwise rows pass through to downstream operators (which re-check
-        // join/TopK/aggregate conditions) to avoid two-phase decode and selection overhead.
+        // As at file open, refine the row filter only when the advisory predicate skips a row
+        // group or page; otherwise the previous filter stays and the supplying operator
+        // re-checks its own condition.
         if !has_pruning {
             return Ok(());
         }

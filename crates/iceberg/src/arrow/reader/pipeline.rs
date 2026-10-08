@@ -702,16 +702,13 @@ impl FileScanTaskReader {
             }
         }
 
-        // An advisory runtime predicate (from Comet dynamic filters: join/TopK/aggregate)
-        // is compiled into a Parquet RowFilter ONLY if it pruned >= 1 row group or >= 1 page
-        // in this file. When no pages or row groups are skipped, Parquet resolves RowSelection
-        // to Mask policy, which decodes every payload value anyway, so an in-reader row filter
-        // only adds predicate-column decode and selection overhead.
+        // An advisory runtime predicate becomes a row filter only if it pruned a row group or
+        // a page of this file. When nothing is skipped, the reader decodes every payload value
+        // anyway, so a row filter would only add a predicate decode and a selection pass.
         //
-        // Correctness argument: advisory predicates are never required for query correctness
-        // because downstream operators always re-verify surviving rows (e.g. Comet HashJoinExec
-        // checks join keys against the build table regardless of whether the reader filtered rows).
-        // Planned (static) predicates and equality/positional delete predicates are NEVER affected.
+        // Advisory predicates only narrow what the reader returns: the operator that supplied
+        // one (a join, Top-K or aggregate) still applies its own condition to every row, so
+        // returning unfiltered rows is correct. Planned and delete predicates always filter.
         let advisory_pruned = runtime_row_groups_pruned > 0 || runtime_pages_pruned;
         for plan in &mut plans {
             if plan.advisory {
