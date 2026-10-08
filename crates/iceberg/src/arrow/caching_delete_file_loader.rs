@@ -1278,7 +1278,7 @@ mod tests {
         // Both of B's files must be waiting on A before A is cancelled.
         tokio::time::timeout(
             Duration::from_secs(5),
-            loader.delete_filter.wait_for_load_waiters(2),
+            crate::arrow::delete_filter::tests::wait_for_load_waiters(&loader.delete_filter, 2),
         )
         .await
         .unwrap();
