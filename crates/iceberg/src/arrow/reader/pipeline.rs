@@ -74,7 +74,7 @@ use crate::metadata_columns::{
     RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, RESERVED_FIELD_ID_SPEC_ID, is_metadata_field,
 };
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskMetrics, FileScanTaskStream};
-use crate::spec::{Datum, PartitionSpec, PrimitiveLiteral, Struct};
+use crate::spec::{Datum, PartitionSpec, PrimitiveLiteral, PrimitiveType, Struct};
 use crate::{Error, ErrorKind};
 
 impl ArrowReader {
@@ -1194,7 +1194,8 @@ impl FileScanTaskReader {
     /// schema, and evaluation errors, answer no, which only costs the row filter.
     /// Floating-point binary and set predicates keep their row filters unless provably safe:
     /// the strict evaluator uses Iceberg float ordering (NaN highest, -0.0 == +0.0), while Arrow's
-    /// row kernels use IEEE total order.
+    /// row kernels use IEEE total order. String and binary comparisons also keep their row filters:
+    /// Iceberg bounds may be truncated and are used only for inclusive pruning.
     fn file_always_matches(predicate: &BoundPredicate, metrics: &FileScanTaskMetrics) -> bool {
         let bounds_match_schema = Self::file_bounds_match_predicate(predicate, metrics);
         // Iceberg's strict evaluator treats null as matching negative equality
@@ -1221,6 +1222,14 @@ impl FileScanTaskReader {
                     {
                         return false;
                     }
+                    if matches!(
+                        expression.term().field().field_type.as_primitive_type(),
+                        Some(
+                            PrimitiveType::String | PrimitiveType::Binary | PrimitiveType::Fixed(_)
+                        )
+                    ) {
+                        return false;
+                    }
                     if expression.op() == PredicateOperator::NotEq {
                         metrics
                             .null_value_counts()
@@ -1238,6 +1247,14 @@ impl FileScanTaskReader {
                             metrics,
                         )
                     {
+                        return false;
+                    }
+                    if matches!(
+                        expression.term().field().field_type.as_primitive_type(),
+                        Some(
+                            PrimitiveType::String | PrimitiveType::Binary | PrimitiveType::Fixed(_)
+                        )
+                    ) {
                         return false;
                     }
                     if expression.op() == PredicateOperator::NotIn {
@@ -1804,6 +1821,112 @@ mod tests {
             &double_pred,
             &double_metrics,
         ));
+    }
+
+    #[test]
+    fn file_always_matches_keeps_string_and_binary_comparisons() {
+        for (field_type, value, other) in [
+            (
+                PrimitiveType::String,
+                Datum::string("prefix"),
+                Datum::string("z"),
+            ),
+            (
+                PrimitiveType::Binary,
+                Datum::binary(b"prefix".iter().copied()),
+                Datum::binary(b"z".iter().copied()),
+            ),
+        ] {
+            let schema = Arc::new(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::optional(1, "key", Type::Primitive(field_type)).into(),
+                    ])
+                    .build()
+                    .unwrap(),
+            );
+            let metrics = FileScanTaskMetrics::new(
+                Some(2),
+                HashMap::from([(1, 2)]),
+                HashMap::from([(1, 0)]),
+                HashMap::new(),
+                HashMap::from([(1, value.clone())]),
+                HashMap::from([(1, value.clone())]),
+            );
+            for predicate in [
+                Reference::new("key").equal_to(value.clone()),
+                Reference::new("key").not_equal_to(other.clone()),
+                Reference::new("key").less_than(other.clone()),
+                Reference::new("key").less_than_or_equal_to(value.clone()),
+                Reference::new("key").greater_than_or_equal_to(value.clone()),
+                Reference::new("key").is_in([value.clone(), other.clone()]),
+                Reference::new("key").is_not_in([other.clone()]),
+                Reference::new("key")
+                    .equal_to(value.clone())
+                    .and(Reference::new("key").is_not_null()),
+                Reference::new("key")
+                    .equal_to(value.clone())
+                    .or(Reference::new("key").is_null()),
+            ] {
+                let predicate = predicate.bind(schema.clone(), false).unwrap();
+                assert!(
+                    super::StrictMetricsEvaluator::eval_metrics(&predicate, (&metrics).into())
+                        .unwrap()
+                );
+                assert!(!super::FileScanTaskReader::file_always_matches(
+                    &predicate, &metrics
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_string_bounds_remain_inclusive_and_keep_row_filter() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "key", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        // Actual values differ after the first sixteen characters. The lower bound is
+        // truncated down and the upper bound rounded up, so neither is an exact value.
+        let metrics = FileScanTaskMetrics::new(
+            Some(2),
+            HashMap::from([(1, 2)]),
+            HashMap::from([(1, 0)]),
+            HashMap::new(),
+            HashMap::from([(1, Datum::string("abcdefghijklmnop"))]),
+            HashMap::from([(1, Datum::string("abcdefghijklmnoq"))]),
+        );
+        for predicate in [
+            Reference::new("key").equal_to(Datum::string("abcdefghijklmnop-first")),
+            Reference::new("key").is_in([Datum::string("abcdefghijklmnop-last")]),
+            Reference::new("key").greater_than_or_equal_to(Datum::string("abcdefghijklmnop")),
+            Reference::new("key").less_than_or_equal_to(Datum::string("abcdefghijklmnoq")),
+        ] {
+            let predicate = predicate.bind(schema.clone(), false).unwrap();
+            assert!(
+                super::InclusiveMetricsEvaluator::eval_metrics(
+                    &predicate,
+                    (&metrics).into(),
+                    false
+                )
+                .unwrap()
+            );
+            assert!(!super::FileScanTaskReader::file_always_matches(
+                &predicate, &metrics
+            ));
+        }
+        let outside = Reference::new("key")
+            .equal_to(Datum::string("z-outside"))
+            .bind(schema, false)
+            .unwrap();
+        assert!(
+            !super::InclusiveMetricsEvaluator::eval_metrics(&outside, (&metrics).into(), false)
+                .unwrap()
+        );
     }
 
     #[test]
