@@ -517,7 +517,7 @@ impl FileScanTaskReader {
             record_batch_stream_builder = record_batch_stream_builder.with_batch_size(batch_size);
         }
 
-        let delete_filter = delete_load.await.unwrap()?;
+        let delete_filter = delete_load.await?;
         let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
 
         // In addition to the optional predicate supplied in the `FileScanTask`,

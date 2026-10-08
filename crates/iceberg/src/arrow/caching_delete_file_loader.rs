@@ -57,19 +57,27 @@ pub(crate) struct CachingDeleteFileLoader {
 }
 
 /// Owns delete loading until completion or cancellation of the scan task.
-/// The cache is per-scan, so all waiters drop together on scan cancellation.
-/// Aborting drops the positional load guards and equality senders, which complete
-/// any remaining cache waiters with an error rather than leaving them pending.
+/// Dropping this future aborts its task. Cancellation releases cache claims so
+/// other tasks or scans sharing the reader can load the files themselves.
+/// Genuine load and parse errors remain cached for all waiters.
 pub(crate) struct DeleteLoad {
     receiver: Receiver<Result<DeleteFilter>>,
     task: JoinHandle<()>,
 }
 
 impl Future for DeleteLoad {
-    type Output = std::result::Result<Result<DeleteFilter>, tokio::sync::oneshot::error::RecvError>;
+    type Output = Result<DeleteFilter>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.get_mut().receiver).poll(cx)
+        Pin::new(&mut self.get_mut().receiver).poll(cx).map(|result| {
+            result.unwrap_or_else(|error| {
+                Err(Error::new(
+                    ErrorKind::Unexpected,
+                    "Delete loading stopped before completing",
+                )
+                .with_source(error))
+            })
+        })
     }
 }
 
@@ -146,9 +154,9 @@ impl CachingDeleteFileLoader {
 
     /// Initiates loading of all deletes for all the specified tasks
     ///
-    /// Returned future completes once all positional deletes and delete vectors
-    /// have loaded. EQ deletes are not waited for in this method but the returned
-    /// DeleteFilter will await their loading when queried for them.
+    /// Returned future completes once all deletes have loaded or their predicates
+    /// have been sent to the cache. The returned DeleteFilter awaits publication
+    /// of equality delete predicates when queried for them.
     ///
     ///  * Create a single stream of all delete file tasks irrespective of type,
     ///    so that we can respect the combined concurrency limit
@@ -156,9 +164,9 @@ impl CachingDeleteFileLoader {
     ///  * for positional deletes the load phase instantiates an ArrowRecordBatchStream to
     ///    stream the file contents out
     ///  * for eq deletes, we first check if the EQ delete is already loaded or being loaded by
-    ///    another concurrently processing data file scan task. If it is, we skip it.
-    ///    If not, the DeleteFilter is updated to contain a notifier to prevent other data file
-    ///    tasks from starting to load the same equality delete file. We spawn a task to load
+    ///    another concurrently processing data file scan task. We wait for that load,
+    ///    retrying if it is cancelled. Otherwise, the DeleteFilter reserves the file with a
+    ///    notifier to prevent duplicate loads. We load
     ///    the EQ delete's record batch stream, convert it to a predicate, update the delete filter,
     ///    and notify any task that was waiting for it.
     ///  * For a V3 deletion vector, the load phase reads the blob's byte range directly from its
@@ -180,7 +188,7 @@ impl CachingDeleteFileLoader {
     /// ```none
     ///                                          FileScanTaskDeleteFile
     ///                                                     |
-    ///                                             Skip Started EQ Deletes
+    ///                                             Wait for Started EQ Deletes
     ///                                                     |
     ///                                                     |
     ///                                       [load recordbatch stream / puffin]
@@ -302,36 +310,46 @@ impl CachingDeleteFileLoader {
                     return Self::load_deletion_vector(task, basic_delete_file_loader).await;
                 }
 
-                match del_filter.try_start_pos_del_load(&task.file_path) {
-                    PosDelLoadAction::AlreadyLoaded => Ok(DeleteFileContext::ExistingPosDel),
-                    PosDelLoadAction::WaitFor(notified) => {
-                        // Positional deletes are accessed synchronously by ArrowReader.
-                        // We must wait here to ensure the data is ready before returning,
-                        // otherwise ArrowReader might get an empty/partial result.
-                        notified.await;
-                        del_filter.positional_delete_load_result(&task.file_path)?;
-                        Ok(DeleteFileContext::ExistingPosDel)
-                    }
-                    PosDelLoadAction::Failed(error) => Err(error),
-                    PosDelLoadAction::Load(load_guard) => {
-                        let stream = basic_delete_file_loader
-                            .parquet_to_batch_stream(
-                                &task.file_path,
-                                task.file_size_in_bytes,
-                                task.key_metadata.as_deref(),
-                            )
-                            .await;
-                        match stream {
-                            Ok(stream) => Ok(DeleteFileContext::PosDels { load_guard, stream }),
-                            Err(error) => Err(load_guard.fail(error)),
+                loop {
+                    match del_filter.try_start_pos_del_load(&task.file_path) {
+                        PosDelLoadAction::AlreadyLoaded => {
+                            return Ok(DeleteFileContext::ExistingPosDel);
+                        }
+                        PosDelLoadAction::WaitFor(notified) => {
+                            // Re-check after waking: cancellation releases the entry and
+                            // another waiter may have claimed it before we run again.
+                            notified.await;
+                        }
+                        PosDelLoadAction::Failed(error) => return Err(error),
+                        PosDelLoadAction::Load(load_guard) => {
+                            let stream = basic_delete_file_loader
+                                .parquet_to_batch_stream(
+                                    &task.file_path,
+                                    task.file_size_in_bytes,
+                                    task.key_metadata.as_deref(),
+                                )
+                                .await;
+                            return match stream {
+                                Ok(stream) => Ok(DeleteFileContext::PosDels { load_guard, stream }),
+                                Err(error) => Err(load_guard.fail(error)),
+                            };
                         }
                     }
                 }
             }
 
             DataContentType::EqualityDeletes => {
-                let Some(sender) = del_filter.try_start_eq_del_load(&task.file_path) else {
-                    return Ok(DeleteFileContext::ExistingEqDel);
+                let sender = loop {
+                    if let Some(sender) = del_filter.try_start_eq_del_load(&task.file_path) {
+                        break sender;
+                    }
+                    if del_filter
+                        .get_equality_delete_predicate_for_delete_file_path(&task.file_path)
+                        .await?
+                        .is_some()
+                    {
+                        return Ok(DeleteFileContext::ExistingEqDel);
+                    }
                 };
 
                 // Per the Iceberg spec, evolve schema for equality deletes but only for the
@@ -1039,8 +1057,8 @@ mod tests {
 
     #[derive(Debug)]
     struct ReadGate {
-        started: tokio::sync::Notify,
-        release: tokio::sync::Notify,
+        started: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
         dropped: tokio::sync::Notify,
         completed_bytes: AtomicU64,
     }
@@ -1048,8 +1066,8 @@ mod tests {
     impl ReadGate {
         fn new() -> Self {
             Self {
-                started: tokio::sync::Notify::new(),
-                release: tokio::sync::Notify::new(),
+                started: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(0),
                 dropped: tokio::sync::Notify::new(),
                 completed_bytes: AtomicU64::new(0),
             }
@@ -1073,8 +1091,9 @@ mod tests {
     impl crate::io::FileRead for GatedFileRead {
         async fn read(&self, range: std::ops::Range<u64>) -> Result<Bytes> {
             let _guard = ReadDropGuard(Arc::clone(&self.gate));
-            self.gate.started.notify_one();
-            self.gate.release.notified().await;
+            self.gate.started.add_permits(1);
+            // Closing the gate releases this read and all subsequent reads.
+            let _ = self.gate.release.acquire().await;
             let bytes = self.inner.read(range).await?;
             self.gate
                 .completed_bytes
@@ -1083,8 +1102,53 @@ mod tests {
         }
     }
 
+    fn equality_delete_fixture(directory: &TempDir) -> (FileScanTaskDeleteFile, SchemaRef) {
+        let path = setup_write_equality_delete_file_1(directory.path().to_str().unwrap());
+        let delete = FileScanTaskDeleteFile::builder()
+            .with_file_path(path.clone())
+            .with_file_size_in_bytes(std::fs::metadata(&path).unwrap().len())
+            .with_file_type(DataContentType::EqualityDeletes)
+            .with_file_format(DataFileFormat::Parquet)
+            .with_partition_spec_id(0)
+            .with_equality_ids(Some(vec![2, 3]))
+            .build();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(2, "y", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(3, "z", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        (delete, schema)
+    }
+
+    async fn assert_equality_delete_contents(filter: &DeleteFilter, path: &str) {
+        let predicate = filter
+            .get_equality_delete_predicate_for_delete_file_path(path)
+            .await
+            .unwrap()
+            .unwrap();
+        let expected = Reference::new("y")
+            .is_null()
+            .or(Reference::new("y").not_equal_to(Datum::long(1)))
+            .or(
+                Reference::new("z")
+                    .is_null()
+                    .or(Reference::new("z").not_equal_to(Datum::long(100))),
+            )
+            .and(
+                Reference::new("y")
+                    .is_null()
+                    .or(Reference::new("y").not_equal_to(Datum::long(2)))
+                    .or(Reference::new("z").is_not_null()),
+            );
+        assert_eq!(predicate, expected);
+    }
+
     #[tokio::test]
-    async fn test_drop_delete_load_aborts_read_and_wakes_positional_waiters() {
+    async fn test_drop_delete_load_aborts_read_and_releases_positional_claim() {
         let directory = TempDir::new().unwrap();
         let tasks = setup(directory.path());
         let task = &tasks[0];
@@ -1099,49 +1163,51 @@ mod tests {
         let loader = CachingDeleteFileLoader::new(file_io, 2, Runtime::current())
             .with_scan_metrics(metrics.clone());
         let owner = loader.load_deletes(std::slice::from_ref(delete), task.schema_ref());
-        tokio::time::timeout(Duration::from_secs(5), gate.started.notified())
+        tokio::time::timeout(Duration::from_secs(5), gate.started.acquire())
             .await
-            .unwrap();
+            .unwrap()
+            .unwrap()
+            .forget();
         let bytes_before_drop = metrics.bytes_read();
         assert!(bytes_before_drop > 0);
 
-        // Register before aborting to exercise notification of an existing waiter.
+        // Register before aborting, then await only after cancellation has signalled.
         let PosDelLoadAction::WaitFor(notified) = loader
             .delete_filter
             .try_start_pos_del_load(&delete.file_path)
         else {
             panic!("expected an in-progress positional load")
         };
-        let waiter = loader.load_deletes(std::slice::from_ref(delete), task.schema_ref());
         drop(owner);
-        gate.release.notify_one();
         tokio::time::timeout(Duration::from_secs(5), gate.dropped.notified())
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), notified)
             .await
             .unwrap();
-        let error = tokio::time::timeout(Duration::from_secs(5), waiter)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unexpected);
-        assert!(error.retryable());
-        assert!(error.to_string().contains("cancelled"));
-        tokio::task::yield_now().await;
+        gate.release.close();
         assert_eq!(gate.completed_bytes.load(Ordering::SeqCst), 0);
         assert_eq!(metrics.bytes_read(), bytes_before_drop);
+
+        // A fresh load on the same loader reclaims the cancelled entry.
+        let filter = tokio::time::timeout(
+            Duration::from_secs(5),
+            loader.load_deletes(std::slice::from_ref(delete), task.schema_ref()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let vector = filter.get_delete_vector(task).unwrap();
+        assert_eq!(
+            vector.lock().unwrap().iter().collect::<Vec<_>>(),
+            vec![0, 1, 3, 5, 6, 8, 1022, 1023]
+        );
     }
 
     #[tokio::test]
-    async fn test_drop_delete_load_aborts_read_and_wakes_equality_waiters() {
+    async fn test_drop_delete_load_aborts_read_and_releases_equality_claim() {
         let directory = TempDir::new().unwrap();
-        let tasks = setup(directory.path());
-        let task = &tasks[0];
-        let mut delete = task.deletes()[0].clone();
-        delete.file_type = DataContentType::EqualityDeletes;
-        delete.equality_ids = Some(vec![1]);
+        let (delete, schema) = equality_delete_fixture(&directory);
         let gate = Arc::new(ReadGate::new());
         let file_io = crate::io::FileIOBuilder::new(Arc::new(MetadataCountingStorageFactory {
             read_gate: Some(Arc::clone(&gate)),
@@ -1151,39 +1217,148 @@ mod tests {
         let metrics = ScanMetrics::new();
         let loader = CachingDeleteFileLoader::new(file_io, 2, Runtime::current())
             .with_scan_metrics(metrics.clone());
-        let owner = loader.load_deletes(std::slice::from_ref(&delete), task.schema_ref());
-        tokio::time::timeout(Duration::from_secs(5), gate.started.notified())
+        let owner = loader.load_deletes(std::slice::from_ref(&delete), schema.clone());
+        tokio::time::timeout(Duration::from_secs(5), gate.started.acquire())
             .await
-            .unwrap();
+            .unwrap()
+            .unwrap()
+            .forget();
         let bytes_before_drop = metrics.bytes_read();
         assert!(bytes_before_drop > 0);
-        let filter = tokio::time::timeout(
-            Duration::from_secs(5),
-            loader.load_deletes(std::slice::from_ref(&delete), task.schema_ref()),
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-        let mut waiter =
-            Box::pin(filter.get_equality_delete_predicate_for_delete_file_path(&delete.file_path));
+        let mut waiter = Box::pin(
+            loader
+                .delete_filter
+                .get_equality_delete_predicate_for_delete_file_path(&delete.file_path),
+        );
         assert!(futures::poll!(&mut waiter).is_pending());
 
         drop(owner);
-        gate.release.notify_one();
         tokio::time::timeout(Duration::from_secs(5), gate.dropped.notified())
             .await
             .unwrap();
-        let error = tokio::time::timeout(Duration::from_secs(5), waiter)
+        let predicate = tokio::time::timeout(Duration::from_secs(5), waiter)
             .await
             .unwrap()
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unexpected);
-        assert!(error.retryable());
-        assert!(error.to_string().contains("cancelled"));
-        tokio::task::yield_now().await;
+            .unwrap();
+        assert!(predicate.is_none());
+        gate.release.close();
         assert_eq!(gate.completed_bytes.load(Ordering::SeqCst), 0);
         assert_eq!(metrics.bytes_read(), bytes_before_drop);
+
+        let filter = tokio::time::timeout(
+            Duration::from_secs(5),
+            loader.load_deletes(std::slice::from_ref(&delete), schema),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_equality_delete_contents(&filter, &delete.file_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_shared_delete_load_survives_owner_cancellation() {
+        let directory = TempDir::new().unwrap();
+        let tasks = setup(directory.path());
+        let task = &tasks[0];
+        let (equality_delete, schema) = equality_delete_fixture(&directory);
+        let deletes = vec![task.deletes()[0].clone(), equality_delete.clone()];
+        let gate = Arc::new(ReadGate::new());
+        let file_io = crate::io::FileIOBuilder::new(Arc::new(MetadataCountingStorageFactory {
+            read_gate: Some(Arc::clone(&gate)),
+            ..Default::default()
+        }))
+        .build();
+        let loader = CachingDeleteFileLoader::new(file_io, 2, Runtime::current());
+        let owner = loader.load_deletes(&deletes, schema.clone());
+        tokio::time::timeout(Duration::from_secs(5), gate.started.acquire_many(2))
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let waiter = loader.load_deletes(&deletes, schema);
+        drop(owner);
+        gate.release.close();
+        let filter = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        let vector = filter.get_delete_vector(task).unwrap();
+        assert_eq!(
+            vector.lock().unwrap().iter().collect::<Vec<_>>(),
+            vec![0, 1, 3, 5, 6, 8, 1022, 1023]
+        );
+        assert_equality_delete_contents(&filter, &equality_delete.file_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_registered_waiters_follow_reclaimed_loads() {
+        let directory = TempDir::new().unwrap();
+        let tasks = setup(directory.path());
+        let task = &tasks[0];
+        let delete = &task.deletes()[0];
+        let loader = CachingDeleteFileLoader::new(FileIO::new_with_fs(), 2, Runtime::current());
+        let filter = &loader.delete_filter;
+        let PosDelLoadAction::Load(owner) = filter.try_start_pos_del_load(&delete.file_path) else {
+            panic!("expected positional load ownership")
+        };
+        let mut waiter = Box::pin(CachingDeleteFileLoader::load_file_for_task(
+            delete,
+            loader.basic_delete_file_loader.clone(),
+            filter.clone(),
+            task.schema_ref(),
+        ));
+        assert!(futures::poll!(&mut waiter).is_pending());
+        drop(owner);
+        let PosDelLoadAction::Load(replacement) = filter.try_start_pos_del_load(&delete.file_path)
+        else {
+            panic!("expected positional claim to be released")
+        };
+        // Wake from the old generation, then wait for the replacement instead of spinning.
+        assert!(futures::poll!(&mut waiter).is_pending());
+        replacement.finish();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), waiter).await,
+            Ok(Ok(DeleteFileContext::ExistingPosDel))
+        ));
+
+        let (delete, schema) = equality_delete_fixture(&directory);
+        let owner = filter.try_start_eq_del_load(&delete.file_path).unwrap();
+        let mut waiter = Box::pin(CachingDeleteFileLoader::load_file_for_task(
+            &delete,
+            loader.basic_delete_file_loader.clone(),
+            filter.clone(),
+            schema,
+        ));
+        assert!(futures::poll!(&mut waiter).is_pending());
+        drop(owner);
+        assert!(
+            filter
+                .get_equality_delete_predicate_for_delete_file_path(&delete.file_path)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let replacement = filter.try_start_eq_del_load(&delete.file_path).unwrap();
+        assert!(futures::poll!(&mut waiter).is_pending());
+        replacement.send(Ok(AlwaysTrue)).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), waiter).await,
+            Ok(Ok(DeleteFileContext::ExistingEqDel))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_delete_load_closed_channel_returns_error() {
+        let (sender, receiver) = channel();
+        let task = Runtime::current().io().spawn(async {});
+        drop(sender);
+        let error = DeleteLoad { receiver, task }.await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(
+            error
+                .to_string()
+                .contains("Delete loading stopped before completing")
+        );
     }
 
     #[tokio::test]
@@ -1201,7 +1376,6 @@ mod tests {
                 loader.load_deletes(std::slice::from_ref(&delete), task.schema_ref()),
             )
             .await
-            .unwrap()
             .unwrap()
             .unwrap_err();
             if let Some((kind, retryable)) = first {
@@ -1240,7 +1414,9 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), waiter)
             .await
             .unwrap();
-        let error = filter.positional_delete_load_result(path).unwrap_err();
+        let PosDelLoadAction::Failed(error) = filter.try_start_pos_del_load(path) else {
+            panic!("expected cached parse failure")
+        };
         assert_eq!(error.kind(), ErrorKind::DataInvalid);
         assert!(error.retryable());
         assert!(
@@ -1265,7 +1441,6 @@ mod tests {
                 loader.load_deletes(std::slice::from_ref(&delete), task.schema_ref()),
             )
             .await
-            .unwrap()
             .unwrap()
             .unwrap_err();
             assert_eq!(error.kind(), ErrorKind::DataInvalid);
@@ -1706,7 +1881,6 @@ mod tests {
                 file_scan_tasks[0].schema_ref(),
             )
             .await
-            .unwrap()
             .unwrap();
 
         let result = delete_filter
@@ -1859,7 +2033,6 @@ mod tests {
         let known = CachingDeleteFileLoader::new(file_io.clone(), 10, Runtime::current())
             .load_deletes(task.deletes(), task.schema_ref())
             .await
-            .unwrap()
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
@@ -1869,13 +2042,11 @@ mod tests {
         let lazy = loader
             .load_deletes(&unknown, task.schema_ref())
             .await
-            .unwrap()
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), unknown.len());
         loader
             .load_deletes(&unknown[1..], task.schema_ref())
             .await
-            .unwrap()
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), unknown.len());
 
@@ -1940,7 +2111,6 @@ mod tests {
             .load_deletes(known_task.deletes(), known_task.schema_ref())
             .await
             .unwrap()
-            .unwrap()
             .build_equality_delete_predicate(&known_task)
             .await
             .unwrap();
@@ -1955,7 +2125,6 @@ mod tests {
             let predicate = loader
                 .load_deletes(task.deletes(), task.schema_ref())
                 .await
-                .unwrap()
                 .unwrap()
                 .build_equality_delete_predicate(&task)
                 .await
@@ -1985,9 +2154,7 @@ mod tests {
         let error = CachingDeleteFileLoader::new(FileIO::new_with_fs(), 10, Runtime::current())
             .load_deletes(&[missing], task.schema_ref())
             .await
-            .unwrap()
-            .err()
-            .unwrap();
+            .unwrap_err();
         assert!(
             error.to_string().contains("Failed to stat delete file"),
             "{error}"
@@ -2003,9 +2170,7 @@ mod tests {
         let error = CachingDeleteFileLoader::new(file_io, 10, Runtime::current())
             .load_deletes(&[present], task.schema_ref())
             .await
-            .unwrap()
-            .err()
-            .unwrap();
+            .unwrap_err();
         assert!(
             error.to_string().contains("Failed to stat delete file"),
             "{error}"
@@ -2361,7 +2526,6 @@ mod tests {
         let delete_filter = delete_file_loader
             .load_deletes(file_scan_task.deletes(), file_scan_task.schema_ref())
             .await
-            .unwrap()
             .unwrap();
 
         // Verify both delete types can be processed together
@@ -2441,7 +2605,6 @@ mod tests {
                 file_scan_tasks[0].schema_ref(),
             )
             .await
-            .unwrap()
             .unwrap();
 
         // Load deletes for the second time (same task/files)
@@ -2451,7 +2614,6 @@ mod tests {
                 file_scan_tasks[0].schema_ref(),
             )
             .await
-            .unwrap()
             .unwrap();
 
         let dv1 = delete_filter_1
@@ -2528,7 +2690,7 @@ mod tests {
         );
 
         let loader = CachingDeleteFileLoader::new(file_io, 10, Runtime::current());
-        let delete_filter = loader.load_deletes(&[dv], schema).await.unwrap().unwrap();
+        let delete_filter = loader.load_deletes(&[dv], schema).await.unwrap();
 
         let delete_vector = delete_filter
             .get_delete_vector_for_path(&data_file_path)
@@ -2584,7 +2746,7 @@ mod tests {
         );
 
         let loader = CachingDeleteFileLoader::new(file_io, 10, Runtime::current());
-        let delete_filter = loader.load_deletes(&[dv], schema).await.unwrap().unwrap();
+        let delete_filter = loader.load_deletes(&[dv], schema).await.unwrap();
 
         let delete_vector = delete_filter
             .get_delete_vector_for_path(&data_file_path)
@@ -2629,7 +2791,6 @@ mod tests {
         let err = loader
             .load_deletes(&[dv], schema)
             .await
-            .unwrap()
             .unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::DataInvalid);

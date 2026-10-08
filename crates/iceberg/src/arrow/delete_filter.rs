@@ -81,7 +81,7 @@ pub(crate) enum PosDelLoadAction {
 }
 
 /// Owns a positional-delete load through opening, parsing and publishing its vectors.
-/// Dropping an unfinished load must release waiters with an error, including cancellation.
+/// Dropping an unfinished load releases its claim so waiters can retry.
 pub(crate) struct PosDelLoadGuard {
     filter: DeleteFilter,
     file_path: String,
@@ -106,16 +106,7 @@ impl PosDelLoadGuard {
 impl Drop for PosDelLoadGuard {
     fn drop(&mut self) {
         if !self.finished {
-            self.filter.fail_pos_del_load(
-                &self.file_path,
-                Arc::new(
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        "Positional delete loading was cancelled before completion",
-                    )
-                    .with_retryable(true),
-                ),
-            );
+            self.filter.cancel_pos_del_load(&self.file_path);
         }
     }
 }
@@ -149,7 +140,7 @@ impl DeleteFilter {
     }
 
     /// Atomically reserves a cache entry and its sole completion channel.
-    /// Returning the sender transfers ownership of the load; dropping it publishes cancellation.
+    /// Returning the sender transfers ownership of the load; dropping it releases the claim.
     pub(crate) fn try_start_eq_del_load(&self, file_path: &str) -> Option<Sender<EqDelLoadResult>> {
         let (notify, sender, receiver) = {
             let mut state = self.state.write().unwrap();
@@ -168,17 +159,17 @@ impl DeleteFilter {
         let delete_file_path = file_path.to_string();
         self.runtime.cpu().spawn(async move {
             let result = match receiver.await {
-                Ok(Ok(predicate)) => EqDelState::Loaded(predicate),
-                Ok(Err(error)) => EqDelState::Failed(error),
-                Err(error) => EqDelState::Failed(Arc::new(Error::new(
-                    ErrorKind::Unexpected, "Equality delete loading failed or was cancelled before delivering its predicate",
-                ).with_retryable(true).with_source(error))),
+                Ok(Ok(predicate)) => Some(EqDelState::Loaded(predicate)),
+                Ok(Err(error)) => Some(EqDelState::Failed(error)),
+                Err(_) => None,
             };
             {
                 let mut state = state.write().unwrap();
-                state
-                    .equality_deletes
-                    .insert(delete_file_path, result);
+                if let Some(result) = result {
+                    state.equality_deletes.insert(delete_file_path, result);
+                } else {
+                    state.equality_deletes.remove(&delete_file_path);
+                }
             }
             notify.notify_waiters();
         });
@@ -240,15 +231,15 @@ impl DeleteFilter {
         notify.notify_waiters();
     }
 
-    pub(crate) fn positional_delete_load_result(&self, file_path: &str) -> Result<()> {
-        match self.state.read().unwrap().positional_deletes.get(file_path) {
-            Some(PosDelState::Loaded) => Ok(()),
-            Some(PosDelState::Failed(error)) => Err(Self::cached_load_error(file_path, error)),
-            _ => Err(Error::new(
-                ErrorKind::Unexpected,
-                "Positional delete loading did not complete",
-            )),
-        }
+    fn cancel_pos_del_load(&self, file_path: &str) {
+        let notify = {
+            let mut state = self.state.write().unwrap();
+            match state.positional_deletes.remove(file_path) {
+                Some(PosDelState::Loading(notify)) => notify,
+                _ => return,
+            }
+        };
+        notify.notify_waiters();
     }
 
     /// Marks a positional delete file as successfully loaded and notifies any waiting tasks.
@@ -275,30 +266,26 @@ impl DeleteFilter {
         &self,
         file_path: &str,
     ) -> Result<Option<Predicate>> {
-        // Build the `Notified` while holding the read lock. `notified_owned()` records tokio's
-        // `notify_waiters_calls` counter at construction and completes on first poll if that
-        // counter has since advanced. Reading the counter under the lock guarantees it is taken
-        // before the completion task can advance it via `notify_waiters()`, so the
-        // notification is never missed even though we `.await` after releasing the lock.
-        let notified = {
-            match self.state.read().unwrap().equality_deletes.get(file_path) {
-                None => return Ok(None),
-                Some(EqDelState::Loading(notifier)) => notifier.clone().notified_owned(),
-                Some(EqDelState::Loaded(predicate)) => {
-                    return Ok(Some(predicate.clone()));
+        loop {
+            // Construct `Notified` under the state lock, before the loader can change the
+            // entry and call `notify_waiters()`. It records the notification counter even
+            // before its first poll, so completion or cancellation cannot be missed.
+            let notified = {
+                match self.state.read().unwrap().equality_deletes.get(file_path) {
+                    None => return Ok(None),
+                    Some(EqDelState::Loading(notifier)) => notifier.clone().notified_owned(),
+                    Some(EqDelState::Loaded(predicate)) => {
+                        return Ok(Some(predicate.clone()));
+                    }
+                    Some(EqDelState::Failed(error)) => {
+                        return Err(Self::cached_load_error(file_path, error));
+                    }
                 }
-                Some(EqDelState::Failed(error)) => {
-                    return Err(Self::cached_load_error(file_path, error));
-                }
-            }
-        };
+            };
 
-        notified.await;
-
-        match self.state.read().unwrap().equality_deletes.get(file_path) {
-            Some(EqDelState::Loaded(predicate)) => Ok(Some(predicate.clone())),
-            Some(EqDelState::Failed(error)) => Err(Self::cached_load_error(file_path, error)),
-            _ => unreachable!("Cannot be any other state than loaded"),
+            // A cancelled owner releases the entry. Re-check in case another waiter has
+            // already claimed it; otherwise return None so the caller can claim it.
+            notified.await;
         }
     }
 
@@ -427,29 +414,30 @@ pub(crate) mod tests {
             assert_eq!(error.kind(), ErrorKind::DataInvalid);
             assert!(error.retryable());
             assert!(error.to_string().contains("injected equality failure"));
+            assert!(filter.try_start_eq_del_load(path).is_none());
         }
     }
 
     #[tokio::test]
-    async fn test_cancelled_eq_load_returns_error_instead_of_hanging() {
+    async fn test_cancelled_eq_load_releases_claim_instead_of_hanging() {
         let filter = DeleteFilter::new(Runtime::current());
         let sender = filter
             .try_start_eq_del_load("cancelled-eq.parquet")
             .unwrap();
         drop(sender);
-        let error = tokio::time::timeout(
+        let predicate = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             filter.get_equality_delete_predicate_for_delete_file_path("cancelled-eq.parquet"),
         )
         .await
         .unwrap()
-        .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unexpected);
-        assert!(error.retryable());
+        .unwrap();
+        assert!(predicate.is_none());
+        assert!(filter.try_start_eq_del_load("cancelled-eq.parquet").is_some());
     }
 
     #[tokio::test]
-    async fn test_cancelled_pos_load_releases_every_waiter_with_error() {
+    async fn test_cancelled_pos_load_releases_every_waiter_and_claim() {
         let filter = DeleteFilter::new(Runtime::current());
         let path = "cancelled-pos.parquet";
         let PosDelLoadAction::Load(guard) = filter.try_start_pos_del_load(path) else {
@@ -467,11 +455,10 @@ pub(crate) mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
                 .await
                 .unwrap();
-            assert!(filter.positional_delete_load_result(path).is_err());
         }
         assert!(matches!(
             filter.try_start_pos_del_load(path),
-            PosDelLoadAction::Failed(_)
+            PosDelLoadAction::Load(_)
         ));
     }
 
@@ -523,7 +510,6 @@ pub(crate) mod tests {
                 file_scan_tasks[0].schema_ref(),
             )
             .await
-            .unwrap()
             .unwrap();
 
         let result = delete_filter
@@ -537,7 +523,6 @@ pub(crate) mod tests {
                 file_scan_tasks[1].schema_ref(),
             )
             .await
-            .unwrap()
             .unwrap();
 
         let result = delete_filter
