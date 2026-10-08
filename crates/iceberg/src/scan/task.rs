@@ -56,12 +56,6 @@ pub struct FileScanTaskMetrics {
     pub(crate) upper_bounds: HashMap<i32, Datum>,
 }
 
-impl From<&DataFile> for FileScanTaskMetrics {
-    fn from(file: &DataFile) -> Self {
-        Self::from_data_file(file, &ColumnStatsSelection::All)
-    }
-}
-
 impl FileScanTaskMetrics {
     /// Creates whole-file statistics keyed by Iceberg field ID. Value counts
     /// include nulls and NaNs; bounds are inclusive.
@@ -799,7 +793,6 @@ mod tests {
             .unwrap();
 
         let all = FileScanTaskMetrics::from_data_file(&file, &ColumnStatsSelection::All);
-        assert_eq!(all, FileScanTaskMetrics::from(&file));
         assert_eq!(all.lower_bounds.len(), 2);
 
         let selected = FileScanTaskMetrics::from_data_file(

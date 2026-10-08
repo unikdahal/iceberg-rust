@@ -1423,8 +1423,6 @@ impl core::clone::Clone for iceberg::scan::FileScanTaskMetrics
 pub fn iceberg::scan::FileScanTaskMetrics::clone(&self) -> iceberg::scan::FileScanTaskMetrics
 impl core::cmp::PartialEq for iceberg::scan::FileScanTaskMetrics
 pub fn iceberg::scan::FileScanTaskMetrics::eq(&self, other: &iceberg::scan::FileScanTaskMetrics) -> bool
-impl core::convert::From<&iceberg::spec::DataFile> for iceberg::scan::FileScanTaskMetrics
-pub fn iceberg::scan::FileScanTaskMetrics::from(file: &iceberg::spec::DataFile) -> Self
 impl core::default::Default for iceberg::scan::FileScanTaskMetrics
 pub fn iceberg::scan::FileScanTaskMetrics::default() -> iceberg::scan::FileScanTaskMetrics
 impl core::fmt::Debug for iceberg::scan::FileScanTaskMetrics
@@ -1462,8 +1460,6 @@ pub fn iceberg::scan::TableScan::fmt(&self, f: &mut core::fmt::Formatter<'_>) ->
 pub struct iceberg::scan::TableScanBuilder<'a>
 impl<'a> iceberg::scan::TableScanBuilder<'a>
 pub fn iceberg::scan::TableScanBuilder<'a>::build(self) -> iceberg::Result<iceberg::scan::TableScan>
-pub fn iceberg::scan::TableScanBuilder<'a>::include_column_stats(self) -> Self
-pub fn iceberg::scan::TableScanBuilder<'a>::include_column_stats_for(self, column_names: impl core::iter::traits::collect::IntoIterator<Item = impl core::convert::Into<alloc::string::String>>) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select(self, column_names: impl core::iter::traits::collect::IntoIterator<Item = impl alloc::string::ToString>) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select_all(self) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select_empty(self) -> Self
@@ -2007,8 +2003,6 @@ pub fn iceberg::spec::DataFile::clone(&self) -> iceberg::spec::DataFile
 impl core::cmp::Eq for iceberg::spec::DataFile
 impl core::cmp::PartialEq for iceberg::spec::DataFile
 pub fn iceberg::spec::DataFile::eq(&self, other: &iceberg::spec::DataFile) -> bool
-impl core::convert::From<&iceberg::spec::DataFile> for iceberg::scan::FileScanTaskMetrics
-pub fn iceberg::scan::FileScanTaskMetrics::from(file: &iceberg::spec::DataFile) -> Self
 impl core::fmt::Debug for iceberg::spec::DataFile
 pub fn iceberg::spec::DataFile::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for iceberg::spec::DataFile
