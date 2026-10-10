@@ -696,8 +696,8 @@ impl CachingDeleteFileLoader {
             // Every requested equality id must resolve to a primitive column of the delete
             // file's schema. If a key silently dropped out of the batch (for example a column
             // removed by schema evolution, or a zero-column batch), the built predicate would
-            // omit that key and could keep rows the delete file actually matches. Fail closed
-            // instead of under-deleting.
+            // omit that key and could delete rows that do not match the complete tuple.
+            // An entirely missing key set could instead skip deletes. Fail closed in both cases.
             let missing = processor.missing_equality_ids();
             if !missing.is_empty() {
                 return Err(invalid_data!(
@@ -1825,7 +1825,7 @@ mod tests {
     }
 
     // A requested equality id absent from the delete file's schema must fail closed: dropping
-    // it from the projection would omit the key and keep rows the delete file actually matches.
+    // it from the projection would match only a partial tuple and could delete unrelated rows.
     #[tokio::test]
     async fn test_parse_equality_deletes_rejects_partially_missing_key() {
         let schema = Arc::new(arrow_schema::Schema::new(vec![simple_field(
@@ -1884,7 +1884,7 @@ mod tests {
     // set, so it must error rather than collapse to `AlwaysTrue`.
     #[tokio::test]
     async fn test_parse_equality_deletes_rejects_zero_column_batch() {
-        let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::empty()), vec![]).unwrap();
+        let batch = RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty()));
         assert_eq!(batch.num_columns(), 0);
         let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
 
