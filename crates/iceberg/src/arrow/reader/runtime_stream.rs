@@ -374,9 +374,11 @@ impl RuntimePrunedStream {
             if let Some(probe) = &self.probe {
                 probe.rebuilds.fetch_add(1, Ordering::Relaxed);
             }
-            if self.probe.as_ref().is_some_and(|probe| {
-                probe.take_failure(test_support::Stage::IntoBuilder)
-            }) {
+            if self
+                .probe
+                .as_ref()
+                .is_some_and(|probe| probe.take_failure(test_support::Stage::IntoBuilder))
+            {
                 // A finished decoder exercises parquet's actual
                 // into_builder error after ownership was taken.
                 let mut finished = decoder
@@ -397,9 +399,11 @@ impl RuntimePrunedStream {
             .with_row_group_selections(selections)
             .with_row_filter(row_filter);
         #[cfg(test)]
-        let builder = if self.probe.as_ref().is_some_and(|probe| {
-            probe.take_failure(test_support::Stage::Build)
-        }) {
+        let builder = if self
+            .probe
+            .as_ref()
+            .is_some_and(|probe| probe.take_failure(test_support::Stage::Build))
+        {
             // Conflicting plans exercise parquet's actual build error.
             builder.with_row_groups(vec![0])
         } else {
@@ -459,7 +463,7 @@ impl RuntimePrunedStream {
 #[cfg(test)]
 pub(super) mod test_support {
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, OnceLock, Weak};
 
     #[derive(Clone, Copy)]
@@ -480,28 +484,21 @@ pub(super) mod test_support {
     }
 
     fn registry() -> &'static Mutex<HashMap<String, Weak<Probe>>> {
-        static REGISTRY: OnceLock<
-            Mutex<HashMap<String, Weak<Probe>>>,
-        > = OnceLock::new();
+        static REGISTRY: OnceLock<Mutex<HashMap<String, Weak<Probe>>>> = OnceLock::new();
         REGISTRY.get_or_init(Mutex::default)
     }
 
     impl Probe {
-        pub(in crate::arrow::reader) fn register(
-            path: &str,
-        ) -> Arc<Self> {
+        pub(in crate::arrow::reader) fn register(path: &str) -> Arc<Self> {
             let probe = Arc::new(Self::default());
-            registry().lock().unwrap().insert(
-                path.to_owned(),
-                Arc::downgrade(&probe),
-            );
+            registry()
+                .lock()
+                .unwrap()
+                .insert(path.to_owned(), Arc::downgrade(&probe));
             probe
         }
 
-        pub(in crate::arrow::reader) fn fail_at(
-            &self,
-            stage: Stage,
-        ) {
+        pub(in crate::arrow::reader) fn fail_at(&self, stage: Stage) {
             self.failure.store(stage as u8, Ordering::Relaxed);
         }
 
@@ -526,20 +523,12 @@ pub(super) mod test_support {
 
         pub(super) fn take_failure(&self, stage: Stage) -> bool {
             self.failure
-                .compare_exchange(
-                    stage as u8,
-                    0,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
+                .compare_exchange(stage as u8, 0, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         }
     }
 
-    pub(super) fn find(
-        path: &str,
-        disabled: Arc<AtomicBool>,
-    ) -> Option<Arc<Probe>> {
+    pub(super) fn find(path: &str, disabled: Arc<AtomicBool>) -> Option<Arc<Probe>> {
         let mut registry = registry().lock().unwrap();
         registry.retain(|_, probe| probe.strong_count() > 0);
         let probe = registry.get(path)?.upgrade()?;

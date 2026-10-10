@@ -175,12 +175,10 @@ impl<'a> PageIndexEvaluator<'a> {
             .column(parquet_column_index)
             .column_descr();
         if column_descriptor.converted_type() == parquet::basic::ConvertedType::UINT_32
-            || column_descriptor
-                .logical_type_ref()
-                .is_some_and(|logical| {
-                    matches!(logical, parquet::basic::LogicalType::Integer(integer)
+            || column_descriptor.logical_type_ref().is_some_and(|logical| {
+                matches!(logical, parquet::basic::LogicalType::Integer(integer)
                     if !integer.is_signed && integer.bit_width == 32)
-                })
+            })
         {
             return self.select_all_rows();
         }
@@ -1026,16 +1024,13 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, Decimal128Array, FixedSizeBinaryArray,
-        Float32Array, Float64Array, Int32Array, Int64Array,
-        LargeBinaryArray, RecordBatch, StringArray,
-        UInt32Array,
+        ArrayRef, Decimal128Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int32Array,
+        Int64Array, LargeBinaryArray, RecordBatch, StringArray, UInt32Array,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use parquet::arrow::ArrowWriter;
     use parquet::arrow::arrow_reader::{
-        ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
-        RowSelector,
+        ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelector,
     };
     use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData};
     use parquet::file::properties::WriterProperties;
@@ -1045,9 +1040,7 @@ mod tests {
     use super::PageIndexEvaluator;
     use crate::expr::{Bind, Predicate, Reference};
     use crate::spec::decimal_utils::decimal_from_i128_with_scale;
-    use crate::spec::{
-        Datum, NestedField, PrimitiveType, Schema, Type,
-    };
+    use crate::spec::{Datum, NestedField, PrimitiveType, Schema, Type};
     use crate::{ErrorKind, Result};
 
     fn check_numeric_page_selections(
@@ -1055,13 +1048,11 @@ mod tests {
         field_type: PrimitiveType,
         cases: Vec<(Predicate, Vec<RowSelector>)>,
     ) -> Result<()> {
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new(
-                "value",
-                values.data_type().clone(),
-                false,
-            ),
-        ]));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "value",
+            values.data_type().clone(),
+            false,
+        )]));
         let temp_file = NamedTempFile::new().unwrap();
         let props = WriterProperties::builder()
             .set_data_page_row_count_limit(1024)
@@ -1072,30 +1063,19 @@ mod tests {
             arrow_schema.clone(),
             Some(props),
         )?;
-        let batch = RecordBatch::try_new(
-            arrow_schema,
-            vec![values],
-        )?;
+        let batch = RecordBatch::try_new(arrow_schema, vec![values])?;
         for row in 0..batch.num_rows() {
             writer.write(&batch.slice(row, 1))?;
         }
         writer.close()?;
 
-        let options = ArrowReaderOptions::new()
-            .with_page_index_policy(
-                PageIndexPolicy::Required,
-            );
-        let reader =
-            ParquetRecordBatchReaderBuilder::try_new_with_options(
-                temp_file.reopen().unwrap(),
-                options,
-            )?;
-        let (column_index, offset_index, row_group) =
-            get_test_metadata(reader.metadata());
-        assert_eq!(
-            offset_index[0].page_locations().len(),
-            3,
-        );
+        let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
+        let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            temp_file.reopen().unwrap(),
+            options,
+        )?;
+        let (column_index, offset_index, row_group) = get_test_metadata(reader.metadata());
+        assert_eq!(offset_index[0].page_locations().len(), 3,);
         let schema = Arc::new(
             Schema::builder()
                 .with_fields([Arc::new(NestedField::new(
@@ -1108,8 +1088,7 @@ mod tests {
         );
         let field_id_map = HashMap::from_iter([(1, 0)]);
         for (predicate, expected) in cases {
-            let filter =
-                predicate.bind(schema.clone(), false)?;
+            let filter = predicate.bind(schema.clone(), false)?;
             let actual = PageIndexEvaluator::eval(
                 &filter,
                 &column_index,
@@ -1124,93 +1103,64 @@ mod tests {
     }
 
     #[test]
-    fn eval_float_page_bounds_widen_for_double_column()
-    -> Result<()> {
+    fn eval_float_page_bounds_widen_for_double_column() -> Result<()> {
         let values = [1.0_f32, 2.0, 3.0]
             .into_iter()
-            .flat_map(|value| {
-                std::iter::repeat_n(value, 1024)
-            })
+            .flat_map(|value| std::iter::repeat_n(value, 1024))
             .collect::<Vec<_>>();
         check_numeric_page_selections(
             Arc::new(Float32Array::from(values)),
             PrimitiveType::Double,
             vec![
-                (
-                    Reference::new("value")
-                        .less_than(Datum::double(1.5)),
-                    vec![
-                        RowSelector::select(1024),
-                        RowSelector::skip(2048),
-                    ],
-                ),
-                (
-                    Reference::new("value")
-                        .is_in([Datum::double(3.0)]),
-                    vec![
-                        RowSelector::skip(2048),
-                        RowSelector::select(1024),
-                    ],
-                ),
+                (Reference::new("value").less_than(Datum::double(1.5)), vec![
+                    RowSelector::select(1024),
+                    RowSelector::skip(2048),
+                ]),
+                (Reference::new("value").is_in([Datum::double(3.0)]), vec![
+                    RowSelector::skip(2048),
+                    RowSelector::select(1024),
+                ]),
             ],
         )
     }
 
     #[test]
-    fn eval_int32_page_bounds_widen_for_long_column()
-    -> Result<()> {
+    fn eval_int32_page_bounds_widen_for_long_column() -> Result<()> {
         let values = [1, 6, i32::MAX]
             .into_iter()
-            .flat_map(|value| {
-                std::iter::repeat_n(value, 1024)
-            })
+            .flat_map(|value| std::iter::repeat_n(value, 1024))
             .collect::<Vec<_>>();
         check_numeric_page_selections(
             Arc::new(Int32Array::from(values)),
             PrimitiveType::Long,
             vec![
                 (
-                    Reference::new("value").greater_than(
-                        Datum::long(i64::from(i32::MAX)),
-                    ),
+                    Reference::new("value").greater_than(Datum::long(i64::from(i32::MAX))),
                     vec![RowSelector::skip(3072)],
                 ),
                 (
-                    Reference::new("value")
-                        .less_than_or_equal_to(
-                            Datum::long(5),
-                        ),
-                    vec![
-                        RowSelector::select(1024),
-                        RowSelector::skip(2048),
-                    ],
+                    Reference::new("value").less_than_or_equal_to(Datum::long(5)),
+                    vec![RowSelector::select(1024), RowSelector::skip(2048)],
                 ),
             ],
         )
     }
 
     #[test]
-    fn eval_uint32_page_index_selects_all_rows()
-    -> Result<()> {
+    fn eval_uint32_page_index_selects_all_rows() -> Result<()> {
         let values = [1, i32::MAX as u32 + 1, u32::MAX]
             .into_iter()
-            .flat_map(|value| {
-                std::iter::repeat_n(value, 1024)
-            })
+            .flat_map(|value| std::iter::repeat_n(value, 1024))
             .collect::<Vec<_>>();
         check_numeric_page_selections(
             Arc::new(UInt32Array::from(values)),
             PrimitiveType::Long,
             vec![
+                (Reference::new("value").less_than(Datum::long(10)), vec![
+                    RowSelector::select(3072),
+                ]),
                 (
-                    Reference::new("value")
-                        .less_than(Datum::long(10)),
-                    vec![RowSelector::select(3072)],
-                ),
-                (
-                    Reference::new("value").is_in([
-                        Datum::long(i64::from(u32::MAX)),
-                    ]),
+                    Reference::new("value").is_in([Datum::long(i64::from(u32::MAX))]),
                     vec![RowSelector::select(3072)],
                 ),
             ],
@@ -1218,37 +1168,29 @@ mod tests {
     }
 
     #[test]
-    fn eval_incompatible_physical_page_index_selects_all_rows()
-    -> Result<()> {
+    fn eval_incompatible_physical_page_index_selects_all_rows() -> Result<()> {
         let double_values = [1.0_f64, 2.0, 3.0]
             .into_iter()
-            .flat_map(|value| {
-                std::iter::repeat_n(value, 1024)
-            })
+            .flat_map(|value| std::iter::repeat_n(value, 1024))
             .collect::<Vec<_>>();
         check_numeric_page_selections(
             Arc::new(Float64Array::from(double_values)),
             PrimitiveType::Float,
             vec![(
-                Reference::new("value")
-                    .greater_than(Datum::float(10.0)),
+                Reference::new("value").greater_than(Datum::float(10.0_f32)),
                 vec![RowSelector::select(3072)],
             )],
         )?;
         let long_values = [1_i64, 2, 3]
             .into_iter()
-            .flat_map(|value| {
-                std::iter::repeat_n(value, 1024)
-            })
+            .flat_map(|value| std::iter::repeat_n(value, 1024))
             .collect::<Vec<_>>();
         check_numeric_page_selections(
             Arc::new(Int64Array::from(long_values)),
             PrimitiveType::Int,
-            vec![(
-                Reference::new("value")
-                    .greater_than(Datum::int(10)),
-                vec![RowSelector::select(3072)],
-            )],
+            vec![(Reference::new("value").greater_than(Datum::int(10)), vec![
+                RowSelector::select(3072),
+            ])],
         )
     }
 

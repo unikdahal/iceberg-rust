@@ -2344,8 +2344,7 @@ mod tests {
     }
 
     #[test]
-    fn arrow_decimal32_64_256_convert_to_iceberg_decimal()
-    -> Result<()> {
+    fn arrow_decimal32_64_256_convert_to_iceberg_decimal() -> Result<()> {
         let cases = [
             (DataType::Decimal32(8, 2), 8),
             (DataType::Decimal64(15, 2), 15),
@@ -2353,14 +2352,12 @@ mod tests {
             (DataType::Decimal256(38, 2), 38),
         ];
         for (arrow_type, precision) in cases {
-            let arrow_schema = ArrowSchema::new(vec![
-                simple_field(
-                    "decimal",
-                    arrow_type.clone(),
-                    false,
-                    "1",
-                ),
-            ]);
+            let arrow_schema = ArrowSchema::new(vec![simple_field(
+                "decimal",
+                arrow_type.clone(),
+                false,
+                "1",
+            )]);
             let decimal_type = Type::decimal(precision, 2)?;
             let expected = Schema::builder()
                 .with_fields([Arc::new(NestedField::required(
@@ -2369,35 +2366,20 @@ mod tests {
                     decimal_type.clone(),
                 ))])
                 .build()?;
+            assert_eq!(arrow_schema_to_schema(&arrow_schema)?, expected,);
+            assert_eq!(arrow_type_to_type(&arrow_type)?, decimal_type,);
+            let without_ids = ArrowSchema::new(vec![Field::new("decimal", arrow_type, false)]);
             assert_eq!(
-                arrow_schema_to_schema(&arrow_schema)?,
+                arrow_schema_to_schema_auto_assign_ids(&without_ids,)?,
                 expected,
             );
-            assert_eq!(
-                arrow_type_to_type(&arrow_type)?,
-                decimal_type,
-            );
-            let without_ids = ArrowSchema::new(vec![
-                Field::new("decimal", arrow_type, false),
-            ]);
-            assert_eq!(
-                arrow_schema_to_schema_auto_assign_ids(
-                    &without_ids,
-                )?,
-                expected,
-            );
-            let expected_arrow = ArrowSchema::new(vec![
-                simple_field(
-                    "decimal",
-                    DataType::Decimal128(precision as u8, 2),
-                    false,
-                    "1",
-                ),
-            ]);
-            assert_eq!(
-                schema_to_arrow_schema(&expected)?,
-                expected_arrow,
-            );
+            let expected_arrow = ArrowSchema::new(vec![simple_field(
+                "decimal",
+                DataType::Decimal128(precision as u8, 2),
+                false,
+                "1",
+            )]);
+            assert_eq!(schema_to_arrow_schema(&expected)?, expected_arrow,);
         }
         Ok(())
     }
@@ -2405,41 +2387,23 @@ mod tests {
     #[test]
     fn arrow_decimal256_precision_above_38_is_rejected() {
         for precision in [39, 76] {
-            let arrow_type =
-                DataType::Decimal256(precision, 2);
-            let arrow_schema = ArrowSchema::new(vec![
-                simple_field(
-                    "decimal",
-                    arrow_type.clone(),
-                    false,
-                    "1",
-                ),
-            ]);
-            let without_ids = ArrowSchema::new(vec![
-                Field::new(
-                    "decimal",
-                    arrow_type.clone(),
-                    false,
-                ),
-            ]);
+            let arrow_type = DataType::Decimal256(precision, 2);
+            let arrow_schema = ArrowSchema::new(vec![simple_field(
+                "decimal",
+                arrow_type.clone(),
+                false,
+                "1",
+            )]);
+            let without_ids =
+                ArrowSchema::new(vec![Field::new("decimal", arrow_type.clone(), false)]);
             let errors = [
-                arrow_schema_to_schema(&arrow_schema)
-                    .unwrap_err(),
-                arrow_schema_to_schema_auto_assign_ids(
-                    &without_ids,
-                )
-                .unwrap_err(),
-                arrow_type_to_type(&arrow_type)
-                    .unwrap_err(),
+                arrow_schema_to_schema(&arrow_schema).unwrap_err(),
+                arrow_schema_to_schema_auto_assign_ids(&without_ids).unwrap_err(),
+                arrow_type_to_type(&arrow_type).unwrap_err(),
             ];
             for error in errors {
-                assert_eq!(
-                    error.kind(),
-                    ErrorKind::DataInvalid,
-                );
-                assert!(error.to_string().contains(
-                    "Failed to create decimal type",
-                ));
+                assert_eq!(error.kind(), ErrorKind::DataInvalid,);
+                assert!(error.to_string().contains("Failed to create decimal type",));
             }
         }
     }

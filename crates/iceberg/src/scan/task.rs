@@ -23,8 +23,8 @@ use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
 use crate::error::invalid_data;
-use crate::expr::visitors::FileMetrics;
 use crate::expr::BoundPredicate;
+use crate::expr::visitors::FileMetrics;
 use crate::metadata_columns::is_metadata_field;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, Datum, ManifestEntryRef, NameMapping, PartitionSpec,
@@ -116,9 +116,7 @@ impl FileScanTaskMetrics {
                     !is_metadata_field(**id)
                         && match selection {
                             ColumnStatsSelection::All => true,
-                            ColumnStatsSelection::Fields(ids) => {
-                                ids.contains(id)
-                            }
+                            ColumnStatsSelection::Fields(ids) => ids.contains(id),
                         }
                 })
                 .map(|(id, value)| (*id, value.clone()))
@@ -127,10 +125,7 @@ impl FileScanTaskMetrics {
         Self::builder()
             .with_record_count(Some(file.record_count))
             .with_value_counts(select(&file.value_counts, selection))
-            .with_null_value_counts(select(
-                &file.null_value_counts,
-                selection,
-            ))
+            .with_null_value_counts(select(&file.null_value_counts, selection))
             .with_nan_value_counts(select(&file.nan_value_counts, selection))
             .with_lower_bounds(select(&file.lower_bounds, selection))
             .with_upper_bounds(select(&file.upper_bounds, selection))
@@ -1075,20 +1070,19 @@ mod tests {
 
     #[test]
     fn file_metrics_round_trip_every_primitive_bound_type() {
-        use rust_decimal::Decimal;
+        use crate::spec::decimal_utils::decimal_from_i128_with_scale;
 
+        let decimal = decimal_from_i128_with_scale(123, 2);
+        let integer_decimal = decimal_from_i128_with_scale(123, 0);
         let bounds = [
             Datum::bool(true),
             Datum::int(7),
             Datum::long(8),
-            Datum::float(1.5),
+            Datum::float(1.5_f32),
             Datum::double(2.5),
-            Datum::decimal_with_precision(Decimal::new(123, 2), 9)
-                .unwrap(),
-            Datum::decimal_with_precision(Decimal::new(123, 0), 38)
-                .unwrap(),
-            Datum::uuid_from_str("00112233-4455-6677-8899-aabbccddeeff")
-                .unwrap(),
+            Datum::decimal_with_precision(decimal, 9).unwrap(),
+            Datum::decimal_with_precision(integer_decimal, 38).unwrap(),
+            Datum::uuid_from_str("00112233-4455-6677-8899-aabbccddeeff").unwrap(),
             Datum::fixed([1, 2, 3]),
             Datum::binary([4, 5, 6]),
             Datum::date(7),
@@ -1127,10 +1121,7 @@ mod tests {
         let mut task = build_file_scan_task(schema, None, None).unwrap();
         task.file_metrics = Some(Arc::new(metrics));
         let json = serde_json::to_string(&task).unwrap();
-        assert_eq!(
-            serde_json::from_str::<FileScanTask>(&json).unwrap(),
-            task
-        );
+        assert_eq!(serde_json::from_str::<FileScanTask>(&json).unwrap(), task);
     }
 
     fn build_file_scan_task(

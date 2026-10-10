@@ -1132,29 +1132,28 @@ mod tests {
     #[tokio::test]
     async fn test_plan_files_retains_column_stats_only_when_requested() {
         use crate::spec::{
-            DataFileBuilder, ManifestEntry, ManifestListWriter,
-            ManifestStatus, ManifestWriterBuilder,
+            DataFileBuilder, ManifestEntry, ManifestListWriter, ManifestStatus,
+            ManifestWriterBuilder,
         };
 
         let fixture = TableTestFixture::new();
         let snapshot = fixture.table.metadata().current_snapshot().unwrap();
         let schema = snapshot.schema(fixture.table.metadata()).unwrap();
-        let lower = HashMap::from([
-            (1, Datum::long(100)),
-            (2, Datum::long(200)),
-        ]);
+        let lower = HashMap::from([(1, Datum::long(100)), (2, Datum::long(200))]);
         let mut writer = ManifestWriterBuilder::new(
             fixture
                 .table
                 .file_io()
-                .new_output(format!(
-                    "{}/metadata/stats.avro",
-                    fixture.table_location
-                ))
+                .new_output(format!("{}/metadata/stats.avro", fixture.table_location))
                 .unwrap(),
             Some(snapshot.snapshot_id()),
             schema.clone(),
-            fixture.table.metadata().default_partition_spec().as_ref().clone(),
+            fixture
+                .table
+                .metadata()
+                .default_partition_spec()
+                .as_ref()
+                .clone(),
         )
         .build_v2_data();
         writer
@@ -1169,9 +1168,7 @@ mod tests {
                             .file_format(DataFileFormat::Parquet)
                             .file_size_in_bytes(100)
                             .record_count(3)
-                            .partition(Struct::from_iter([
-                                Some(Literal::long(100)),
-                            ]))
+                            .partition(Struct::from_iter([Some(Literal::long(100))]))
                             .lower_bounds(lower.clone())
                             .upper_bounds(lower.clone())
                             .build()
@@ -1222,12 +1219,18 @@ mod tests {
                 HashMap::from([(1, Datum::long(100))]),
             ),
             (
-                fixture.table.scan().include_column_stats_for(["x"])
+                fixture
+                    .table
+                    .scan()
+                    .include_column_stats_for(["x"])
                     .include_column_stats(),
                 lower.clone(),
             ),
             (
-                fixture.table.scan().include_column_stats()
+                fixture
+                    .table
+                    .scan()
+                    .include_column_stats()
                     .include_column_stats_for(["x"]),
                 HashMap::from([(1, Datum::long(100))]),
             ),
@@ -1262,18 +1265,13 @@ mod tests {
             Type::Primitive(PrimitiveType::Int),
         ));
         for (field_type, leaf_name) in [
+            (Type::Struct(StructType::new(vec![leaf.clone()])), "s.a"),
             (
-                Type::Struct(StructType::new(vec![leaf.clone()])),
-                "s.a",
-            ),
-            (
-                Type::List(ListType::new(Arc::new(
-                    NestedField::list_element(
-                        3,
-                        Type::Primitive(PrimitiveType::Int),
-                        false,
-                    ),
-                ))),
+                Type::List(ListType::new(Arc::new(NestedField::list_element(
+                    3,
+                    Type::Primitive(PrimitiveType::Int),
+                    false,
+                )))),
                 "s.element",
             ),
             (
@@ -1309,18 +1307,25 @@ mod tests {
                 .include_column_stats_for(["s"])
                 .build()
                 .unwrap_err();
-            assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+            assert_eq!(err.kind(), ErrorKind::DataInvalid);
             assert_eq!(
                 err.message(),
                 "Column s requested for statistics must be primitive"
             );
             assert!(
-                table.scan().include_column_stats_for([leaf_name])
-                    .build().is_ok()
+                table
+                    .scan()
+                    .include_column_stats_for([leaf_name])
+                    .build()
+                    .is_ok()
             );
             assert!(
-                table.scan().include_column_stats_for(["s"])
-                    .include_column_stats().build().is_ok()
+                table
+                    .scan()
+                    .include_column_stats_for(["s"])
+                    .include_column_stats()
+                    .build()
+                    .is_ok()
             );
         }
     }

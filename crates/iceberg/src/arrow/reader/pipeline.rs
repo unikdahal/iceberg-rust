@@ -1925,12 +1925,15 @@ mod tests {
 
     #[test]
     fn file_always_matches_rejects_nan_payloads_and_signs() {
-        let float_payloads = (0..23)
-            .map(|bit| 1_u32 << bit)
-            .chain([0x003f_ffff, 0x0040_0001, 0x007f_ffff]);
-        let double_payloads = (0..52)
-            .map(|bit| 1_u64 << bit)
-            .chain([0x0007_ffff_ffff_ffff, 0x0008_0000_0000_0001, 0x000f_ffff_ffff_ffff]);
+        let float_payloads =
+            (0..23)
+                .map(|bit| 1_u32 << bit)
+                .chain([0x003f_ffff, 0x0040_0001, 0x007f_ffff]);
+        let double_payloads = (0..52).map(|bit| 1_u64 << bit).chain([
+            0x0007_ffff_ffff_ffff,
+            0x0008_0000_0000_0001,
+            0x000f_ffff_ffff_ffff,
+        ]);
         let float_nans = float_payloads.flat_map(|payload| {
             [0, 0x8000_0000].map(|sign| Datum::float(f32::from_bits(sign | 0x7f80_0000 | payload)))
         });
@@ -1939,8 +1942,16 @@ mod tests {
                 .map(|sign| Datum::double(f64::from_bits(sign | 0x7ff0_0000_0000_0000 | payload)))
         });
         for (field_type, one, nans) in [
-            (PrimitiveType::Float, Datum::float(1.0), float_nans.collect::<Vec<_>>()),
-            (PrimitiveType::Double, Datum::double(1.0), double_nans.collect::<Vec<_>>()),
+            (
+                PrimitiveType::Float,
+                Datum::float(1.0_f32),
+                float_nans.collect::<Vec<_>>(),
+            ),
+            (
+                PrimitiveType::Double,
+                Datum::double(1.0),
+                double_nans.collect::<Vec<_>>(),
+            ),
         ] {
             let schema = Arc::new(
                 Schema::builder()
@@ -2002,8 +2013,7 @@ mod tests {
         ] {
             let predicate = predicate.bind(schema.clone(), false).unwrap();
             assert!(
-                super::StrictMetricsEvaluator::eval_metrics(&predicate, (&metrics).into())
-                    .unwrap()
+                super::StrictMetricsEvaluator::eval_metrics(&predicate, (&metrics).into()).unwrap()
             );
             assert!(!super::FileScanTaskReader::file_always_matches(
                 &predicate, &metrics

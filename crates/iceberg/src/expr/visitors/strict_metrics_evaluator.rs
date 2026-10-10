@@ -19,8 +19,8 @@ use fnv::FnvHashSet;
 
 use crate::Result;
 use crate::error::invalid_data;
-use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
 use crate::expr::visitors::FileMetrics;
+use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
 use crate::expr::{BoundPredicate, BoundReference};
 use crate::spec::{DataFile, Datum, PrimitiveType};
 
@@ -434,11 +434,7 @@ mod test {
         let mut results = Vec::new();
         for (field_type, lower, literal) in [
             (PrimitiveType::Int, Datum::int(1), Datum::int(0)),
-            (
-                PrimitiveType::Float,
-                Datum::float(1.0),
-                Datum::float(0.0),
-            ),
+            (PrimitiveType::Float, Datum::float(1.0_f32), Datum::float(0.0_f32)),
             (
                 PrimitiveType::Double,
                 Datum::double(1.0),
@@ -491,18 +487,16 @@ mod test {
         let counts = HashMap::from([(4, 3)]);
         let empty_counts = HashMap::new();
         let bounds = HashMap::new();
-        let result = StrictMetricsEvaluator::eval_metrics(
-            &predicate,
-            crate::expr::visitors::FileMetrics {
+        let result =
+            StrictMetricsEvaluator::eval_metrics(&predicate, crate::expr::visitors::FileMetrics {
                 record_count: None,
                 value_counts: &counts,
                 null_value_counts: &counts,
                 nan_value_counts: &empty_counts,
                 lower_bounds: &bounds,
                 upper_bounds: &bounds,
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert!(result);
     }
 

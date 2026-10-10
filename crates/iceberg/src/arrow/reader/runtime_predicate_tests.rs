@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::{
-    Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
-    StringArray,
+    Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
+    RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::{StreamExt, TryStreamExt};
@@ -2549,24 +2549,28 @@ async fn runtime_predicate_negative_predicates_preserve_null_filtering_with_file
                 ),
             ]))
             .with_nan_value_counts(HashMap::new())
-            .with_lower_bounds(std::iter::once((1, Datum::int(1)))
-                .chain(
-                    values
-                        .iter()
-                        .flatten()
-                        .min()
-                        .map(|&value| (2, Datum::int(value))),
-                )
-                .collect())
-            .with_upper_bounds(std::iter::once((1, Datum::int(4)))
-                .chain(
-                    values
-                        .iter()
-                        .flatten()
-                        .max()
-                        .map(|&value| (2, Datum::int(value))),
-                )
-                .collect())
+            .with_lower_bounds(
+                std::iter::once((1, Datum::int(1)))
+                    .chain(
+                        values
+                            .iter()
+                            .flatten()
+                            .min()
+                            .map(|&value| (2, Datum::int(value))),
+                    )
+                    .collect(),
+            )
+            .with_upper_bounds(
+                std::iter::once((1, Datum::int(4)))
+                    .chain(
+                        values
+                            .iter()
+                            .flatten()
+                            .max()
+                            .map(|&value| (2, Datum::int(value))),
+                    )
+                    .collect(),
+            )
             .build();
         let expected: Vec<_> = values
             .iter()
@@ -2838,22 +2842,16 @@ fn concurrent_publishers_keep_snapshot_pair_and_generation() {
 
     let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
     let cache = Arc::new(RuntimePredicates::new(provider.clone()));
-    let predicate = |generation| {
-        Reference::new("id")
-            .greater_than_or_equal_to(Datum::int(generation))
-    };
+    let predicate =
+        |generation| Reference::new("id").greater_than_or_equal_to(Datum::int(generation));
     let (entered_tx, entered_rx) = channel();
     let (release_tx, release_rx) = channel();
     let first_provider = provider.clone();
     let first = thread::spawn(move || {
-        first_provider.publish_with_gate(
-            Some(predicate(1)),
-            1,
-            || {
-                entered_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-            },
-        );
+        first_provider.publish_with_gate(Some(predicate(1)), 1, || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
     });
     entered_rx.recv().unwrap();
     assert_eq!(provider.generation(), 0);
@@ -2865,14 +2863,10 @@ fn concurrent_publishers_keep_snapshot_pair_and_generation() {
     let second_provider = provider.clone();
     let second = thread::spawn(move || {
         started_tx.send(()).unwrap();
-        second_provider.publish_with_gate(
-            Some(predicate(2)),
-            2,
-            || {
-                second_tx.send(()).unwrap();
-                finish_rx.recv().unwrap();
-            },
-        );
+        second_provider.publish_with_gate(Some(predicate(2)), 2, || {
+            second_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+        });
     });
     started_rx.recv().unwrap();
     let observer_provider = provider.clone();
@@ -2901,10 +2895,7 @@ fn concurrent_publishers_keep_snapshot_pair_and_generation() {
     assert_eq!(snapshot.into_predicate(), Some(predicate(2)));
     let schema = iceberg_schema();
     let latest = cache.current(&schema, false, "publisher").unwrap();
-    assert_eq!(
-        *latest,
-        predicate(2).bind(schema.clone(), false).unwrap(),
-    );
+    assert_eq!(*latest, predicate(2).bind(schema.clone(), false).unwrap(),);
     assert!(Arc::ptr_eq(
         &latest,
         &cache.current(&schema, false, "publisher").unwrap(),
@@ -2930,18 +2921,12 @@ async fn check_rebuild_failure(
 
     for initially_active in [false, true] {
         let temp = TempDir::new().unwrap();
-        let path = write_three_row_group_file(
-            temp.path().to_str().unwrap(),
-            "rebuild-failure.parquet",
-        );
+        let path =
+            write_three_row_group_file(temp.path().to_str().unwrap(), "rebuild-failure.parquet");
         let probe = Probe::register(&path);
-        let initial = initially_active.then(|| {
-            Reference::new("id")
-                .greater_than_or_equal_to(Datum::int(0))
-        });
-        let provider = Arc::new(ChangingRuntimePredicate::new(
-            initial, 0,
-        ));
+        let initial =
+            initially_active.then(|| Reference::new("id").greater_than_or_equal_to(Datum::int(0)));
+        let provider = Arc::new(ChangingRuntimePredicate::new(initial, 0));
         let (mut stream, metrics) = start_runtime_scan(
             scan_task(path, iceberg_schema(), None),
             Some(provider.clone()),
@@ -2954,8 +2939,7 @@ async fn check_rebuild_failure(
         let before = refresh_metric_counts(&metrics);
         probe.fail_at(stage);
         provider.publish(
-            Some(Reference::new("id")
-                .greater_than_or_equal_to(Datum::int(200))),
+            Some(Reference::new("id").greater_than_or_equal_to(Datum::int(200))),
             1,
         );
         let error = stream.try_next().await.unwrap_err();
@@ -2994,19 +2978,9 @@ fn lineage_schema() -> SchemaRef {
         Schema::builder()
             .with_schema_id(1)
             .with_fields(vec![
-                NestedField::required(
-                    1, "id", Type::Primitive(PrimitiveType::Int),
-                )
-                .into(),
-                NestedField::required(
-                    2, "payload",
-                    Type::Primitive(PrimitiveType::String),
-                )
-                .into(),
-                NestedField::required(
-                    3, "k", Type::Primitive(PrimitiveType::Int),
-                )
-                .into(),
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "payload", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(3, "k", Type::Primitive(PrimitiveType::Int)).into(),
             ])
             .build()
             .unwrap(),
@@ -3014,10 +2988,9 @@ fn lineage_schema() -> SchemaRef {
 }
 
 fn write_lineage_groups(path: &str, physical_row_id: bool) {
+    use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
+
     use crate::metadata_columns::RESERVED_FIELD_ID_ROW_ID;
-    use parquet::file::metadata::{
-        PageIndexPolicy, ParquetMetaDataReader,
-    };
 
     let mut fields = vec![
         field("id", DataType::Int32, 1),
@@ -3025,18 +2998,14 @@ fn write_lineage_groups(path: &str, physical_row_id: bool) {
         field("k", DataType::Int32, 3),
     ];
     if physical_row_id {
-        fields.push(
-            field("_row_id", DataType::Int64, RESERVED_FIELD_ID_ROW_ID)
-                .with_nullable(true),
-        );
+        fields
+            .push(field("_row_id", DataType::Int64, RESERVED_FIELD_ID_ROW_ID).with_nullable(true));
     }
     let schema = Arc::new(ArrowSchema::new(fields));
     let properties = WriterProperties::builder()
         .set_compression(Compression::UNCOMPRESSED)
         .set_dictionary_enabled(false)
-        .set_max_row_group_row_count(Some(
-            LINEAGE_GROUP_ROWS as usize,
-        ))
+        .set_max_row_group_row_count(Some(LINEAGE_GROUP_ROWS as usize))
         .set_data_page_row_count_limit(LINEAGE_PAGE_ROWS as usize)
         .set_write_batch_size(LINEAGE_PAGE_ROWS as usize)
         .build();
@@ -3052,13 +3021,10 @@ fn write_lineage_groups(path: &str, physical_row_id: bool) {
                 (0..LINEAGE_GROUP_ROWS).map(|row| group * 10000 + row),
             )),
             Arc::new(StringArray::from_iter_values(
-                (0..LINEAGE_GROUP_ROWS).map(|row| {
-                    format!("{group}-{row}-{}", "x".repeat(64))
-                }),
+                (0..LINEAGE_GROUP_ROWS).map(|row| format!("{group}-{row}-{}", "x".repeat(64))),
             )),
             Arc::new(Int32Array::from_iter_values(
-                (0..LINEAGE_GROUP_ROWS)
-                    .map(|row| row / LINEAGE_PAGE_ROWS),
+                (0..LINEAGE_GROUP_ROWS).map(|row| row / LINEAGE_PAGE_ROWS),
             )),
         ];
         if physical_row_id {
@@ -3087,9 +3053,7 @@ fn write_lineage_groups(path: &str, physical_row_id: bool) {
 }
 
 fn lineage_task(path: &str, planned: Option<Predicate>) -> FileScanTask {
-    use crate::metadata_columns::{
-        RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID,
-    };
+    use crate::metadata_columns::{RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID};
 
     let schema = lineage_schema();
     FileScanTask::builder()
@@ -3099,13 +3063,9 @@ fn lineage_task(path: &str, planned: Option<Predicate>) -> FileScanTask {
         .with_data_file_path(path.to_owned())
         .with_data_file_format(DataFileFormat::Parquet)
         .with_schema(schema.clone())
-        .with_project_field_ids(vec![
-            1, 2, RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID,
-        ])
+        .with_project_field_ids(vec![1, 2, RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID])
         .with_first_row_id(Some(LINEAGE_FIRST_ROW_ID))
-        .with_predicate(planned.map(|predicate| {
-            predicate.bind(schema, false).unwrap()
-        }))
+        .with_predicate(planned.map(|predicate| predicate.bind(schema, false).unwrap()))
         .with_case_sensitive(false)
         .build()
         .unwrap()
@@ -3122,12 +3082,24 @@ fn patch_task(task: FileScanTask, patch: serde_json::Value) -> FileScanTask {
 fn lineage_rows(batches: &[RecordBatch]) -> Vec<(i32, i64, i64)> {
     let mut rows = Vec::new();
     for batch in batches {
-        let id = batch.column_by_name("id").unwrap()
-            .as_any().downcast_ref::<Int32Array>().unwrap();
-        let pos = batch.column_by_name("_pos").unwrap()
-            .as_any().downcast_ref::<Int64Array>().unwrap();
-        let row_id = batch.column_by_name("_row_id").unwrap()
-            .as_any().downcast_ref::<Int64Array>().unwrap();
+        let id = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let pos = batch
+            .column_by_name("_pos")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let row_id = batch
+            .column_by_name("_row_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(row_id.null_count(), 0);
         for row in 0..batch.num_rows() {
             rows.push((id.value(row), pos.value(row), row_id.value(row)));
@@ -3137,9 +3109,7 @@ fn lineage_rows(batches: &[RecordBatch]) -> Vec<(i32, i64, i64)> {
 }
 
 fn expected_lineage(id: i32, physical: bool) -> (i32, i64, i64) {
-    let pos = i64::from(
-        (id / 10000) * LINEAGE_GROUP_ROWS + id % 10000,
-    );
+    let pos = i64::from((id / 10000) * LINEAGE_GROUP_ROWS + id % 10000);
     let row_id = if physical && pos % 3 == 0 {
         9_000_000 + pos
     } else {
@@ -3167,10 +3137,9 @@ fn delete_task(path: String, position: bool) -> FileScanTaskDeleteFile {
 fn lineage_deletes(path: &str, dir: &str) -> Vec<FileScanTaskDeleteFile> {
     let position_path = format!("{dir}/lineage-position.parquet");
     let equality_path = format!("{dir}/lineage-equality.parquet");
-    let mut positions: Vec<i64> =
-        (LINEAGE_GROUP_ROWS..2 * LINEAGE_GROUP_ROWS)
-            .map(i64::from)
-            .collect();
+    let mut positions: Vec<i64> = (LINEAGE_GROUP_ROWS..2 * LINEAGE_GROUP_ROWS)
+        .map(i64::from)
+        .collect();
     for group in [0, 2, 3, 4] {
         positions.push(i64::from(
             group * LINEAGE_GROUP_ROWS + 2 * LINEAGE_PAGE_ROWS + 1,
@@ -3188,15 +3157,11 @@ fn lineage_deletes(path: &str, dir: &str) -> Vec<FileScanTaskDeleteFile> {
             Arc::new(Int64Array::from(positions)),
         ],
     );
-    write_delete(
-        &equality_path,
-        vec![field("id", DataType::Int32, 1)],
-        vec![Arc::new(Int32Array::from_iter_values(
-            (0..5).map(|group| {
-                group * 10000 + 2 * LINEAGE_PAGE_ROWS + 2
-            }),
-        ))],
-    );
+    write_delete(&equality_path, vec![field("id", DataType::Int32, 1)], vec![
+        Arc::new(Int32Array::from_iter_values(
+            (0..5).map(|group| group * 10000 + 2 * LINEAGE_PAGE_ROWS + 2),
+        )),
+    ]);
     vec![
         delete_task(position_path, true),
         delete_task(equality_path, false),
@@ -3224,56 +3189,54 @@ async fn live_refresh_preserves_deletes_and_absolute_lineage_differential() {
             .flat_map(|group| {
                 (0..3 * LINEAGE_PAGE_ROWS)
                     .filter(|row| {
-                        ![2 * LINEAGE_PAGE_ROWS + 1,
-                          2 * LINEAGE_PAGE_ROWS + 2].contains(row)
+                        ![2 * LINEAGE_PAGE_ROWS + 1, 2 * LINEAGE_PAGE_ROWS + 2].contains(row)
                     })
-                    .map(move |row| expected_lineage(
-                        group * 10000 + row, physical,
-                    ))
+                    .map(move |row| expected_lineage(group * 10000 + row, physical))
             })
             .collect();
         assert_eq!(baseline_rows, expected_baseline);
         for largest_first in [false, true] {
             let changing = Arc::new(ChangingRuntimePredicate::new(None, 0));
-            let provider: Arc<dyn RuntimePredicateProvider> =
-                if largest_first {
-                    Arc::new(LargestFirstChanging(changing.clone()))
-                } else {
-                    changing.clone()
-                };
-            let (mut stream, metrics) = start_runtime_scan(
-                task.clone(), Some(provider), true, true, 128,
-            );
+            let provider: Arc<dyn RuntimePredicateProvider> = if largest_first {
+                Arc::new(LargestFirstChanging(changing.clone()))
+            } else {
+                changing.clone()
+            };
+            let (mut stream, metrics) =
+                start_runtime_scan(task.clone(), Some(provider), true, true, 128);
             let first = stream.try_next().await.unwrap().unwrap();
             let first_group = if largest_first { 4 } else { 0 };
             assert_eq!(
                 lineage_rows(std::slice::from_ref(&first)),
-                (0..128).map(|row| expected_lineage(
-                    first_group * 10000 + row, physical,
-                )).collect::<Vec<_>>(),
+                (0..128)
+                    .map(|row| expected_lineage(first_group * 10000 + row, physical,))
+                    .collect::<Vec<_>>(),
             );
             changing.publish(
-                Some(Reference::new("k")
-                    .greater_than_or_equal_to(Datum::int(2))
-                    .and(Reference::new("id")
-                        .less_than(Datum::int(20000))
-                        .or(Reference::new("id")
-                            .greater_than_or_equal_to(Datum::int(30000))))),
+                Some(
+                    Reference::new("k")
+                        .greater_than_or_equal_to(Datum::int(2))
+                        .and(
+                            Reference::new("id")
+                                .less_than(Datum::int(20000))
+                                .or(Reference::new("id")
+                                    .greater_than_or_equal_to(Datum::int(30000))),
+                        ),
+                ),
                 1,
             );
             let mut batches = vec![first];
             batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
-            let mut expected: Vec<_> = baseline_rows.iter().copied()
+            let mut expected: Vec<_> = baseline_rows
+                .iter()
+                .copied()
                 .filter(|(id, _, _)| {
                     id / 10000 == first_group
-                        || (id % 10000 >= 2 * LINEAGE_PAGE_ROWS
-                            && !(20000..30000).contains(id))
+                        || (id % 10000 >= 2 * LINEAGE_PAGE_ROWS && !(20000..30000).contains(id))
                 })
                 .collect();
             if largest_first {
-                expected.sort_by_key(|(id, _, _)| {
-                    (std::cmp::Reverse(id / 10000), id % 10000)
-                });
+                expected.sort_by_key(|(id, _, _)| (std::cmp::Reverse(id / 10000), id % 10000));
             }
             assert_eq!(lineage_rows(&batches), expected);
             assert_eq!(metrics.runtime_predicate_refreshes(), 1);
@@ -3289,17 +3252,14 @@ fn start_uncoalesced_scan(
     provider: Option<Arc<dyn RuntimePredicateProvider>>,
     pages: bool,
 ) -> (ArrowRecordBatchStream, ScanMetrics) {
-    let mut builder = ArrowReaderBuilder::new(
-        FileIO::new_with_fs(), Runtime::current(),
-    )
-    .with_range_coalesce_bytes(0)
-    .with_row_selection_enabled(pages)
-    .with_batch_size(LINEAGE_GROUP_ROWS as usize);
+    let mut builder = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+        .with_range_coalesce_bytes(0)
+        .with_row_selection_enabled(pages)
+        .with_batch_size(LINEAGE_GROUP_ROWS as usize);
     if let Some(provider) = provider {
         builder = builder.with_runtime_predicate_provider(provider);
     }
-    let tasks = Box::pin(futures::stream::iter([Ok(task)]))
-        as FileScanTaskStream;
+    let tasks = Box::pin(futures::stream::iter([Ok(task)])) as FileScanTaskStream;
     let scan = builder.build().read(tasks).unwrap();
     let metrics = scan.metrics().clone();
     (scan.stream(), metrics)
@@ -3308,9 +3268,7 @@ fn start_uncoalesced_scan(
 fn lineage_all_match_metrics() -> crate::scan::FileScanTaskMetrics {
     crate::scan::FileScanTaskMetrics::builder()
         .with_record_count(Some(5 * LINEAGE_GROUP_ROWS as u64))
-        .with_value_counts(HashMap::from([
-            (3, 5 * LINEAGE_GROUP_ROWS as u64),
-        ]))
+        .with_value_counts(HashMap::from([(3, 5 * LINEAGE_GROUP_ROWS as u64)]))
         .with_null_value_counts(HashMap::from([(3, 0)]))
         .with_lower_bounds(HashMap::from([(3, Datum::int(0))]))
         .with_upper_bounds(HashMap::from([(3, Datum::int(3))]))
@@ -3320,16 +3278,16 @@ fn lineage_all_match_metrics() -> crate::scan::FileScanTaskMetrics {
 fn lineage_middle_split(task: FileScanTask) -> FileScanTask {
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
-    let parquet = SerializedFileReader::new(
-        File::open(task.data_file_path()).unwrap(),
-    )
-    .unwrap();
+    let parquet = SerializedFileReader::new(File::open(task.data_file_path()).unwrap()).unwrap();
     let metadata = parquet.metadata();
     let start = 4 + metadata.row_group(0).compressed_size() as u64;
     let length = metadata.row_group(1).compressed_size() as u64;
-    patch_task(task, serde_json::json!({
-        "start": start, "length": length,
-    }))
+    patch_task(
+        task,
+        serde_json::json!({
+            "start": start, "length": length,
+        }),
+    )
 }
 
 async fn check_runtime_page_lineage(split: bool) {
@@ -3345,40 +3303,26 @@ async fn check_runtime_page_lineage(split: bool) {
             .equal_to(Datum::int(0))
             .or(Reference::new("k").equal_to(Datum::int(3)));
         let provider = Arc::new(FixedRuntimePredicate::new(predicate));
-        let (reference, reference_metrics) = start_uncoalesced_scan(
-            task.clone(), Some(provider.clone()), false,
-        );
-        let reference: Vec<RecordBatch> =
-            reference.try_collect().await.unwrap();
-        let (pruned, metrics) = start_uncoalesced_scan(
-            task.clone(), Some(provider), true,
-        );
-        let pruned: Vec<RecordBatch> =
-            pruned.try_collect().await.unwrap();
-        let groups: Vec<i32> = if split {
-            vec![1]
-        } else {
-            (0..5).collect()
-        };
-        let expected: Vec<_> = groups.into_iter()
+        let (reference, reference_metrics) =
+            start_uncoalesced_scan(task.clone(), Some(provider.clone()), false);
+        let reference: Vec<RecordBatch> = reference.try_collect().await.unwrap();
+        let (pruned, metrics) = start_uncoalesced_scan(task.clone(), Some(provider), true);
+        let pruned: Vec<RecordBatch> = pruned.try_collect().await.unwrap();
+        let groups: Vec<i32> = if split { vec![1] } else { (0..5).collect() };
+        let expected: Vec<_> = groups
+            .into_iter()
             .flat_map(|group| {
                 (0..LINEAGE_GROUP_ROWS)
-                    .filter(|row| {
-                        *row < LINEAGE_PAGE_ROWS
-                            || *row >= 3 * LINEAGE_PAGE_ROWS
-                    })
-                    .map(move |row| expected_lineage(
-                        group * 10000 + row, physical,
-                    ))
+                    .filter(|row| *row < LINEAGE_PAGE_ROWS || *row >= 3 * LINEAGE_PAGE_ROWS)
+                    .map(move |row| expected_lineage(group * 10000 + row, physical))
             })
             .collect();
         assert_eq!(lineage_rows(&reference), expected);
         assert_eq!(lineage_rows(&pruned), expected);
         assert!(metrics.bytes_read() < reference_metrics.bytes_read());
         if split {
-            let (whole, whole_metrics) = start_uncoalesced_scan(
-                lineage_task(&path, None), None, false,
-            );
+            let (whole, whole_metrics) =
+                start_uncoalesced_scan(lineage_task(&path, None), None, false);
             let _: Vec<RecordBatch> = whole.try_collect().await.unwrap();
             assert!(metrics.bytes_read() < whole_metrics.bytes_read());
         }
@@ -3402,43 +3346,31 @@ async fn check_all_match_lineage(split: bool) {
         write_lineage_groups(&path, physical);
         let mut task = lineage_task(
             &path,
-            Some(Reference::new("k")
-                .greater_than_or_equal_to(Datum::int(0))),
+            Some(Reference::new("k").greater_than_or_equal_to(Datum::int(0))),
         );
         if split {
             task = lineage_middle_split(task);
         }
-        let (reference, reference_metrics) = start_uncoalesced_scan(
-            task.clone(), None, true,
-        );
-        let reference: Vec<RecordBatch> =
-            reference.try_collect().await.unwrap();
+        let (reference, reference_metrics) = start_uncoalesced_scan(task.clone(), None, true);
+        let reference: Vec<RecordBatch> = reference.try_collect().await.unwrap();
         let (shortcut, shortcut_metrics) = start_uncoalesced_scan(
             with_file_metrics(task, lineage_all_match_metrics()),
             None,
             true,
         );
-        let shortcut: Vec<RecordBatch> =
-            shortcut.try_collect().await.unwrap();
-        let groups: Vec<i32> = if split {
-            vec![1]
-        } else {
-            (0..5).collect()
-        };
-        let expected: Vec<_> = groups.into_iter()
+        let shortcut: Vec<RecordBatch> = shortcut.try_collect().await.unwrap();
+        let groups: Vec<i32> = if split { vec![1] } else { (0..5).collect() };
+        let expected: Vec<_> = groups
+            .into_iter()
             .flat_map(|group| {
-                (0..LINEAGE_GROUP_ROWS).map(move |row| {
-                    expected_lineage(group * 10000 + row, physical)
-                })
+                (0..LINEAGE_GROUP_ROWS)
+                    .map(move |row| expected_lineage(group * 10000 + row, physical))
             })
             .collect();
         assert_eq!(lineage_rows(&reference), expected);
         assert_eq!(lineage_rows(&shortcut), expected);
         assert_eq!(shortcut, reference);
-        assert!(
-            shortcut_metrics.bytes_read()
-                < reference_metrics.bytes_read(),
-        );
+        assert!(shortcut_metrics.bytes_read() < reference_metrics.bytes_read(),);
     }
 }
 
@@ -3469,14 +3401,12 @@ async fn unchanged_generation_checks_do_not_replan() {
             }),
         );
         let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
-        let (mut stream, metrics) = start_runtime_scan(
-            task, Some(provider.clone()), true, true, 128,
-        );
+        let (mut stream, metrics) =
+            start_runtime_scan(task, Some(provider.clone()), true, true, 128);
         let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
         assert_eq!(&probe.counts()[1..], &[0, 0, 0, 0]);
         provider.publish(
-            Some(Reference::new("k")
-                .greater_than_or_equal_to(Datum::int(2))),
+            Some(Reference::new("k").greater_than_or_equal_to(Datum::int(2))),
             1,
         );
         // Drain the active group; none of its batches samples again.
@@ -3507,12 +3437,9 @@ async fn unchanged_generation_checks_do_not_replan() {
                 (0..LINEAGE_GROUP_ROWS)
                     .filter(move |row| {
                         (group == 0 || *row >= 2 * LINEAGE_PAGE_ROWS)
-                            && ![2 * LINEAGE_PAGE_ROWS + 1,
-                                 2 * LINEAGE_PAGE_ROWS + 2].contains(row)
+                            && ![2 * LINEAGE_PAGE_ROWS + 1, 2 * LINEAGE_PAGE_ROWS + 2].contains(row)
                     })
-                    .map(move |row| expected_lineage(
-                        group * 10000 + row, false,
-                    ))
+                    .map(move |row| expected_lineage(group * 10000 + row, false))
             })
             .collect();
         assert_eq!(lineage_rows(&batches), expected);
@@ -3546,11 +3473,7 @@ impl RuntimePredicateProvider for OrderingHint {
     }
 }
 
-fn write_ordering_fallback_file(
-    path: &str,
-    field_ids: bool,
-    statistics: bool,
-) -> SchemaRef {
+fn write_ordering_fallback_file(path: &str, field_ids: bool, statistics: bool) -> SchemaRef {
     use parquet::file::properties::EnabledStatistics;
 
     let mut fields = vec![
@@ -3582,11 +3505,10 @@ fn write_ordering_fallback_file(
     .unwrap();
     for base in [0, 100, 200] {
         let values: Vec<i32> = (base..base + 4).collect();
-        let decimal = Decimal128Array::from_iter_values(
-            values.iter().map(|value| i128::from(*value)),
-        )
-        .with_precision_and_scale(30, 2)
-        .unwrap();
+        let decimal =
+            Decimal128Array::from_iter_values(values.iter().map(|value| i128::from(*value)))
+                .with_precision_and_scale(30, 2)
+                .unwrap();
         let batch = RecordBatch::try_new(schema.clone(), vec![
             Arc::new(Int32Array::from(values.clone())),
             Arc::new(StringArray::from_iter_values(
@@ -3606,21 +3528,18 @@ fn write_ordering_fallback_file(
         Schema::builder()
             .with_schema_id(1)
             .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "payload", Type::Primitive(PrimitiveType::String)).into(),
                 NestedField::required(
-                    1, "id", Type::Primitive(PrimitiveType::Int),
-                ).into(),
-                NestedField::required(
-                    2, "payload",
-                    Type::Primitive(PrimitiveType::String),
-                ).into(),
-                NestedField::required(
-                    3, "d", Type::Primitive(PrimitiveType::Decimal {
-                        precision: 30, scale: 2,
+                    3,
+                    "d",
+                    Type::Primitive(PrimitiveType::Decimal {
+                        precision: 30,
+                        scale: 2,
                     }),
-                ).into(),
-                NestedField::required(
-                    4, "f", Type::Primitive(PrimitiveType::Double),
-                ).into(),
+                )
+                .into(),
+                NestedField::required(4, "f", Type::Primitive(PrimitiveType::Double)).into(),
             ])
             .build()
             .unwrap(),
@@ -3643,28 +3562,30 @@ async fn largest_first_fallback_contract() {
     ] {
         let temp = TempDir::new().unwrap();
         let path = format!("{}/fallback.parquet", temp.path().display());
-        let schema = write_ordering_fallback_file(
-            &path, field_ids, statistics,
-        );
-        let parquet = SerializedFileReader::new(
-            File::open(&path).unwrap(),
-        )
-        .unwrap();
+        let schema = write_ordering_fallback_file(&path, field_ids, statistics);
+        let parquet = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
         assert_eq!(
-            parquet.metadata().file_metadata().schema_descr()
-                .column(2).physical_type(),
+            parquet
+                .metadata()
+                .file_metadata()
+                .schema_descr()
+                .column(2)
+                .physical_type(),
             parquet::basic::Type::FIXED_LEN_BYTE_ARRAY,
         );
         if !statistics {
-            assert!(parquet.metadata().row_group(0)
-                .column(0).statistics().is_none());
+            assert!(
+                parquet
+                    .metadata()
+                    .row_group(0)
+                    .column(0)
+                    .statistics()
+                    .is_none()
+            );
         }
         let task = scan_task(path, schema, None);
-        let (reference, _) = start_runtime_scan(
-            task.clone(), None, true, row_groups, 2,
-        );
-        let reference: Vec<RecordBatch> =
-            reference.try_collect().await.unwrap();
+        let (reference, _) = start_runtime_scan(task.clone(), None, true, row_groups, 2);
+        let reference: Vec<RecordBatch> = reference.try_collect().await.unwrap();
         let (hinted, metrics) = start_runtime_scan(
             task,
             Some(Arc::new(OrderingHint { column: hint })),
@@ -3672,8 +3593,7 @@ async fn largest_first_fallback_contract() {
             row_groups,
             2,
         );
-        let hinted: Vec<RecordBatch> =
-            hinted.try_collect().await.unwrap();
+        let hinted: Vec<RecordBatch> = hinted.try_collect().await.unwrap();
         assert_eq!(ids(&hinted), all_ids());
         assert_eq!(hinted, reference);
         assert_eq!(metrics.runtime_decoder_rebuilds(), 0);

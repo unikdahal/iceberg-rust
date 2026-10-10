@@ -542,8 +542,7 @@ mod tests {
     use crate::spec::{Datum, NestedField, PrimitiveType, Schema, Type};
 
     #[test]
-    fn test_row_group_in_with_literals_on_both_sides_of_the_bounds()
-    -> Result<()> {
+    fn test_row_group_in_with_literals_on_both_sides_of_the_bounds() -> Result<()> {
         let row_group = create_row_group_metadata(
             50,
             50,
@@ -557,8 +556,7 @@ mod tests {
             50,
             None,
         )?;
-        let (schema, field_id_map) =
-            build_iceberg_schema_and_field_map()?;
+        let (schema, field_id_map) = build_iceberg_schema_and_field_map()?;
         let cases = [
             (vec![29.0_f32, 80.0], false),
             (vec![29.0_f32, 50.0, 80.0], true),

@@ -315,7 +315,9 @@ mod tests {
                 ),
                 (
                     Box::new(|_| {
-                        Ok(arrow_array::BooleanArray::from(vec![true, false, true, true]))
+                        Ok(arrow_array::BooleanArray::from(vec![
+                            true, false, true, true,
+                        ]))
                     }),
                     false,
                 ),
@@ -358,7 +360,10 @@ mod tests {
             let disabled = Arc::new(AtomicBool::new(disabled));
             let mut evaluate = super::combine_predicates(
                 vec![
-                    (Box::new(|_| panic!("runtime ran before mandatory mask")), true),
+                    (
+                        Box::new(|_| panic!("runtime ran before mandatory mask")),
+                        true,
+                    ),
                     (
                         Box::new(|_| {
                             Err(ArrowError::ComputeError("injected mandatory error".into()))
