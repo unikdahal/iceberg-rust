@@ -434,7 +434,11 @@ mod test {
         let mut results = Vec::new();
         for (field_type, lower, literal) in [
             (PrimitiveType::Int, Datum::int(1), Datum::int(0)),
-            (PrimitiveType::Float, Datum::float(1.0_f32), Datum::float(0.0_f32)),
+            (
+                PrimitiveType::Float,
+                Datum::float(1.0_f32),
+                Datum::float(0.0_f32),
+            ),
             (
                 PrimitiveType::Double,
                 Datum::double(1.0),

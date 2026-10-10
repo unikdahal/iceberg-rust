@@ -255,7 +255,7 @@ fn combine_predicates(
             });
         }
         let mut mask = mask.unwrap_or_else(|| BooleanArray::from(vec![true; batch.num_rows()]));
-        if runtime_disabled.load(Ordering::Relaxed) {
+        if runtime.is_empty() || runtime_disabled.load(Ordering::Relaxed) {
             return Ok(mask);
         }
         let mandatory_mask = mask.clone();
