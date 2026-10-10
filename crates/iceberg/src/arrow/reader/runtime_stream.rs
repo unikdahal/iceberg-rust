@@ -25,7 +25,9 @@
 //! Cost: a boundary with an unchanged generation costs one cheap generation
 //! check, with no snapshot, binding or replanning. Each new generation costs
 //! one pass over the remaining row groups (statistics and page index) and one
-//! decoder rebuild.
+//! decoder rebuild. Cumulative refresh planning is limited to eight times the
+//! initial frontier size. Refreshes exceeding the remaining budget retain the
+//! task's installed safe restrictions; later tasks capture newer publications.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -104,6 +106,7 @@ pub(super) struct RuntimePrunedStream {
     /// The frontier count identifies the group owning any overfetched bytes.
     /// It also changes when the decoder internally skips a fully filtered group.
     buffered_frontier: Option<usize>,
+    remaining_planning_budget: usize,
     #[cfg(test)]
     probe: Option<Arc<test_support::Probe>>,
 }
@@ -131,6 +134,7 @@ impl RuntimePrunedStream {
                 refresh.task.data_file_path(),
                 refresh.runtime_disabled.clone(),
             ),
+            remaining_planning_budget: selections.len().saturating_mul(8),
             decoder: Some(decoder),
             active_reader: None,
             file_reader,
@@ -158,6 +162,11 @@ impl RuntimePrunedStream {
             return Ok(());
         }
         self.refresh.seen_generation = generation;
+        if decoder.row_groups_remaining() > self.remaining_planning_budget {
+            // Advisory publications may be declined without revoking any
+            // installed restriction or weakening mandatory filters.
+            return Ok(());
+        }
         // `None`, a failed publication or a predicate already in force keep the
         // current restrictions.
         let Some(predicate) = self.refresh.predicates.current(
@@ -175,6 +184,8 @@ impl RuntimePrunedStream {
         {
             return Ok(());
         }
+
+        self.remaining_planning_budget -= decoder.row_groups_remaining();
 
         // Bring the local plan in lock-step with the decoder, which may have
         // skipped groups internally (for example an empty static selection).

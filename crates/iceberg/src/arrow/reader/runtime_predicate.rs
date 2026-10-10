@@ -265,6 +265,17 @@ impl RuntimePredicates {
                 (generation, None)
             }
         };
+        let predicate = predicate.map(|predicate| {
+            if let Some(cached) = cache.as_ref()
+                && cached.case_sensitive == case_sensitive
+                && (Arc::ptr_eq(&cached.schema, schema) || *cached.schema == **schema)
+                && cached.predicate.as_deref() == Some(predicate.as_ref())
+            {
+                cached.predicate.as_ref().unwrap().clone()
+            } else {
+                predicate
+            }
+        });
         let result = predicate.clone();
         *cache = Some(CachedPredicate {
             generation,
@@ -309,8 +320,8 @@ fn check_runtime_predicate_semantics(predicate: &BoundPredicate) -> Result<()> {
 }
 
 /// Fails if `predicate` references a column the file lacks (its default is
-/// invisible to physical filters) or stores with a promoted type (a literal
-/// cast before promotion can round or overflow and reject valid rows).
+/// invisible to physical filters) or stores with an unsupported promoted type.
+/// Signed INT32 to LONG is lossless in statistics, pages and row evaluation.
 pub(super) fn check_runtime_predicate_columns(
     predicate: &BoundPredicate,
     parquet_schema: &SchemaDescriptor,
@@ -353,7 +364,17 @@ pub(super) fn check_runtime_predicate_columns(
             .get(column)
             .ok_or_else(|| unusable("has no Arrow leaf column"))?;
         let target_type = type_to_arrow_type(&field.field_type)?;
-        if column_needs_type_promotion(source_field.data_type(), &target_type) {
+        let signed_int_to_long = source_field.data_type() == &arrow_schema::DataType::Int32
+            && target_type == arrow_schema::DataType::Int64
+            && parquet_schema.column(column).converted_type()
+                != parquet::basic::ConvertedType::UINT_32
+            && !parquet_schema.column(column).logical_type_ref().is_some_and(|logical| {
+                matches!(logical, parquet::basic::LogicalType::Integer(integer)
+                    if !integer.is_signed)
+            });
+        if column_needs_type_promotion(source_field.data_type(), &target_type)
+            && !signed_int_to_long
+        {
             return Err(unusable("is stored with a promoted physical type"));
         }
     }
@@ -747,7 +768,10 @@ mod tests {
 
             fn snapshot(&self) -> Result<RuntimePredicateSnapshot> {
                 self.snapshots.fetch_add(1, Ordering::Relaxed);
-                Ok(RuntimePredicateSnapshot::new(Some(self.predicate.clone()), 1))
+                Ok(RuntimePredicateSnapshot::new(
+                    Some(self.predicate.clone()),
+                    1,
+                ))
             }
         }
         let schema = Arc::new(
@@ -780,7 +804,11 @@ mod tests {
                         .collect();
                     barrier.wait();
                     let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
-                    assert!(results.iter().all(|(_, bound)| Arc::ptr_eq(bound, &results[0].1)));
+                    assert!(
+                        results
+                            .iter()
+                            .all(|(_, bound)| Arc::ptr_eq(bound, &results[0].1))
+                    );
                     let max = results.iter().map(|(time, _)| *time).max().unwrap();
                     samples.push(max.as_secs_f64() * 1000.0);
                 });
@@ -792,6 +820,40 @@ mod tests {
                 samples[2],
             );
         }
+    }
+
+    #[test]
+    fn equivalent_publication_reuses_binding_without_reusing_generation() {
+        struct Provider(AtomicU64);
+        impl RuntimePredicateProvider for Provider {
+            fn generation(&self) -> u64 {
+                self.0.load(Ordering::Acquire)
+            }
+
+            fn snapshot(&self) -> Result<RuntimePredicateSnapshot> {
+                Ok(RuntimePredicateSnapshot::new(
+                    Some(Reference::new("id").less_than(Datum::long(10))),
+                    self.generation(),
+                ))
+            }
+        }
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let provider = Arc::new(Provider(AtomicU64::new(1)));
+        let predicates = RuntimePredicates::new(provider.clone());
+        let first = predicates.current(&schema, false, "first").unwrap();
+        provider.0.store(2, Ordering::Release);
+        let second = predicates.current(&schema, false, "second").unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(predicates.cached.read().unwrap().as_ref().unwrap().generation, 2);
+        let case_sensitive = predicates.current(&schema, true, "case").unwrap();
+        assert!(!Arc::ptr_eq(&second, &case_sensitive));
     }
 
 }

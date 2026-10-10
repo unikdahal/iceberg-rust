@@ -3600,7 +3600,6 @@ async fn largest_first_fallback_contract() {
     }
 }
 
-
 #[tokio::test]
 #[ignore = "timing test run explicitly by fork CI"]
 async fn runtime_performance_boundary_publications() {
@@ -3620,12 +3619,19 @@ async fn runtime_performance_boundary_publications() {
         let path = temp.path().join(format!("timing-{groups}.parquet"));
         let path = path.to_str().unwrap();
         write_cycling_groups(path, groups);
-        for mode in ["no-provider", "none", "stable", "one", "churn", "tightening"] {
+        for mode in [
+            "no-provider",
+            "none",
+            "stable",
+            "one",
+            "churn",
+            "tightening",
+        ] {
             let mut samples = Vec::new();
             for _ in 0..3 {
                 let predicate = Reference::new("k").greater_than_or_equal_to(Datum::int(2));
-                let initial = matches!(mode, "stable" | "churn" | "tightening")
-                    .then_some(predicate.clone());
+                let initial =
+                    matches!(mode, "stable" | "churn" | "tightening").then_some(predicate.clone());
                 let provider = Arc::new(ChangingRuntimePredicate::new(initial, 0));
                 let runtime = (mode != "no-provider")
                     .then_some(provider.clone() as Arc<dyn RuntimePredicateProvider>);
@@ -3637,8 +3643,10 @@ async fn runtime_performance_boundary_publications() {
                 while let Some(batch) = stream.try_next().await.unwrap() {
                     rows += batch.num_rows();
                     boundaries += 1;
-                    if boundaries < groups && (mode == "churn" || mode == "tightening"
-                        || (mode == "one" && boundaries == 1))
+                    if boundaries < groups
+                        && (mode == "churn"
+                            || mode == "tightening"
+                            || (mode == "one" && boundaries == 1))
                     {
                         let published = if mode == "tightening" {
                             predicate.clone().and(
@@ -3670,4 +3678,244 @@ async fn runtime_performance_boundary_publications() {
             println!("R3 median groups={groups} mode={mode} ms={:.3}", samples[1]);
         }
     }
+}
+
+
+#[tokio::test]
+#[ignore = "timing test run explicitly by fork CI"]
+async fn runtime_performance_promoted_integer() {
+    use std::time::Instant;
+
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("promoted-timing.parquet");
+    let path = path.to_str().unwrap();
+    let bases: Vec<_> = (0..2000).map(|group| group * 4).collect();
+    write_groups(path, &bases, true, None, false);
+    for primitive in [PrimitiveType::Int, PrimitiveType::Long] {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(primitive.clone())).into(),
+                    NestedField::required(2, "payload", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let predicate = Reference::new("id").greater_than_or_equal_to(match primitive {
+            PrimitiveType::Int => Datum::int(4000),
+            _ => Datum::long(4000),
+        });
+        let mut samples = Vec::new();
+        for runtime in [false, true] {
+            samples.clear();
+            for _ in 0..3 {
+                let task = scan_task(path.to_string(), schema.clone(), None);
+                let provider = runtime.then_some(
+                    Arc::new(FixedRuntimePredicate::new(predicate.clone()))
+                        as Arc<dyn RuntimePredicateProvider>,
+                );
+                let started = Instant::now();
+                let (batches, metrics) = execute(task, provider).await;
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                assert_eq!(rows, if runtime { 4000 } else { 8000 });
+                println!(
+                    "R3 promotion table={primitive} runtime={runtime} ms={:.3} rows={rows} bytes={} groups_pruned={}",
+                    samples.last().unwrap(),
+                    metrics.bytes_read(),
+                    metrics.runtime_row_groups_pruned(),
+                );
+            }
+        samples.sort_by(f64::total_cmp);
+        println!("R3 promotion median table={primitive} runtime={runtime} ms={:.3}", samples[1]);
+        }
+    }
+}
+
+
+#[tokio::test]
+async fn runtime_int_to_long_operator_matrix() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("int-long-matrix.parquet");
+    let path = path.to_str().unwrap();
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        field("id", DataType::Int32, 1),
+        Field::new("value", DataType::Int32, true).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "2".to_string(),
+        )])),
+    ]));
+    let properties = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(2))
+        .set_data_page_row_count_limit(1)
+        .set_write_batch_size(1)
+        .set_bloom_filter_enabled(true)
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(path).unwrap(),
+        arrow_schema.clone(),
+        Some(properties),
+    )
+    .unwrap();
+    let values = [Some(i32::MIN), None, Some(-1), Some(0), Some(1), Some(i32::MAX)];
+    for (group, values) in values.chunks(2).enumerate() {
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(vec![group as i32 * 2, group as i32 * 2 + 1])),
+            Arc::new(Int32Array::from(values.to_vec())),
+        ])
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.flush().unwrap();
+    }
+    writer.close().unwrap();
+    let schema = Arc::new(
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "value", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let below = Datum::long(i64::from(i32::MIN) - 1);
+    let above = Datum::long(i64::from(i32::MAX) + 1);
+    for (predicate, expected) in [
+        (Reference::new("value").less_than(below.clone()), vec![]),
+        (Reference::new("value").less_than(above.clone()), vec![0, 2, 3, 4, 5]),
+        (Reference::new("value").less_than_or_equal_to(Datum::long(0)), vec![0, 2, 3]),
+        (Reference::new("value").greater_than(Datum::long(0)), vec![4, 5]),
+        (Reference::new("value").greater_than_or_equal_to(above.clone()), vec![]),
+        (Reference::new("value").equal_to(Datum::long(1)), vec![4]),
+        (Reference::new("value").not_equal_to(above.clone()), vec![0, 2, 3, 4, 5]),
+        (Reference::new("value").is_in([below.clone(), Datum::long(-1), above.clone()]), vec![2]),
+        (Reference::new("value").is_not_in([below, Datum::long(-1), above]), vec![0, 3, 4, 5]),
+        (Reference::new("value").is_null(), vec![1]),
+        (Reference::new("value").is_not_null(), vec![0, 2, 3, 4, 5]),
+    ] {
+        let planned = predicate.clone().bind(schema.clone(), false).unwrap();
+        let task = scan_task(path.to_string(), schema.clone(), Some(planned));
+        let (baseline, _) = execute_tasks(vec![task], None, true).await;
+        assert_eq!(ids(&baseline), expected, "planned: {predicate}");
+        for bloom in [false, true] {
+            let task = scan_task(path.to_string(), schema.clone(), None);
+            let provider = Arc::new(FixedRuntimePredicate::new(predicate.clone()));
+            let (batches, metrics) = execute_tasks(vec![task], Some(provider), bloom).await;
+            assert_eq!(ids(&batches), expected, "runtime: {predicate}, bloom={bloom}");
+            assert_eq!(metrics.runtime_predicate_tasks(), 1);
+        }
+    }
+}
+
+
+#[tokio::test]
+async fn runtime_publication_budget_retains_mandatory_filters_and_deletes() {
+    const GROUPS: i32 = 256;
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("budget.parquet");
+    let path = path.to_str().unwrap();
+    write_cycling_groups(path, GROUPS);
+    let position_path = temp.path().join("budget-position.parquet");
+    let position_path = position_path.to_str().unwrap();
+    write_delete(
+        position_path,
+        vec![
+            field("file_path", DataType::Utf8, 2_147_483_546),
+            field("pos", DataType::Int64, 2_147_483_545),
+        ],
+        vec![
+            Arc::new(StringArray::from(vec![path])),
+            Arc::new(Int64Array::from(vec![502])),
+        ],
+    );
+    let equality_path = temp.path().join("budget-equality.parquet");
+    let equality_path = equality_path.to_str().unwrap();
+    write_delete(equality_path, vec![field("id", DataType::Int32, 1)], vec![
+        Arc::new(Int32Array::from(vec![402])),
+    ]);
+    let schema = Arc::new(
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "k", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let planned = Reference::new("k")
+        .less_than_or_equal_to(Datum::int(2))
+        .bind(schema.clone(), false)
+        .unwrap();
+    let task = scan_task_with_deletes_and_projection(
+        path.to_string(),
+        schema,
+        Some(planned),
+        vec![
+            delete_task(position_path.to_string(), true),
+            delete_task(equality_path.to_string(), false),
+        ],
+        vec![1, 2, crate::spec::RESERVED_FIELD_ID_POS],
+    );
+    let predicate = Reference::new("k").greater_than_or_equal_to(Datum::int(2));
+    let provider = Arc::new(ChangingRuntimePredicate::new(Some(predicate.clone()), 0));
+    let (mut stream, metrics) = start_runtime_scan(task, Some(provider.clone()), true, true, 4);
+    let mut batches = Vec::new();
+    for boundary in 1..=12 {
+        batches.push(stream.try_next().await.unwrap().unwrap());
+        provider.publish(
+            Some(predicate.clone().and(
+                Reference::new("id").greater_than_or_equal_to(Datum::int(boundary * 4)),
+            )),
+            boundary as u64,
+        );
+    }
+    let rebuilds = metrics.runtime_decoder_rebuilds();
+    assert!(rebuilds > 0 && rebuilds <= 9);
+    provider.publish(Some(Predicate::AlwaysFalse), 13);
+    batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+    let expected: Vec<_> = (0..GROUPS)
+        .map(|group| group * 4 + 2)
+        .filter(|id| ![402, 502].contains(id))
+        .collect();
+    assert_eq!(ids(&batches), expected);
+    let positions: Vec<_> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch.column(2).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()
+        })
+        .collect();
+    assert_eq!(positions, expected.into_iter().map(i64::from).collect::<Vec<_>>());
+    assert_eq!(metrics.runtime_decoder_rebuilds(), rebuilds);
+    assert_eq!(metrics.runtime_predicate_refreshes(), rebuilds);
+    assert!(provider.snapshots() < 13);
+}
+
+#[tokio::test]
+async fn runtime_int_to_long_live_publication_prunes_groups_and_pages() {
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "live-long.parquet");
+    let schema = Arc::new(
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "payload", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let task = scan_task(path, schema, None);
+    let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let (mut stream, metrics) = start_runtime_scan(task, Some(provider.clone()), true, true, 4);
+    let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
+    provider.publish(Some(Reference::new("id").greater_than(Datum::long(200))), 1);
+    batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+    let values: Vec<_> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()
+        })
+        .collect();
+    assert_eq!(values, vec![0, 1, 2, 3, 201, 202, 203]);
+    assert_eq!(metrics.runtime_row_groups_pruned_live(), 1);
+    assert_eq!(metrics.runtime_decoder_rebuilds(), 1);
 }

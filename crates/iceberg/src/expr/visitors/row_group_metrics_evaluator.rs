@@ -136,19 +136,37 @@ impl<'a> RowGroupMetricsEvaluator<'a> {
     }
 
     fn min_value(&self, field_id: i32) -> Result<Option<Datum>> {
-        let Some((stats, primitive_type)) = self.stats_and_type_for_field_id(field_id)? else {
-            return Ok(None);
-        };
-
-        get_parquet_stat_min_as_datum(&primitive_type, stats)
+        self.bound_value(field_id, true)
     }
 
     fn max_value(&self, field_id: i32) -> Result<Option<Datum>> {
+        self.bound_value(field_id, false)
+    }
+
+    fn bound_value(&self, field_id: i32, lower: bool) -> Result<Option<Datum>> {
         let Some((stats, primitive_type)) = self.stats_and_type_for_field_id(field_id)? else {
             return Ok(None);
         };
-
-        get_parquet_stat_max_as_datum(&primitive_type, stats)
+        if let (PrimitiveType::Long, Statistics::Int32(stats)) = (&primitive_type, stats) {
+            let column = self.iceberg_field_id_to_parquet_column_index[&field_id];
+            let descriptor = self.row_group_metadata.column(column).column_descr();
+            // Unsigned bounds have signed physical bit patterns.
+            if descriptor.converted_type() == parquet::basic::ConvertedType::UINT_32
+                || descriptor.logical_type_ref().is_some_and(|logical| {
+                    matches!(logical, parquet::basic::LogicalType::Integer(integer)
+                        if !integer.is_signed)
+                })
+            {
+                return Ok(None);
+            }
+            let value = if lower { stats.min_opt() } else { stats.max_opt() };
+            return Ok(value.map(|value| Datum::long(i64::from(*value))));
+        }
+        if lower {
+            get_parquet_stat_min_as_datum(&primitive_type, stats)
+        } else {
+            get_parquet_stat_max_as_datum(&primitive_type, stats)
+        }
     }
 
     fn visit_inequality(
@@ -297,11 +315,7 @@ impl BoundPredicateVisitor for RowGroupMetricsEvaluator<'_> {
             return ROW_GROUP_CANT_MATCH;
         }
 
-        let Some((stats, primitive_type)) = self.stats_and_type_for_field_id(field_id)? else {
-            return ROW_GROUP_MIGHT_MATCH;
-        };
-
-        if let Some(lower_bound) = get_parquet_stat_min_as_datum(&primitive_type, stats)? {
+        if let Some(lower_bound) = self.min_value(field_id)? {
             if lower_bound.is_nan() {
                 // NaN indicates unreliable bounds.
                 // See the InclusiveMetricsEvaluator docs for more.
@@ -311,7 +325,7 @@ impl BoundPredicateVisitor for RowGroupMetricsEvaluator<'_> {
             }
         }
 
-        if let Some(upper_bound) = get_parquet_stat_max_as_datum(&primitive_type, stats)? {
+        if let Some(upper_bound) = self.max_value(field_id)? {
             if upper_bound.is_nan() {
                 // NaN indicates unreliable bounds.
                 // See the InclusiveMetricsEvaluator docs for more.
@@ -484,12 +498,8 @@ impl BoundPredicateVisitor for RowGroupMetricsEvaluator<'_> {
             return ROW_GROUP_MIGHT_MATCH;
         }
 
-        let Some((stats, primitive_type)) = self.stats_and_type_for_field_id(field_id)? else {
-            return ROW_GROUP_MIGHT_MATCH;
-        };
-
-        let lower_bound = get_parquet_stat_min_as_datum(&primitive_type, stats)?;
-        let upper_bound = get_parquet_stat_max_as_datum(&primitive_type, stats)?;
+        let lower_bound = self.min_value(field_id)?;
+        let upper_bound = self.max_value(field_id)?;
         if lower_bound.as_ref().is_some_and(Datum::is_nan)
             || upper_bound.as_ref().is_some_and(Datum::is_nan)
         {
