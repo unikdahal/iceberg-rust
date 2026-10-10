@@ -3314,7 +3314,8 @@ mod tests {
         .await
         .unwrap();
 
-        // Drop owner concurrently while waiter is pending and owner read was in-flight.
+        // Release Task A's read to fail with retryable error and drop owner concurrently.
+        gate.release.add_permits(1);
         drop(owner);
         tokio::time::timeout(Duration::from_secs(5), gate.dropped.notified())
             .await
@@ -3341,12 +3342,14 @@ mod tests {
         let pos_del_path = format!("{}/pos-del.parquet", directory.path().display());
 
         let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![
-            Field::new("id", DataType::Int32, false).with_metadata(
-                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
-            ),
-            Field::new("val", DataType::Utf8, false).with_metadata(
-                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
-            ),
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("val", DataType::Utf8, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
         ]));
 
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![

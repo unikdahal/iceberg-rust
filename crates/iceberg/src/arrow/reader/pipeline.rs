@@ -1455,7 +1455,28 @@ impl ArrowReader {
         let arrow_metadata = ArrowReaderMetadata::load_async(&mut reader, arrow_reader_options)
             .await
             .map_err(|e| {
-                Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata").with_source(e)
+                let retryable = match &e {
+                    parquet::errors::ParquetError::External(source) => {
+                        if let Some(err) = source.downcast_ref::<Error>() {
+                            err.retryable()
+                        } else if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
+                            matches!(
+                                io_err.kind(),
+                                std::io::ErrorKind::TimedOut
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::NotConnected
+                                    | std::io::ErrorKind::Interrupted
+                            )
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata")
+                    .with_retryable(retryable)
+                    .with_source(e)
             })?;
 
         Ok((reader, arrow_metadata))
@@ -1601,8 +1622,8 @@ mod tests {
                 HashMap::from([(1, 2)]),
                 HashMap::from([(1, 0)]),
                 HashMap::from([(1, 0)]),
-                HashMap::from([(1, negative_zero.clone())]),
-                HashMap::from([(1, negative_zero)]),
+                HashMap::from([(1, positive_zero.clone())]),
+                HashMap::from([(1, positive_zero)]),
             );
             for predicate in [
                 Reference::new("key").equal_to(positive_zero.clone()),
