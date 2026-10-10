@@ -130,12 +130,6 @@ enum ParsedDeleteFileContext {
     ExistingPosDel,
 }
 
-/// Maximum number of load attempts per delete file within one scan task before
-/// giving up. Retryable failures and reclaimed claims release the cache entry,
-/// so a task re-claims and retries; this bound stops a persistently failing
-/// file from retrying without limit inside a single task.
-const MAX_DELETE_LOAD_ATTEMPTS: usize = 3;
-
 #[allow(unused_variables)]
 impl CachingDeleteFileLoader {
     pub(crate) fn new(
@@ -318,15 +312,14 @@ impl CachingDeleteFileLoader {
                     return Self::load_deletion_vector(task, basic_delete_file_loader).await;
                 }
 
-                for _ in 0..MAX_DELETE_LOAD_ATTEMPTS {
+                loop {
                     match del_filter.try_start_pos_del_load(task.file_path()) {
                         PosDelLoadAction::AlreadyLoaded => {
                             return Ok(DeleteFileContext::ExistingPosDel);
                         }
                         PosDelLoadAction::WaitFor(notified) => {
-                            // Re-check after waking: cancellation or a retryable
-                            // failure releases the entry and another waiter may
-                            // have claimed it before we run again.
+                            // Re-check after waking: cancellation releases the entry and
+                            // another waiter may have claimed it before we run again.
                             notified.await;
                         }
                         PosDelLoadAction::Failed(error) => return Err(error),
@@ -345,41 +338,20 @@ impl CachingDeleteFileLoader {
                         }
                     }
                 }
-                Err(Error::new(
-                    ErrorKind::Unexpected,
-                    format!(
-                        "Exceeded maximum load attempts for delete file '{}'",
-                        task.file_path()
-                    ),
-                ))
             }
 
             DataContentType::EqualityDeletes => {
-                let sender = {
-                    let mut sender = None;
-                    for _ in 0..MAX_DELETE_LOAD_ATTEMPTS {
-                        if let Some(claimed) = del_filter.try_start_eq_del_load(task.file_path()) {
-                            sender = Some(claimed);
-                            break;
-                        }
-                        if del_filter
-                            .get_equality_delete_predicate_for_delete_file_path(task.file_path())
-                            .await?
-                            .is_some()
-                        {
-                            return Ok(DeleteFileContext::ExistingEqDel);
-                        }
+                let sender = loop {
+                    if let Some(sender) = del_filter.try_start_eq_del_load(task.file_path()) {
+                        break sender;
                     }
-                    sender
-                };
-                let Some(sender) = sender else {
-                    return Err(Error::new(
-                        ErrorKind::Unexpected,
-                        format!(
-                            "Exceeded maximum load attempts for equality delete file '{}'",
-                            task.file_path()
-                        ),
-                    ));
+                    if del_filter
+                        .get_equality_delete_predicate_for_delete_file_path(task.file_path())
+                        .await?
+                        .is_some()
+                    {
+                        return Ok(DeleteFileContext::ExistingEqDel);
+                    }
                 };
 
                 // Per the Iceberg spec, evolve schema for equality deletes but only for the
@@ -1153,7 +1125,7 @@ mod tests {
                 .gate
                 .fail_reads
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    (remaining > 0).then_some(remaining - 1)
+                    if remaining > 0 { Some(remaining - 1) } else { None }
                 })
                 .is_ok();
             if should_fail {

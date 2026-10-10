@@ -126,7 +126,9 @@ impl BasicDeleteFileLoader {
                         }
                         _ => false,
                     };
-                    Error::new(ErrorKind::Unexpected, format!("{e}")).with_retryable(retryable)
+                    Error::new(ErrorKind::Unexpected, "Failed to read delete file batch")
+                        .with_retryable(retryable)
+                        .with_source(e)
                 });
 
         Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
