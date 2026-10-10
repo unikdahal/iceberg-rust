@@ -1413,6 +1413,17 @@ impl FileScanTaskReader {
     }
 }
 
+/// Whether a Parquet error wraps a retryable storage error. `ArrowFileReader` reports storage
+/// failures as an external [`Error`], so a retryable read stays retryable through Parquet.
+pub(crate) fn parquet_error_is_retryable(error: &parquet::errors::ParquetError) -> bool {
+    match error {
+        parquet::errors::ParquetError::External(source) => {
+            source.downcast_ref::<Error>().is_some_and(Error::retryable)
+        }
+        _ => false,
+    }
+}
+
 impl ArrowReader {
     /// Opens a Parquet file and loads its metadata, wrapping the reader with
     /// [`CountingFileRead`] so all I/O is accumulated into `bytes_read`.
@@ -1455,30 +1466,8 @@ impl ArrowReader {
         let arrow_metadata = ArrowReaderMetadata::load_async(&mut reader, arrow_reader_options)
             .await
             .map_err(|e| {
-                let retryable = match &e {
-                    parquet::errors::ParquetError::External(source) => {
-                        if let Some(err) = source.downcast_ref::<Error>() {
-                            err.retryable()
-                        } else if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
-                            matches!(
-                                io_err.kind(),
-                                std::io::ErrorKind::TimedOut
-                                    | std::io::ErrorKind::ConnectionReset
-                                    | std::io::ErrorKind::ConnectionAborted
-                                    | std::io::ErrorKind::NotConnected
-                                    | std::io::ErrorKind::Interrupted
-                            )
-                        } else {
-                            false
-                        }
-                    }
-                    _ => false,
-                };
-                // A storage error that is retryable must stay retryable through
-                // the metadata load so the delete loader can release its claim
-                // and retry it.
                 Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata")
-                    .with_retryable(retryable)
+                    .with_retryable(parquet_error_is_retryable(&e))
                     .with_source(e)
             })?;
 

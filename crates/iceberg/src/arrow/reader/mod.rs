@@ -50,6 +50,8 @@ mod runtime_predicate_tests;
 mod runtime_stream;
 pub use file_reader::ArrowFileReader;
 pub(crate) use options::ParquetReadOptions;
+pub(crate) use pipeline::parquet_error_is_retryable;
+pub(crate) use predicate_visitor::IN_SET_THRESHOLD;
 use predicate_visitor::{CollectFieldIdVisitor, PredicateConverter};
 use projection::{
     add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,

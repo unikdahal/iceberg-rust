@@ -662,7 +662,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
 
 /// Literal count above which `IN` and `NOT IN` switch from one comparison
 /// pass per literal to a hash lookup per row.
-const IN_SET_THRESHOLD: usize = 8;
+pub(crate) const IN_SET_THRESHOLD: usize = 8;
 
 /// The literals of an `IN` predicate as a hash set over one column type.
 enum InSet {

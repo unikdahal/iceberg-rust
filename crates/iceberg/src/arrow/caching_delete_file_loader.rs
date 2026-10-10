@@ -28,6 +28,7 @@ use futures::{StreamExt, TryStreamExt};
 use tokio::sync::oneshot::{Receiver, channel};
 
 use super::delete_filter::{DeleteFilter, EqDelLoadResult, PosDelLoadAction, PosDelLoadGuard};
+use super::reader::IN_SET_THRESHOLD;
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
 use crate::arrow::scan_metrics::ScanMetrics;
 use crate::arrow::{arrow_primitive_to_literal, arrow_schema_to_schema};
@@ -57,11 +58,12 @@ pub(crate) struct CachingDeleteFileLoader {
 }
 
 /// Owns delete loading until completion or cancellation of the scan task.
-/// Dropping this future aborts its task. Cancellation releases cache claims so
-/// other tasks or scans sharing the reader can load the files themselves.
-/// Genuine load and parse errors remain cached for all waiters.
+/// Dropping this future aborts its task. Cancellation and retryable errors release
+/// cache claims so other tasks or scans sharing the reader can load the files
+/// themselves. Other load and parse errors are cached for all waiters.
 pub(crate) struct DeleteLoad {
-    receiver: Receiver<Result<DeleteFilter>>,
+    /// `None` once the task has dropped its sender without sending a result.
+    receiver: Option<Receiver<Result<DeleteFilter>>>,
     task: JoinHandle<()>,
 }
 
@@ -69,17 +71,25 @@ impl Future for DeleteLoad {
     type Output = Result<DeleteFilter>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.get_mut().receiver)
-            .poll(cx)
-            .map(|result| {
-                result.unwrap_or_else(|error| {
-                    Err(Error::new(
-                        ErrorKind::Unexpected,
-                        "Delete loading stopped before completing",
-                    )
-                    .with_source(error))
-                })
+        let this = self.get_mut();
+        if let Some(receiver) = this.receiver.as_mut() {
+            match Pin::new(receiver).poll(cx) {
+                Poll::Ready(Ok(result)) => return Poll::Ready(result),
+                Poll::Ready(Err(_)) => this.receiver = None,
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        // The task ended without a result; report how it ended, such as a panic.
+        Pin::new(&mut this.task).poll(cx).map(|ended| {
+            let error = Error::new(
+                ErrorKind::Unexpected,
+                "Delete loading stopped before completing",
+            );
+            Err(match ended {
+                Ok(()) => error,
+                Err(cause) => error.with_source(cause),
             })
+        })
     }
 }
 
@@ -166,10 +176,10 @@ impl CachingDeleteFileLoader {
     ///  * for positional deletes the load phase instantiates an ArrowRecordBatchStream to
     ///    stream the file contents out
     ///  * for eq deletes, we first check if the EQ delete is already loaded or being loaded by
-    ///    another concurrently processing data file scan task. We wait for that load,
-    ///    retrying if it is cancelled. Otherwise, the DeleteFilter reserves the file with a
-    ///    notifier to prevent duplicate loads. We load
-    ///    the EQ delete's record batch stream, convert it to a predicate, update the delete filter,
+    ///    another concurrently processing data file scan task. We wait for that load, and claim
+    ///    the file ourselves if it is cancelled or fails with a retryable error. Otherwise, the
+    ///    DeleteFilter reserves the file with a notifier to prevent duplicate loads. We load the
+    ///    EQ delete's record batch stream, convert it to a predicate, update the delete filter,
     ///    and notify any task that was waiting for it.
     ///  * For a V3 deletion vector, the load phase reads the blob's byte range directly from its
     ///    Puffin file (decrypting first if the entry carries key metadata), and the parse phase
@@ -295,7 +305,10 @@ impl CachingDeleteFileLoader {
             let _ = tx.send(result);
         });
 
-        DeleteLoad { receiver: rx, task }
+        DeleteLoad {
+            receiver: Some(rx),
+            task,
+        }
     }
 
     async fn load_file_for_task(
@@ -318,8 +331,8 @@ impl CachingDeleteFileLoader {
                             return Ok(DeleteFileContext::ExistingPosDel);
                         }
                         PosDelLoadAction::WaitFor(notified) => {
-                            // Re-check after waking: cancellation releases the entry and
-                            // another waiter may have claimed it before we run again.
+                            // Re-check after waking: cancellation or a retryable failure
+                            // releases the entry, and another waiter may claim it first.
                             notified.await;
                         }
                         PosDelLoadAction::Failed(error) => return Err(error),
@@ -386,7 +399,7 @@ impl CachingDeleteFileLoader {
                     Ok(result) => result,
                     Err(error) => {
                         let error = Arc::new(error);
-                        let returned = DeleteFilter::cached_load_error(task.file_path(), &error);
+                        let returned = DeleteFilter::load_error(task.file_path(), &error);
                         let _ = sender.send(Err(error));
                         return Err(returned);
                     }
@@ -548,7 +561,7 @@ impl CachingDeleteFileLoader {
                     Ok(predicate) => predicate,
                     Err(error) => {
                         let error = Arc::new(error);
-                        let returned = DeleteFilter::cached_load_error(&file_path, &error);
+                        let returned = DeleteFilter::load_error(&file_path, &error);
                         let _ = sender.send(Err(error));
                         return Err(returned);
                     }
@@ -707,8 +720,8 @@ impl CachingDeleteFileLoader {
 
             // For one equality column, keeping rows that match none of the delete keys is
             // a set-membership test. Float equality must retain the comparison path: Datum
-            // hashing normalizes signed zero and NaNs, whereas Arrow comparisons distinguish
-            // them. Keep the row predicates for compound keys, where each row is a tuple.
+            // equality treats every NaN payload as one value, whereas Arrow comparisons are
+            // bitwise. Keep the row predicates for compound keys, where each row is a tuple.
             let use_single_column_set = equality_ids.len() == 1
                 && processor.collected_columns.len() == 1
                 && !matches!(
@@ -717,17 +730,17 @@ impl CachingDeleteFileLoader {
                 );
 
             let mut datum_columns_with_names = processor.finish()?;
-            if datum_columns_with_names.is_empty() {
+            if use_single_column_set {
+                if let Some((column, field_name)) = datum_columns_with_names.pop() {
+                    let deletes = single_column_deletes
+                        .get_or_insert_with(|| SingleColumnEqualityDeletes::new(field_name));
+                    for value in column {
+                        deletes.push(value?);
+                    }
+                }
                 continue;
             }
-
-            if use_single_column_set {
-                let (column, field_name) = datum_columns_with_names.pop().unwrap();
-                let deletes = single_column_deletes
-                    .get_or_insert_with(|| SingleColumnEqualityDeletes::new(field_name));
-                for value in column {
-                    deletes.push(value?);
-                }
+            if datum_columns_with_names.is_empty() {
                 continue;
             }
 
@@ -783,7 +796,8 @@ impl CachingDeleteFileLoader {
 }
 
 /// Accumulates one equality key across batches without allocating a predicate per row.
-/// Small deletes retain the comparison path; larger deletes are deduplicated as they load.
+/// Up to [`IN_SET_THRESHOLD`] deletes keep one comparison each; more are deduplicated as they
+/// load into one `NOT IN` set, which the reader evaluates with a hash lookup.
 struct SingleColumnEqualityDeletes {
     field_name: String,
     values: EqualityDeleteValues,
@@ -796,8 +810,6 @@ enum EqualityDeleteValues {
 }
 
 impl SingleColumnEqualityDeletes {
-    const COMPARISON_LIMIT: usize = 8;
-
     fn new(field_name: String) -> Self {
         Self {
             field_name,
@@ -808,7 +820,7 @@ impl SingleColumnEqualityDeletes {
 
     fn push(&mut self, value: Option<Datum>) {
         if let EqualityDeleteValues::Small(values) = &mut self.values {
-            if values.len() < Self::COMPARISON_LIMIT {
+            if values.len() < IN_SET_THRESHOLD {
                 values.push(value);
                 return;
             }
@@ -1096,6 +1108,8 @@ mod tests {
         release: tokio::sync::Semaphore,
         dropped: tokio::sync::Notify,
         completed_bytes: AtomicU64,
+        /// Number of storage reads that pass before injected failures apply.
+        pass_reads: AtomicUsize,
         /// Number of storage reads that fail before reaching the inner reader.
         fail_reads: AtomicUsize,
         /// Retryability reported by injected failures.
@@ -1111,6 +1125,7 @@ mod tests {
                 release: tokio::sync::Semaphore::new(0),
                 dropped: tokio::sync::Notify::new(),
                 completed_bytes: AtomicU64::new(0),
+                pass_reads: AtomicUsize::new(0),
                 fail_reads: AtomicUsize::new(0),
                 fail_retryable: AtomicBool::new(false),
                 read_calls: AtomicUsize::new(0),
@@ -1146,17 +1161,12 @@ mod tests {
             self.gate.started.add_permits(1);
             // Closing the gate releases this read and all subsequent reads.
             let _ = self.gate.release.acquire().await;
-            let should_fail = self
-                .gate
-                .fail_reads
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    if remaining > 0 {
-                        Some(remaining - 1)
-                    } else {
-                        None
-                    }
-                })
-                .is_ok();
+            let take = |counter: &AtomicUsize| {
+                counter
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            };
+            let should_fail = !take(&self.gate.pass_reads) && take(&self.gate.fail_reads);
             if should_fail {
                 return Err(
                     Error::new(ErrorKind::Unexpected, "injected storage read failure")
@@ -1170,6 +1180,116 @@ mod tests {
                 .fetch_add(bytes.len() as u64, Ordering::SeqCst);
             Ok(bytes)
         }
+    }
+
+    /// Local filesystem storage that counts metadata requests and can gate or fail reads.
+    /// It is its own factory, so every `FileIO` built from it shares the same instruments.
+    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+    struct InstrumentedStorage {
+        #[serde(skip)]
+        calls: Arc<AtomicUsize>,
+        /// Fail every metadata request with a retryable error.
+        #[serde(skip)]
+        fail_metadata: bool,
+        #[serde(skip)]
+        read_gate: Option<Arc<ReadGate>>,
+    }
+
+    #[async_trait::async_trait]
+    #[typetag::serde(name = "test_instrumented_storage")]
+    impl crate::io::Storage for InstrumentedStorage {
+        async fn exists(&self, path: &str) -> Result<bool> {
+            crate::io::LocalFsStorage::new().exists(path).await
+        }
+
+        async fn metadata(&self, path: &str) -> Result<crate::io::FileMetadata> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_metadata {
+                return Err(
+                    Error::new(ErrorKind::Unexpected, "metadata temporarily unavailable")
+                        .with_retryable(true),
+                );
+            }
+            crate::io::LocalFsStorage::new().metadata(path).await
+        }
+
+        async fn read(&self, path: &str) -> Result<Bytes> {
+            crate::io::LocalFsStorage::new().read(path).await
+        }
+
+        async fn reader(&self, path: &str) -> Result<Box<dyn crate::io::FileRead>> {
+            let reader = crate::io::LocalFsStorage::new().reader(path).await?;
+            match &self.read_gate {
+                Some(gate) => Ok(Box::new(GatedFileRead {
+                    inner: reader,
+                    gate: Arc::clone(gate),
+                })),
+                None => Ok(reader),
+            }
+        }
+
+        async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
+            crate::io::LocalFsStorage::new().write(path, bs).await
+        }
+
+        async fn writer(&self, path: &str) -> Result<Box<dyn crate::io::FileWrite>> {
+            crate::io::LocalFsStorage::new().writer(path).await
+        }
+
+        async fn delete(&self, path: &str) -> Result<()> {
+            crate::io::LocalFsStorage::new().delete(path).await
+        }
+
+        async fn delete_prefix(&self, path: &str) -> Result<()> {
+            crate::io::LocalFsStorage::new().delete_prefix(path).await
+        }
+
+        async fn delete_stream(
+            &self,
+            paths: futures::stream::BoxStream<'static, String>,
+        ) -> Result<()> {
+            crate::io::LocalFsStorage::new().delete_stream(paths).await
+        }
+
+        fn new_input(&self, path: &str) -> Result<crate::io::InputFile> {
+            Ok(crate::io::InputFile::new(
+                Arc::new(self.clone()),
+                path.to_string(),
+            ))
+        }
+
+        fn new_output(&self, path: &str) -> Result<crate::io::OutputFile> {
+            Ok(crate::io::OutputFile::new(
+                Arc::new(self.clone()),
+                path.to_string(),
+            ))
+        }
+    }
+
+    #[typetag::serde(name = "test_instrumented_storage_factory")]
+    impl crate::io::StorageFactory for InstrumentedStorage {
+        fn build(&self, _config: &crate::io::StorageConfig) -> Result<Arc<dyn crate::io::Storage>> {
+            Ok(Arc::new(self.clone()))
+        }
+    }
+
+    fn gated_loader(gate: &Arc<ReadGate>) -> CachingDeleteFileLoader {
+        let file_io = crate::io::FileIOBuilder::new(Arc::new(InstrumentedStorage {
+            read_gate: Some(Arc::clone(gate)),
+            ..Default::default()
+        }))
+        .build();
+        CachingDeleteFileLoader::new(file_io, 2, Runtime::current())
+    }
+
+    /// Storage reads made by one uninterrupted load of `deletes`.
+    async fn reads_for_one_load(deletes: &[FileScanTaskDeleteFile], schema: SchemaRef) -> usize {
+        let gate = ReadGate::open();
+        gated_loader(&gate)
+            .load_deletes(deletes, schema)
+            .await
+            .unwrap();
+        gate.read_calls.load(Ordering::SeqCst)
     }
 
     fn equality_delete_fixture(directory: &TempDir) -> (FileScanTaskDeleteFile, SchemaRef) {
@@ -1223,7 +1343,7 @@ mod tests {
         let task = &tasks[0];
         let delete = &task.deletes()[0];
         let gate = Arc::new(ReadGate::new());
-        let file_io = crate::io::FileIOBuilder::new(Arc::new(MetadataCountingStorageFactory {
+        let file_io = crate::io::FileIOBuilder::new(Arc::new(InstrumentedStorage {
             read_gate: Some(Arc::clone(&gate)),
             ..Default::default()
         }))
@@ -1258,7 +1378,6 @@ mod tests {
         assert_eq!(gate.completed_bytes.load(Ordering::SeqCst), 0);
         assert_eq!(metrics.bytes_read(), bytes_before_drop);
 
-        // A fresh load on the same loader reclaims the cancelled entry.
         let filter = tokio::time::timeout(
             Duration::from_secs(5),
             loader.load_deletes(std::slice::from_ref(delete), task.schema_ref()),
@@ -1277,7 +1396,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let (delete, schema) = equality_delete_fixture(&directory);
         let gate = Arc::new(ReadGate::new());
-        let file_io = crate::io::FileIOBuilder::new(Arc::new(MetadataCountingStorageFactory {
+        let file_io = crate::io::FileIOBuilder::new(Arc::new(InstrumentedStorage {
             read_gate: Some(Arc::clone(&gate)),
             ..Default::default()
         }))
@@ -1331,7 +1450,7 @@ mod tests {
         let (equality_delete, schema) = equality_delete_fixture(&directory);
         let deletes = vec![task.deletes()[0].clone(), equality_delete.clone()];
         let gate = Arc::new(ReadGate::new());
-        let file_io = crate::io::FileIOBuilder::new(Arc::new(MetadataCountingStorageFactory {
+        let file_io = crate::io::FileIOBuilder::new(Arc::new(InstrumentedStorage {
             read_gate: Some(Arc::clone(&gate)),
             ..Default::default()
         }))
@@ -1373,14 +1492,13 @@ mod tests {
         let gate = ReadGate::open();
         gate.fail_reads.store(1, Ordering::SeqCst);
         gate.fail_retryable.store(true, Ordering::SeqCst);
-        let file_io = crate::io::FileIOBuilder::new(Arc::new(MetadataCountingStorageFactory {
+        let file_io = crate::io::FileIOBuilder::new(Arc::new(InstrumentedStorage {
             read_gate: Some(Arc::clone(&gate)),
             ..Default::default()
         }))
         .build();
         let loader = CachingDeleteFileLoader::new(file_io, 2, Runtime::current());
 
-        // The first attempt fails with a retryable storage error...
         let first_err = tokio::time::timeout(
             Duration::from_secs(5),
             loader.load_deletes(std::slice::from_ref(delete), task.schema_ref()),
@@ -1390,8 +1508,6 @@ mod tests {
         .unwrap_err();
         assert!(first_err.retryable());
 
-        // ...and a later load on the same loader succeeds instead of reading the
-        // cached failure.
         let filter = tokio::time::timeout(
             Duration::from_secs(5),
             loader.load_deletes(std::slice::from_ref(delete), task.schema_ref()),
@@ -1412,7 +1528,7 @@ mod tests {
         let gate = ReadGate::open();
         gate.fail_reads.store(1, Ordering::SeqCst);
         gate.fail_retryable.store(true, Ordering::SeqCst);
-        let file_io = crate::io::FileIOBuilder::new(Arc::new(MetadataCountingStorageFactory {
+        let file_io = crate::io::FileIOBuilder::new(Arc::new(InstrumentedStorage {
             read_gate: Some(Arc::clone(&gate)),
             ..Default::default()
         }))
@@ -1447,7 +1563,7 @@ mod tests {
         let gate = ReadGate::open();
         gate.fail_reads.store(1, Ordering::SeqCst);
         gate.fail_retryable.store(false, Ordering::SeqCst);
-        let file_io = crate::io::FileIOBuilder::new(Arc::new(MetadataCountingStorageFactory {
+        let file_io = crate::io::FileIOBuilder::new(Arc::new(InstrumentedStorage {
             read_gate: Some(Arc::clone(&gate)),
             ..Default::default()
         }))
@@ -1463,7 +1579,6 @@ mod tests {
         .unwrap_err();
         assert!(!first_err.retryable());
 
-        // The cached failure is returned without any further storage read.
         let second_err = tokio::time::timeout(
             Duration::from_secs(5),
             loader.load_deletes(std::slice::from_ref(delete), task.schema_ref()),
@@ -1481,37 +1596,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_retryable_pos_failure_waiter_reclaims_single_flight() {
+    async fn test_retryable_pos_failure_wakes_waiters_for_one_reload() {
         let directory = TempDir::new().unwrap();
         let tasks = setup(directory.path());
         let task = &tasks[0];
-        let delete = &task.deletes()[0];
+        let delete = std::slice::from_ref(&task.deletes()[0]);
+        let clean_load_reads = reads_for_one_load(delete, task.schema_ref()).await;
         let gate = Arc::new(ReadGate::new());
         gate.fail_reads.store(1, Ordering::SeqCst);
         gate.fail_retryable.store(true, Ordering::SeqCst);
-        let file_io = crate::io::FileIOBuilder::new(Arc::new(MetadataCountingStorageFactory {
-            read_gate: Some(Arc::clone(&gate)),
-            ..Default::default()
-        }))
-        .build();
-        let loader = CachingDeleteFileLoader::new(file_io, 2, Runtime::current());
+        let loader = gated_loader(&gate);
 
-        // Task A owns the load; task B waits on it.
-        let owner = loader.load_deletes(std::slice::from_ref(delete), task.schema_ref());
+        let owner = loader.load_deletes(delete, task.schema_ref());
         tokio::time::timeout(Duration::from_secs(5), gate.started.acquire())
             .await
             .unwrap()
             .unwrap()
             .forget();
-        let waiter = loader.load_deletes(std::slice::from_ref(delete), task.schema_ref());
+        let waiters = [
+            loader.load_deletes(delete, task.schema_ref()),
+            loader.load_deletes(delete, task.schema_ref()),
+        ];
         tokio::time::timeout(
             Duration::from_secs(5),
-            crate::arrow::delete_filter::tests::wait_for_load_waiters(&loader.delete_filter, 1),
+            crate::arrow::delete_filter::tests::wait_for_load_waiters(&loader.delete_filter, 2),
         )
         .await
         .unwrap();
-
-        // A's read fails with a retryable error; the owner fails closed...
         gate.release.add_permits(1);
         let owner_err = tokio::time::timeout(Duration::from_secs(5), owner)
             .await
@@ -1519,70 +1630,104 @@ mod tests {
             .unwrap_err();
         assert!(owner_err.retryable());
 
-        // ...and B wakes, re-claims, and reads again without a second owner.
+        gate.release.close();
+        let filters = tokio::time::timeout(
+            Duration::from_secs(5),
+            futures::future::try_join_all(waiters),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        for filter in filters {
+            let vector = filter.get_delete_vector(task).unwrap();
+            assert_eq!(vector.lock().unwrap().iter().collect::<Vec<_>>(), vec![
+                0, 1, 3, 5, 6, 8, 1022, 1023
+            ]);
+        }
+        assert_eq!(gate.read_calls.load(Ordering::SeqCst), clean_load_reads);
+    }
+
+    #[tokio::test]
+    async fn test_retryable_eq_failure_wakes_waiters_for_one_reload() {
+        let directory = TempDir::new().unwrap();
+        let (delete, schema) = equality_delete_fixture(&directory);
+        let delete = std::slice::from_ref(&delete);
+        let clean_load_reads = reads_for_one_load(delete, schema.clone()).await;
+        let gate = Arc::new(ReadGate::new());
+        gate.fail_reads.store(1, Ordering::SeqCst);
+        gate.fail_retryable.store(true, Ordering::SeqCst);
+        let loader = gated_loader(&gate);
+
+        let owner = loader.load_deletes(delete, schema.clone());
         tokio::time::timeout(Duration::from_secs(5), gate.started.acquire())
             .await
             .unwrap()
             .unwrap()
             .forget();
-        gate.release.close();
-        // With a fresh read count of one, exactly one waiter re-claimed the load.
-        let filter = tokio::time::timeout(Duration::from_secs(5), waiter)
+        let waiters = [
+            loader.load_deletes(delete, schema.clone()),
+            loader.load_deletes(delete, schema.clone()),
+        ];
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::arrow::delete_filter::tests::wait_for_load_waiters(&loader.delete_filter, 2),
+        )
+        .await
+        .unwrap();
+        gate.release.add_permits(1);
+        let owner_err = tokio::time::timeout(Duration::from_secs(5), owner)
             .await
             .unwrap()
-            .unwrap();
+            .unwrap_err();
+        assert!(owner_err.retryable());
+
+        gate.release.close();
+        let filters = tokio::time::timeout(
+            Duration::from_secs(5),
+            futures::future::try_join_all(waiters),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        for filter in filters {
+            assert_equality_delete_contents(&filter, delete[0].file_path()).await;
+        }
+        assert_eq!(gate.read_calls.load(Ordering::SeqCst), clean_load_reads);
+    }
+
+    #[tokio::test]
+    async fn test_retryable_failure_after_first_read_releases_claim() {
+        let directory = TempDir::new().unwrap();
+        let tasks = setup(directory.path());
+        let task = &tasks[0];
+        let delete = std::slice::from_ref(&task.deletes()[0]);
+        let clean_load_reads = reads_for_one_load(delete, task.schema_ref()).await;
+        assert!(clean_load_reads >= 2, "{clean_load_reads}");
+        let gate = ReadGate::open();
+        gate.pass_reads.store(clean_load_reads - 1, Ordering::SeqCst);
+        gate.fail_reads.store(1, Ordering::SeqCst);
+        gate.fail_retryable.store(true, Ordering::SeqCst);
+        let loader = gated_loader(&gate);
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            loader.load_deletes(delete, task.schema_ref()),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.retryable(), "{error}");
+        let filter = tokio::time::timeout(
+            Duration::from_secs(5),
+            loader.load_deletes(delete, task.schema_ref()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let vector = filter.get_delete_vector(task).unwrap();
         assert_eq!(vector.lock().unwrap().iter().collect::<Vec<_>>(), vec![
             0, 1, 3, 5, 6, 8, 1022, 1023
         ]);
-    }
-
-    #[tokio::test]
-    async fn test_retryable_eq_failure_waiter_reclaims_single_flight() {
-        let directory = TempDir::new().unwrap();
-        let (delete, schema) = equality_delete_fixture(&directory);
-        let gate = Arc::new(ReadGate::new());
-        gate.fail_reads.store(1, Ordering::SeqCst);
-        gate.fail_retryable.store(true, Ordering::SeqCst);
-        let file_io = crate::io::FileIOBuilder::new(Arc::new(MetadataCountingStorageFactory {
-            read_gate: Some(Arc::clone(&gate)),
-            ..Default::default()
-        }))
-        .build();
-        let loader = CachingDeleteFileLoader::new(file_io, 2, Runtime::current());
-
-        let owner = loader.load_deletes(std::slice::from_ref(&delete), schema.clone());
-        tokio::time::timeout(Duration::from_secs(5), gate.started.acquire())
-            .await
-            .unwrap()
-            .unwrap()
-            .forget();
-        let waiter = loader.load_deletes(std::slice::from_ref(&delete), schema.clone());
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            crate::arrow::delete_filter::tests::wait_for_load_waiters(&loader.delete_filter, 1),
-        )
-        .await
-        .unwrap();
-
-        gate.release.add_permits(1);
-        let owner_err = tokio::time::timeout(Duration::from_secs(5), owner)
-            .await
-            .unwrap()
-            .unwrap_err();
-        assert!(owner_err.retryable());
-
-        tokio::time::timeout(Duration::from_secs(5), gate.started.acquire())
-            .await
-            .unwrap()
-            .unwrap()
-            .forget();
-        gate.release.close();
-        let filter = tokio::time::timeout(Duration::from_secs(5), waiter)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_equality_delete_contents(&filter, delete.file_path()).await;
     }
 
     #[tokio::test]
@@ -1648,13 +1793,35 @@ mod tests {
         let (sender, receiver) = channel();
         let task = Runtime::current().io().spawn(async {});
         drop(sender);
-        let error = DeleteLoad { receiver, task }.await.unwrap_err();
+        let error = DeleteLoad {
+            receiver: Some(receiver),
+            task,
+        }
+        .await
+        .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unexpected);
         assert!(
             error
                 .to_string()
                 .contains("Delete loading stopped before completing")
         );
+    }
+
+    #[tokio::test]
+    async fn test_delete_load_reports_loader_panic() {
+        let (sender, receiver) = channel::<Result<DeleteFilter>>();
+        let task = Runtime::current().io().spawn(async move {
+            let _sender = sender;
+            panic!("injected loader panic");
+        });
+        let error = DeleteLoad {
+            receiver: Some(receiver),
+            task,
+        }
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(format!("{error:?}").contains("injected loader panic"), "{error:?}");
     }
 
     #[tokio::test]
@@ -1753,7 +1920,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_invalid_equality_ids_publish_error_instead_of_panicking() {
+    async fn test_invalid_equality_ids_are_cached_errors() {
         let directory = TempDir::new().unwrap();
         let tasks = setup(directory.path());
         let task = &tasks[0];
@@ -2036,6 +2203,14 @@ mod tests {
         (predicate, schema)
     }
 
+    /// The operands of a tree of `AND`s, in order.
+    fn and_terms(predicate: &Predicate) -> Vec<&Predicate> {
+        match predicate {
+            Predicate::And(and) => and.inputs().into_iter().flat_map(and_terms).collect(),
+            other => vec![other],
+        }
+    }
+
     fn assert_equality_delete_keeps(
         predicate: &Predicate,
         schema: SchemaRef,
@@ -2166,22 +2341,194 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_single_column_equality_deletes_switch_to_set_above_threshold() {
+        let reference = Reference::new("key");
+        let keep = |value: i64| {
+            reference
+                .clone()
+                .is_null()
+                .or(reference.clone().not_equal_to(Datum::long(value)))
+        };
+        let threshold = IN_SET_THRESHOLD as i64;
+
+        let (at_threshold, _) = parse_single_column_equality_deletes(DataType::Int64, vec![
+            Arc::new(Int64Array::from_iter_values(0..threshold)),
+        ])
+        .await;
+        let expected: Vec<_> = (0..threshold).map(keep).collect();
+        assert_eq!(and_terms(&at_threshold), expected.iter().collect::<Vec<_>>());
+
+        let (above_threshold, _) = parse_single_column_equality_deletes(DataType::Int64, vec![
+            Arc::new(Int64Array::from_iter_values(0..=threshold)),
+        ])
+        .await;
+        assert_eq!(
+            above_threshold,
+            reference
+                .clone()
+                .is_null()
+                .or(reference.is_not_in((0..=threshold).map(Datum::long)))
+        );
+    }
+
+    /// Scans a one-column data file through `ArrowReader` with an equality delete on that
+    /// column, and returns the surviving column values.
+    async fn read_with_single_key_equality_deletes(
+        directory: &TempDir,
+        name: &str,
+        key_type: PrimitiveType,
+        data: ArrayRef,
+        deletes: ArrayRef,
+    ) -> ArrayRef {
+        let write = |path: &str, column: ArrayRef| {
+            let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![simple_field(
+                "key",
+                column.data_type().clone(),
+                true,
+                "1",
+            )]));
+            let batch = RecordBatch::try_new(Arc::clone(&arrow_schema), vec![column]).unwrap();
+            let mut writer =
+                ArrowWriter::try_new(File::create(path).unwrap(), arrow_schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        };
+        let data_path = format!("{}/{name}-data.parquet", directory.path().display());
+        let delete_path = format!("{}/{name}-deletes.parquet", directory.path().display());
+        write(&data_path, data);
+        write(&delete_path, deletes);
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "key", Type::Primitive(key_type)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let delete = FileScanTaskDeleteFile::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&delete_path).unwrap().len())
+            .with_file_path(delete_path)
+            .with_file_type(DataContentType::EqualityDeletes)
+            .with_file_format(DataFileFormat::Parquet)
+            .with_partition_spec_id(0)
+            .with_equality_ids(Some(vec![1]))
+            .build()
+            .unwrap();
+        let task = crate::scan::FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&data_path).unwrap().len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(data_path)
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema)
+            .with_project_field_ids(vec![1])
+            .with_deletes(vec![delete])
+            .with_case_sensitive(false)
+            .build()
+            .unwrap();
+        let tasks = Box::pin(futures::stream::iter([Ok(task)])) as crate::scan::FileScanTaskStream;
+        let batches: Vec<RecordBatch> =
+            crate::arrow::ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+                .build()
+                .read(tasks)
+                .unwrap()
+                .stream()
+                .try_collect()
+                .await
+                .unwrap();
+        let columns: Vec<&dyn Array> =
+            batches.iter().map(|batch| batch.column(0).as_ref()).collect();
+        arrow_select::concat::concat(&columns).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_reader_applies_large_single_key_equality_deletes_with_nulls() {
+        fn long_array(values: Vec<Option<i64>>) -> ArrayRef {
+            Arc::new(Int64Array::from(values))
+        }
+        fn decimal_array(values: Vec<Option<i64>>) -> ArrayRef {
+            let values = values.into_iter().map(|value| value.map(i128::from));
+            Arc::new(
+                arrow_array::Decimal128Array::from_iter(values)
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            )
+        }
+        fn binary_array(values: Vec<Option<i64>>) -> ArrayRef {
+            let values = values
+                .into_iter()
+                .map(|value| value.map(|value| format!("k{value}").into_bytes()));
+            Arc::new(BinaryArray::from_iter(values))
+        }
+
+        let decimal = PrimitiveType::Decimal {
+            precision: 10,
+            scale: 2,
+        };
+        let cases: [(&str, PrimitiveType, fn(Vec<Option<i64>>) -> ArrayRef); 3] = [
+            ("long", PrimitiveType::Long, long_array),
+            ("decimal", decimal, decimal_array),
+            ("binary", PrimitiveType::Binary, binary_array),
+        ];
+        let directory = TempDir::new().unwrap();
+        let data = vec![Some(-1), None, Some(0), Some(5), Some(11), Some(12), None];
+        let keys: Vec<_> = (0..12).map(Some).collect();
+        assert!(keys.len() > IN_SET_THRESHOLD);
+        for (name, key_type, to_array) in cases {
+            for null_key in [false, true] {
+                let mut deletes = keys.clone();
+                if null_key {
+                    deletes.push(None);
+                }
+                let surviving = read_with_single_key_equality_deletes(
+                    &directory,
+                    &format!("{name}-{null_key}"),
+                    key_type.clone(),
+                    to_array(data.clone()),
+                    to_array(deletes),
+                )
+                .await;
+                let expected = if null_key {
+                    to_array(vec![Some(-1), Some(12)])
+                } else {
+                    to_array(vec![Some(-1), None, Some(12), None])
+                };
+                assert_eq!(&surviving, &expected, "{name}, null key: {null_key}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_large_floating_point_equality_deletes_retain_comparison_predicates() {
-        for (data_type, column) in [
+        let float_values = [0.0, -0.0, f32::NAN, 1.0, 2.0];
+        let double_values = [0.0, -0.0, f64::NAN, 1.0, 2.0];
+        for (data_type, column, datums) in [
             (
                 DataType::Float32,
-                Arc::new(Float32Array::from(vec![0.0, -0.0, f32::NAN, 1.0, 2.0])) as ArrayRef,
+                Arc::new(Float32Array::from(float_values.to_vec())) as ArrayRef,
+                float_values.map(Datum::float).to_vec(),
             ),
             (
                 DataType::Float64,
-                Arc::new(Float64Array::from(vec![0.0, -0.0, f64::NAN, 1.0, 2.0])) as ArrayRef,
+                Arc::new(Float64Array::from(double_values.to_vec())) as ArrayRef,
+                double_values.map(Datum::double).to_vec(),
             ),
         ] {
             let (predicate, _) =
                 parse_single_column_equality_deletes(data_type, vec![column.clone(), column]).await;
-            let text = predicate.to_string();
-            assert!(!text.contains("NOT IN"), "{text}");
-            assert_eq!(text.matches(" != ").count(), 10);
+            let reference = Reference::new("key");
+            let expected: Vec<_> = datums
+                .iter()
+                .chain(&datums)
+                .map(|datum| {
+                    reference
+                        .clone()
+                        .is_null()
+                        .or(reference.clone().not_equal_to(datum.clone()))
+                })
+                .collect();
+            assert_eq!(and_terms(&predicate), expected.iter().collect::<Vec<_>>());
         }
     }
 
@@ -2304,89 +2651,6 @@ mod tests {
         assert!(result.is_none()); // no pos dels for file 3
     }
 
-    /// Local filesystem storage that counts metadata requests.
-    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-    struct MetadataCountingStorage {
-        #[serde(skip)]
-        calls: Arc<AtomicUsize>,
-        /// Fail every metadata request with a retryable error.
-        #[serde(skip)]
-        fail_metadata: bool,
-        #[serde(skip)]
-        read_gate: Option<Arc<ReadGate>>,
-    }
-
-    #[async_trait::async_trait]
-    #[typetag::serde(name = "test_metadata_counting_storage")]
-    impl crate::io::Storage for MetadataCountingStorage {
-        async fn exists(&self, path: &str) -> Result<bool> {
-            crate::io::LocalFsStorage::new().exists(path).await
-        }
-
-        async fn metadata(&self, path: &str) -> Result<crate::io::FileMetadata> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            if self.fail_metadata {
-                return Err(
-                    Error::new(ErrorKind::Unexpected, "metadata temporarily unavailable")
-                        .with_retryable(true),
-                );
-            }
-            crate::io::LocalFsStorage::new().metadata(path).await
-        }
-
-        async fn read(&self, path: &str) -> Result<Bytes> {
-            crate::io::LocalFsStorage::new().read(path).await
-        }
-
-        async fn reader(&self, path: &str) -> Result<Box<dyn crate::io::FileRead>> {
-            let reader = crate::io::LocalFsStorage::new().reader(path).await?;
-            match &self.read_gate {
-                Some(gate) => Ok(Box::new(GatedFileRead {
-                    inner: reader,
-                    gate: Arc::clone(gate),
-                })),
-                None => Ok(reader),
-            }
-        }
-
-        async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
-            crate::io::LocalFsStorage::new().write(path, bs).await
-        }
-
-        async fn writer(&self, path: &str) -> Result<Box<dyn crate::io::FileWrite>> {
-            crate::io::LocalFsStorage::new().writer(path).await
-        }
-
-        async fn delete(&self, path: &str) -> Result<()> {
-            crate::io::LocalFsStorage::new().delete(path).await
-        }
-
-        async fn delete_prefix(&self, path: &str) -> Result<()> {
-            crate::io::LocalFsStorage::new().delete_prefix(path).await
-        }
-
-        async fn delete_stream(
-            &self,
-            paths: futures::stream::BoxStream<'static, String>,
-        ) -> Result<()> {
-            crate::io::LocalFsStorage::new().delete_stream(paths).await
-        }
-
-        fn new_input(&self, path: &str) -> Result<crate::io::InputFile> {
-            Ok(crate::io::InputFile::new(
-                Arc::new(self.clone()),
-                path.to_string(),
-            ))
-        }
-
-        fn new_output(&self, path: &str) -> Result<crate::io::OutputFile> {
-            Ok(crate::io::OutputFile::new(
-                Arc::new(self.clone()),
-                path.to_string(),
-            ))
-        }
-    }
-
     /// Copies `delete` with a different location and recorded size.
     fn relocated_delete(
         delete: &FileScanTaskDeleteFile,
@@ -2409,34 +2673,11 @@ mod tests {
             .unwrap()
     }
 
-    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-    struct MetadataCountingStorageFactory {
-        #[serde(skip)]
-        calls: Arc<AtomicUsize>,
-        #[serde(skip)]
-        fail_metadata: bool,
-        #[serde(skip)]
-        read_gate: Option<Arc<ReadGate>>,
-    }
-
-    #[typetag::serde(name = "test_metadata_counting_storage_factory")]
-    impl crate::io::StorageFactory for MetadataCountingStorageFactory {
-        fn build(&self, _config: &crate::io::StorageConfig) -> Result<Arc<dyn crate::io::Storage>> {
-            Ok(Arc::new(MetadataCountingStorage {
-                calls: Arc::clone(&self.calls),
-                fail_metadata: self.fail_metadata,
-                read_gate: self.read_gate.clone(),
-            }))
-        }
-    }
-
     #[tokio::test]
     async fn test_unknown_delete_sizes_are_resolved_once_per_file() {
-        use std::sync::atomic::Ordering;
-
         let tmp_dir = TempDir::new().unwrap();
         let file_scan_tasks = setup(tmp_dir.path());
-        let factory = Arc::new(MetadataCountingStorageFactory::default());
+        let factory = Arc::new(InstrumentedStorage::default());
         let calls = Arc::clone(&factory.calls);
         let file_io = crate::io::FileIOBuilder::new(factory).build();
         let task = &file_scan_tasks[0];
@@ -2484,33 +2725,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_unknown_size_equality_deletes_are_resolved_once_and_cached() {
-        use std::sync::atomic::Ordering;
-
         use crate::scan::FileScanTask;
-        use crate::spec::DataFileFormat;
 
         let tmp_dir = TempDir::new().unwrap();
         let table_location = tmp_dir.path().to_str().unwrap();
-        let eq_delete_path = setup_write_equality_delete_file_1(table_location);
-        let schema = Arc::new(
-            Schema::builder()
-                .with_fields(vec![
-                    NestedField::optional(2, "y", Type::Primitive(PrimitiveType::Long)).into(),
-                    NestedField::optional(3, "z", Type::Primitive(PrimitiveType::Long)).into(),
-                ])
-                .build()
-                .unwrap(),
-        );
+        let (delete, schema) = equality_delete_fixture(&tmp_dir);
         let equality_delete = |file_size_in_bytes| {
-            FileScanTaskDeleteFile::builder()
-                .with_file_path(eq_delete_path.clone())
-                .with_file_size_in_bytes(file_size_in_bytes)
-                .with_file_type(DataContentType::EqualityDeletes)
-                .with_file_format(DataFileFormat::Parquet)
-                .with_partition_spec_id(0)
-                .with_equality_ids(Some(vec![2, 3]))
-                .build()
-                .unwrap()
+            relocated_delete(&delete, delete.file_path().to_string(), file_size_in_bytes)
         };
         let data_task = |name: &str, delete| {
             FileScanTask::builder()
@@ -2526,9 +2747,9 @@ mod tests {
                 .build()
                 .unwrap()
         };
-        let known_size = std::fs::metadata(&eq_delete_path).unwrap().len();
+        let known_size = delete.file_size_in_bytes();
 
-        let factory = Arc::new(MetadataCountingStorageFactory::default());
+        let factory = Arc::new(InstrumentedStorage::default());
         let calls = Arc::clone(&factory.calls);
         let file_io = crate::io::FileIOBuilder::new(factory).build();
 
@@ -2562,33 +2783,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_deletes_reports_unknown_size_failures() {
+    async fn test_load_deletes_keeps_unknown_size_stat_failures_retryable() {
         let tmp_dir = TempDir::new().unwrap();
         let file_scan_tasks = setup(tmp_dir.path());
         let task = &file_scan_tasks[0];
-        let unknown_size = |path: String| relocated_delete(&task.deletes()[0], path, 0);
-
-        // A missing delete file fails the load instead of dropping its deletes.
-        let missing = unknown_size(format!(
-            "{}/missing-pos-del.parquet",
-            tmp_dir.path().to_str().unwrap()
-        ));
-        let error = CachingDeleteFileLoader::new(FileIO::new_with_fs(), 10, Runtime::current())
-            .load_deletes(&[missing], task.schema_ref())
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("Failed to stat delete file"),
-            "{error}"
-        );
-
-        // A retryable storage failure stays retryable through the loader.
-        let factory = Arc::new(MetadataCountingStorageFactory {
+        let factory = Arc::new(InstrumentedStorage {
             fail_metadata: true,
             ..Default::default()
         });
         let file_io = crate::io::FileIOBuilder::new(factory).build();
-        let present = unknown_size(task.deletes()[0].file_path().to_string());
+        let present = relocated_delete(
+            &task.deletes()[0],
+            task.deletes()[0].file_path().to_string(),
+            0,
+        );
         let error = CachingDeleteFileLoader::new(file_io, 10, Runtime::current())
             .load_deletes(&[present], task.schema_ref())
             .await
@@ -2599,41 +2807,6 @@ mod tests {
         );
         assert_eq!(error.kind(), ErrorKind::Unexpected);
         assert!(error.retryable());
-    }
-
-    #[tokio::test]
-    async fn test_delete_file_loader_parses_equality_deletes_of_unknown_size() {
-        let tmp_dir = TempDir::new().unwrap();
-        let table_location = tmp_dir.path().as_os_str().to_str().unwrap();
-        let eq_delete_file_path = setup_write_equality_delete_file_1(table_location);
-
-        let basic_delete_file_loader =
-            BasicDeleteFileLoader::new(FileIO::new_with_fs(), ScanMetrics::new());
-        let known = basic_delete_file_loader
-            .parquet_to_batch_stream(
-                &eq_delete_file_path,
-                std::fs::metadata(&eq_delete_file_path).unwrap().len(),
-                None,
-            )
-            .await
-            .unwrap();
-        let unknown = basic_delete_file_loader
-            .parquet_to_batch_stream(&eq_delete_file_path, 0, None)
-            .await
-            .unwrap();
-
-        let eq_ids = HashSet::from_iter(vec![2, 3, 4, 6, 8]);
-        let known = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
-            known,
-            eq_ids.clone(),
-        )
-        .await
-        .unwrap();
-        let unknown =
-            CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(unknown, eq_ids)
-                .await
-                .unwrap();
-        assert_eq!(unknown, known);
     }
 
     #[tokio::test]

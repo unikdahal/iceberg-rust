@@ -21,7 +21,7 @@ use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 
 use crate::arrow::ArrowReader;
-use crate::arrow::reader::ParquetReadOptions;
+use crate::arrow::reader::{ParquetReadOptions, parquet_error_is_retryable};
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::ScanMetrics;
 use crate::io::FileIO;
@@ -120,14 +120,8 @@ impl BasicDeleteFileLoader {
             ParquetRecordBatchStreamBuilder::new_with_metadata(parquet_file_reader, arrow_metadata)
                 .build()?
                 .map_err(|e| {
-                    let retryable = match &e {
-                        parquet::errors::ParquetError::External(source) => {
-                            source.downcast_ref::<Error>().is_some_and(Error::retryable)
-                        }
-                        _ => false,
-                    };
                     Error::new(ErrorKind::Unexpected, "Failed to read delete file batch")
-                        .with_retryable(retryable)
+                        .with_retryable(parquet_error_is_retryable(&e))
                         .with_source(e)
                 });
 
