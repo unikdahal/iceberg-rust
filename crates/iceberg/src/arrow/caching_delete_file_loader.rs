@@ -1092,6 +1092,7 @@ mod tests {
         started: tokio::sync::Semaphore,
         release: tokio::sync::Semaphore,
         dropped: tokio::sync::Notify,
+        failed: tokio::sync::Notify,
         completed_bytes: AtomicU64,
         fail_reads: AtomicUsize,
         fail_retryable: AtomicBool,
@@ -1107,6 +1108,7 @@ mod tests {
                 started: tokio::sync::Semaphore::new(0),
                 release: tokio::sync::Semaphore::new(0),
                 dropped: tokio::sync::Notify::new(),
+                failed: tokio::sync::Notify::new(),
                 completed_bytes: AtomicU64::new(0),
                 fail_reads: AtomicUsize::new(0),
                 fail_retryable: AtomicBool::new(false),
@@ -1170,6 +1172,7 @@ mod tests {
                     .is_ok();
 
             if should_fail {
+                self.gate.failed.notify_one();
                 return Err(
                     Error::new(ErrorKind::Unexpected, "injected storage read failure")
                         .with_retryable(self.gate.fail_retryable.load(Ordering::SeqCst)),
@@ -3315,7 +3318,11 @@ mod tests {
         .unwrap();
 
         // Release Task A's read to fail with retryable error and drop owner concurrently.
+        let failed_fut = gate.failed.notified();
         gate.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), failed_fut)
+            .await
+            .unwrap();
         drop(owner);
         tokio::time::timeout(Duration::from_secs(5), gate.dropped.notified())
             .await
