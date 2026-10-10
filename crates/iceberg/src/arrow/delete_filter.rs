@@ -505,7 +505,13 @@ pub(crate) mod tests {
             panic!("expected to wait for the in-flight load")
         };
         let sender = filter.try_start_eq_del_load("eq.parquet").unwrap();
-        let eq_waiter = match filter.state.read().unwrap().equality_deletes.get("eq.parquet") {
+        let eq_waiter = match filter
+            .state
+            .read()
+            .unwrap()
+            .equality_deletes
+            .get("eq.parquet")
+        {
             Some(EqDelState::Loading(notify)) => Arc::clone(notify).notified_owned(),
             other => panic!("expected an in-flight equality load, found {other:?}"),
         };

@@ -1704,7 +1704,8 @@ mod tests {
         let clean_load_reads = reads_for_one_load(delete, task.schema_ref()).await;
         assert!(clean_load_reads >= 2, "{clean_load_reads}");
         let gate = ReadGate::open();
-        gate.pass_reads.store(clean_load_reads - 1, Ordering::SeqCst);
+        gate.pass_reads
+            .store(clean_load_reads - 1, Ordering::SeqCst);
         gate.fail_reads.store(1, Ordering::SeqCst);
         gate.fail_retryable.store(true, Ordering::SeqCst);
         let loader = gated_loader(&gate);
@@ -1821,7 +1822,10 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unexpected);
-        assert!(format!("{error:?}").contains("injected loader panic"), "{error:?}");
+        assert!(
+            format!("{error:?}").contains("injected loader panic"),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]
@@ -2351,17 +2355,22 @@ mod tests {
         };
         let threshold = IN_SET_THRESHOLD as i64;
 
-        let (at_threshold, _) = parse_single_column_equality_deletes(DataType::Int64, vec![
-            Arc::new(Int64Array::from_iter_values(0..threshold)),
-        ])
-        .await;
+        let (at_threshold, _) =
+            parse_single_column_equality_deletes(DataType::Int64, vec![Arc::new(
+                Int64Array::from_iter_values(0..threshold),
+            )])
+            .await;
         let expected: Vec<_> = (0..threshold).map(keep).collect();
-        assert_eq!(and_terms(&at_threshold), expected.iter().collect::<Vec<_>>());
+        assert_eq!(
+            and_terms(&at_threshold),
+            expected.iter().collect::<Vec<_>>()
+        );
 
-        let (above_threshold, _) = parse_single_column_equality_deletes(DataType::Int64, vec![
-            Arc::new(Int64Array::from_iter_values(0..=threshold)),
-        ])
-        .await;
+        let (above_threshold, _) =
+            parse_single_column_equality_deletes(DataType::Int64, vec![Arc::new(
+                Int64Array::from_iter_values(0..=threshold),
+            )])
+            .await;
         assert_eq!(
             above_threshold,
             reference
@@ -2437,8 +2446,10 @@ mod tests {
                 .try_collect()
                 .await
                 .unwrap();
-        let columns: Vec<&dyn Array> =
-            batches.iter().map(|batch| batch.column(0).as_ref()).collect();
+        let columns: Vec<&dyn Array> = batches
+            .iter()
+            .map(|batch| batch.column(0).as_ref())
+            .collect();
         arrow_select::concat::concat(&columns).unwrap()
     }
 
@@ -2459,14 +2470,15 @@ mod tests {
             let values = values
                 .into_iter()
                 .map(|value| value.map(|value| format!("k{value}").into_bytes()));
-            Arc::new(BinaryArray::from_iter(values))
+            Arc::new(arrow_array::LargeBinaryArray::from_iter(values))
         }
 
         let decimal = PrimitiveType::Decimal {
             precision: 10,
             scale: 2,
         };
-        let cases: [(&str, PrimitiveType, fn(Vec<Option<i64>>) -> ArrayRef); 3] = [
+        type ToArray = fn(Vec<Option<i64>>) -> ArrayRef;
+        let cases: [(&str, PrimitiveType, ToArray); 3] = [
             ("long", PrimitiveType::Long, long_array),
             ("decimal", decimal, decimal_array),
             ("binary", PrimitiveType::Binary, binary_array),
