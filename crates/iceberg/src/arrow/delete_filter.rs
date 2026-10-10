@@ -148,7 +148,7 @@ impl DeleteFilter {
                 return None;
             }
             let notify = Arc::new(Notify::new());
-            let (sender, receiver) = channel();
+            let (sender, receiver) = channel::<EqDelLoadResult>();
             state.equality_deletes.insert(
                 file_path.to_string(),
                 EqDelState::Loading(Arc::clone(&notify)),
