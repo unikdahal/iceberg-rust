@@ -679,10 +679,6 @@ impl CachingDeleteFileLoader {
         while let Some(record_batch) = stream.next().await {
             let record_batch = record_batch?;
 
-            if record_batch.num_columns() == 0 {
-                return Ok(AlwaysTrue);
-            }
-
             let schema = match &batch_schema_iceberg {
                 Some(schema) => schema,
                 None => {
@@ -696,6 +692,18 @@ impl CachingDeleteFileLoader {
 
             let mut processor = EqDelColumnProcessor::new(&equality_ids);
             visit_schema_with_partner(schema, &root_array, &mut processor, &accessor)?;
+
+            // Every requested equality id must resolve to a primitive column of the delete
+            // file's schema. If a key silently dropped out of the batch (for example a column
+            // removed by schema evolution, or a zero-column batch), the built predicate would
+            // omit that key and could keep rows the delete file actually matches. Fail closed
+            // instead of under-deleting.
+            let missing = processor.missing_equality_ids();
+            if !missing.is_empty() {
+                return Err(invalid_data!(
+                    "equality delete file is missing equality id(s) {missing:?} from its schema"
+                ));
+            }
 
             // For one equality column, keeping rows that match none of the delete keys is
             // a set-membership test. Float equality must retain the comparison path: Datum
@@ -862,6 +870,7 @@ impl SingleColumnEqualityDeletes {
 struct EqDelColumnProcessor<'a> {
     equality_ids: &'a HashSet<i32>,
     collected_columns: Vec<(ArrayRef, String, Type)>,
+    resolved_equality_ids: HashSet<i32>,
 }
 
 impl<'a> EqDelColumnProcessor<'a> {
@@ -869,7 +878,22 @@ impl<'a> EqDelColumnProcessor<'a> {
         Self {
             equality_ids,
             collected_columns: Vec::with_capacity(equality_ids.len()),
+            resolved_equality_ids: HashSet::with_capacity(equality_ids.len()),
         }
+    }
+
+    /// Requested equality ids that did not resolve to a primitive field in the visited
+    /// schema, sorted for a deterministic error message. Keyed by field id (not counted) so
+    /// duplicated or renamed columns cannot mask a genuinely absent key.
+    fn missing_equality_ids(&self) -> Vec<i32> {
+        let mut missing = self
+            .equality_ids
+            .iter()
+            .filter(|id| !self.resolved_equality_ids.contains(id))
+            .copied()
+            .collect::<Vec<_>>();
+        missing.sort_unstable();
+        missing
     }
 
     #[allow(clippy::type_complexity)]
@@ -923,6 +947,7 @@ impl SchemaWithPartnerVisitor<ArrayRef> for EqDelColumnProcessor<'_> {
 
     fn field(&mut self, field: &NestedFieldRef, partner: &ArrayRef, _value: ()) -> Result<()> {
         if self.equality_ids.contains(&field.id) && field.field_type.as_primitive_type().is_some() {
+            self.resolved_equality_ids.insert(field.id);
             self.collected_columns.push((
                 partner.clone(),
                 field.name.clone(),
@@ -1799,6 +1824,81 @@ mod tests {
         assert_eq!(parsed_eq_delete.to_string(), expected);
     }
 
+    // A requested equality id absent from the delete file's schema must fail closed: dropping
+    // it from the projection would omit the key and keep rows the delete file actually matches.
+    #[tokio::test]
+    async fn test_parse_equality_deletes_rejects_partially_missing_key() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![simple_field(
+            "status",
+            DataType::Utf8,
+            true,
+            "3",
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![
+                Arc::new(StringArray::from(vec![Some("INACTIVE")])) as ArrayRef,
+            ])
+            .unwrap();
+        let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
+
+        let error = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+            stream,
+            HashSet::from_iter(vec![3, 7]),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(error.to_string().contains("[7]"), "{error}");
+    }
+
+    // When none of the requested keys resolve (all dropped), the parser must error instead of
+    // returning `AlwaysTrue`, which would silently apply no deletes.
+    #[tokio::test]
+    async fn test_parse_equality_deletes_rejects_all_missing_keys() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![simple_field(
+            "status",
+            DataType::Utf8,
+            true,
+            "9",
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![
+                Arc::new(StringArray::from(vec![Some("INACTIVE")])) as ArrayRef,
+            ])
+            .unwrap();
+        let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
+
+        let error = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+            stream,
+            HashSet::from_iter(vec![2, 3]),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(error.to_string().contains("[2, 3]"), "{error}");
+    }
+
+    // A zero-column batch can carry no equality key. It is corrupt input for a non-empty key
+    // set, so it must error rather than collapse to `AlwaysTrue`.
+    #[tokio::test]
+    async fn test_parse_equality_deletes_rejects_zero_column_batch() {
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::empty()), vec![]).unwrap();
+        assert_eq!(batch.num_columns(), 0);
+        let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
+
+        let error = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+            stream,
+            HashSet::from_iter(vec![3]),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(error.to_string().contains("[3]"), "{error}");
+    }
+
     // An equality delete keyed on a nullable column must not delete rows whose value in that
     // column is null: per the Iceberg spec (Equality Delete Files), a null matches only a null
     // delete value. Mirrors Iceberg-Java's
@@ -2662,6 +2762,88 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(sorted_positions(&result["a"]), vec![3, 7]);
+    }
+
+    // A key dropped from the current table schema cannot be resolved by `evolve_schema`, so the
+    // evolved stream must fail closed rather than silently drop the key (which would leave the
+    // delete unapplied).
+    #[tokio::test]
+    async fn test_dropped_equality_key_evolve_fails_closed() {
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().as_os_str().to_str().unwrap();
+        let delete_file_path = setup_write_equality_delete_file_1(table_location);
+
+        // Current schema keeps field 3 but has dropped field 2.
+        let table_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(3, "z", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let basic_delete_file_loader =
+            BasicDeleteFileLoader::new(FileIO::new_with_fs(), ScanMetrics::new());
+        let batch_stream = basic_delete_file_loader
+            .parquet_to_batch_stream(
+                &delete_file_path,
+                std::fs::metadata(&delete_file_path).unwrap().len(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = BasicDeleteFileLoader::evolve_schema(batch_stream, table_schema, &[2])
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await;
+
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("field not found"), "{error}");
+    }
+
+    // Loading an equality-delete task whose key was dropped from the current schema must fail
+    // closed through the caching loader as well, and cache that failure for every waiter so no
+    // later read can silently over-delete.
+    #[tokio::test]
+    async fn test_dropped_equality_key_load_fails_closed() {
+        let directory = TempDir::new().unwrap();
+        let (delete, _) = equality_delete_fixture(&directory);
+
+        // The fixture's delete file carries fields 2 and 3; the current schema keeps only 3.
+        let current_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(3, "z", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let loader = CachingDeleteFileLoader::new(FileIO::new_with_fs(), 2, Runtime::current());
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            loader.load_deletes(std::slice::from_ref(&delete), current_schema),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("field not found"), "{error}");
+
+        let cached = tokio::time::timeout(
+            Duration::from_secs(5),
+            loader
+                .delete_filter
+                .get_equality_delete_predicate_for_delete_file_path(delete.file_path()),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(cached.to_string().contains("field not found"), "{cached}");
     }
 
     /// Verifies that evolve_schema on partial-schema equality deletes works correctly
