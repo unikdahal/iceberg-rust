@@ -121,23 +121,8 @@ impl BasicDeleteFileLoader {
                 .build()?
                 .map_err(|e| {
                     let retryable = match &e {
-                        arrow_schema::ArrowError::ExternalError(source) => {
-                            if let Some(err) = source.downcast_ref::<Error>() {
-                                err.retryable()
-                            } else if let Some(parquet_err) =
-                                source.downcast_ref::<parquet::errors::ParquetError>()
-                            {
-                                match parquet_err {
-                                    parquet::errors::ParquetError::External(p_source) => {
-                                        p_source
-                                            .downcast_ref::<Error>()
-                                            .is_some_and(Error::retryable)
-                                    }
-                                    _ => false,
-                                }
-                            } else {
-                                false
-                            }
+                        parquet::errors::ParquetError::External(source) => {
+                            source.downcast_ref::<Error>().is_some_and(Error::retryable)
                         }
                         _ => false,
                     };
