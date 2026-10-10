@@ -148,7 +148,7 @@ impl DeleteFilter {
                 return None;
             }
             let notify = Arc::new(Notify::new());
-            let (sender, receiver) = channel();
+            let (sender, receiver) = channel::<EqDelLoadResult>();
             state.equality_deletes.insert(
                 file_path.to_string(),
                 EqDelState::Loading(Arc::clone(&notify)),
@@ -160,7 +160,13 @@ impl DeleteFilter {
         self.runtime.cpu().spawn(async move {
             let result = match receiver.await {
                 Ok(Ok(predicate)) => Some(EqDelState::Loaded(predicate)),
-                Ok(Err(error)) => Some(EqDelState::Failed(error)),
+                Ok(Err(error)) => {
+                    if error.retryable() {
+                        None
+                    } else {
+                        Some(EqDelState::Failed(error))
+                    }
+                }
                 Err(_) => None,
             };
             {
@@ -223,9 +229,13 @@ impl DeleteFilter {
                 return;
             };
             let notify = Arc::clone(notify);
-            state
-                .positional_deletes
-                .insert(file_path.to_string(), PosDelState::Failed(error));
+            if error.retryable() {
+                state.positional_deletes.remove(file_path);
+            } else {
+                state
+                    .positional_deletes
+                    .insert(file_path.to_string(), PosDelState::Failed(error));
+            }
             notify
         };
         notify.notify_waiters();
@@ -428,14 +438,14 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn test_eq_load_failure_preserves_cause_and_retryability() {
+    async fn test_eq_non_retryable_load_failure_is_cached() {
         let filter = DeleteFilter::new(Runtime::current());
         let path = "failed-eq-delete.parquet";
         let sender = filter.try_start_eq_del_load(path).unwrap();
         sender
             .send(Err(Arc::new(
                 Error::new(ErrorKind::DataInvalid, "injected equality failure")
-                    .with_retryable(true),
+                    .with_retryable(false),
             )))
             .unwrap();
         for _ in 0..2 {
@@ -447,10 +457,31 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap_err();
             assert_eq!(error.kind(), ErrorKind::DataInvalid);
-            assert!(error.retryable());
+            assert!(!error.retryable());
             assert!(error.to_string().contains("injected equality failure"));
             assert!(filter.try_start_eq_del_load(path).is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn test_eq_retryable_load_failure_releases_claim() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let path = "retryable-failed-eq-delete.parquet";
+        let sender = filter.try_start_eq_del_load(path).unwrap();
+        sender
+            .send(Err(Arc::new(
+                Error::new(ErrorKind::Unexpected, "transient error").with_retryable(true),
+            )))
+            .unwrap();
+        let predicate = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            filter.get_equality_delete_predicate_for_delete_file_path(path),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(predicate.is_none());
+        assert!(filter.try_start_eq_del_load(path).is_some());
     }
 
     #[tokio::test]

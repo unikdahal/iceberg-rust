@@ -491,7 +491,7 @@ impl TryFrom<&DeleteFileContext> for FileScanTaskDeleteFile {
 )]
 pub struct FileScanTaskDeleteFile {
     /// The delete file path
-    file_path: String,
+    pub(crate) file_path: String,
 
     /// The total size of the delete file in bytes.
     ///
@@ -499,7 +499,7 @@ pub struct FileScanTaskDeleteFile {
     /// Externally constructed tasks may use `0` when the size is unavailable;
     /// the Parquet delete-file loader then resolves it with one metadata
     /// request when the file is first loaded. Deletion vectors do not use it.
-    file_size_in_bytes: u64,
+    pub(crate) file_size_in_bytes: u64,
 
     /// delete file type
     file_type: DataContentType,
@@ -962,7 +962,7 @@ mod tests {
 
     #[test]
     fn file_metrics_retain_only_selected_columns() {
-        let file = crate::spec::DataFileBuilder::default()
+        let file = DataFileBuilder::default()
             .content(DataContentType::Data)
             .file_path("data.parquet".to_string())
             .file_format(DataFileFormat::Parquet)
