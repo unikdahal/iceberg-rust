@@ -712,7 +712,7 @@ async fn runtime_predicate_reader_preserves_promoted_columns_with_out_of_range_e
             .with_partition_spec_id(0)
             .with_equality_ids(Some(vec![1]))
             .build()
-            .unwrap();
+        .unwrap();
         let task = scan_task_with_deletes(data_path.clone(), schema.clone(), None, vec![delete]);
         let expected: Vec<_> = all_ids()
             .into_iter()
@@ -1099,7 +1099,7 @@ async fn runtime_predicate_resolves_files_without_field_ids() {
             .with_name_mapping(name_mapping)
             .with_case_sensitive(false)
             .build()
-            .unwrap();
+        .unwrap();
         let provider = Arc::new(FixedRuntimePredicate::new(
             Reference::new("id").greater_than_or_equal_to(Datum::int(200)),
         ));
@@ -1809,7 +1809,7 @@ async fn nan_equality_deletes_with_file_metrics_preserve_empty_projection_counts
         .with_partition_spec_id(0)
         .with_equality_ids(Some(vec![1]))
         .build()
-            .unwrap();
+        .unwrap();
     let metrics = crate::scan::FileScanTaskMetrics::new(
         Some(2),
         HashMap::from([(1, 2)]),
@@ -1870,7 +1870,7 @@ async fn runtime_predicate_file_rejection_precedes_data_and_delete_io() {
             .with_deletes(deletes)
             .with_case_sensitive(false)
             .build()
-            .unwrap();
+        .unwrap();
         let provider = Arc::new(FixedRuntimePredicate::new(
             Reference::new("id").greater_than(Datum::int(203)),
         ));
@@ -2207,7 +2207,7 @@ async fn runtime_predicate_live_refresh_preserves_cached_equality_deletes() {
         .with_partition_spec_id(0)
         .with_equality_ids(Some(vec![1]))
         .build()
-            .unwrap();
+        .unwrap();
     let task = scan_task_with_deletes(path, iceberg_schema(), None, vec![delete]);
     let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
     let (mut stream, _) = start_runtime_scan(task, Some(provider.clone()), false, true, 4);
