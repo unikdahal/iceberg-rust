@@ -2325,6 +2325,35 @@ async fn runtime_predicate_live_metrics_count_refreshes_and_pruned_groups() {
     assert_eq!(metrics.runtime_decoder_rebuilds(), 1);
 }
 
+#[tokio::test]
+async fn runtime_predicate_failed_advisory_refresh_counts_no_rebuild() {
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "failed-refresh.parquet");
+    let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let (mut stream, metrics) = start_runtime_scan(
+        scan_task(path, iceberg_schema(), None),
+        Some(provider.clone()),
+        false,
+        true,
+        4,
+    );
+    let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
+    // An advisory predicate that cannot be validated (missing column) fails
+    // open: the refresh is skipped and no pruning or decoder rebuild is
+    // reported for work that never happened.
+    provider.publish(Some(Reference::new("missing").equal_to(Datum::int(100))), 1);
+    batches.push(stream.try_next().await.unwrap().unwrap());
+    assert_eq!(ids(&batches), vec![0, 1, 2, 3, 100, 101, 102, 103]);
+    assert_eq!(metrics.runtime_predicate_refreshes(), 0);
+    assert_eq!(metrics.runtime_decoder_rebuilds(), 0);
+
+    // The next usable publication is adopted and counted exactly once.
+    provider.publish(Some(Predicate::AlwaysFalse), 2);
+    assert!(stream.try_next().await.unwrap().is_none());
+    assert_eq!(metrics.runtime_predicate_refreshes(), 1);
+    assert_eq!(metrics.runtime_decoder_rebuilds(), 1);
+}
+
 /// Writes `groups` four-row groups of `(id, k)` with one page per row, where
 /// `k` cycles 0..4 inside every group.
 fn write_cycling_groups(path: &str, groups: i32) {

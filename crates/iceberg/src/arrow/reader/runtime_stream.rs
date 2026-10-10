@@ -186,6 +186,13 @@ impl RuntimePrunedStream {
             return Ok(());
         };
         let pruned = self.selections.len() - selections.len();
+        let next_pruned = selections
+            .first()
+            .is_none_or(|selection| selection.row_group_index() != next);
+        // Rebuild before committing the refresh: a failed rebuild is fatal, and
+        // the refresh, pruning and rebuild counters must not report work that
+        // never took effect.
+        self.rebuild_decoder(next_pruned, selections.clone(), row_filter)?;
         self.selections = selections;
         // A task whose first usable runtime predicate arrives after the file was
         // opened was not counted by the task-start path. Count it when that
@@ -195,7 +202,7 @@ impl RuntimePrunedStream {
         }
         self.refresh.runtime = Some(runtime);
         self.refresh.metrics.record_runtime_refresh(pruned);
-        self.rebuild_decoder(next, row_filter)
+        Ok(())
     }
 
     /// Returns the remaining selections narrowed by `predicate`: row groups
@@ -315,15 +322,19 @@ impl RuntimePrunedStream {
     }
 
     /// Rebuilds the decoder once with the current selections and row filter.
-    fn rebuild_decoder(&mut self, next: usize, row_filter: RowFilter) -> Result<()> {
-        let next_pruned = self
-            .selections
-            .first()
-            .is_none_or(|selection| selection.row_group_index() != next);
+    /// The caller must have verified that the decoder is at a row-group
+    /// boundary with groups remaining; `into_builder` cannot fail otherwise, so
+    /// a rebuild error is an internal invariant violation and is fatal.
+    fn rebuild_decoder(
+        &mut self,
+        next_pruned: bool,
+        selections: Vec<RowGroupSelection>,
+        row_filter: RowFilter,
+    ) -> Result<()> {
         let decoder = self.decoder.take().ok_or_else(missing_decoder)?;
         let mut decoder = decoder
             .into_builder()?
-            .with_row_group_selections(self.selections.clone())
+            .with_row_group_selections(selections)
             .with_row_filter(row_filter)
             .build()?;
         if next_pruned {
