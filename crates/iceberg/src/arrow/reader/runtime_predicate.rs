@@ -265,16 +265,18 @@ impl RuntimePredicates {
                 (generation, None)
             }
         };
+        // An equivalent publication keeps the bound predicate already in force, so
+        // tasks and boundaries can recognize it without replanning.
         let predicate = predicate.map(|predicate| {
-            if let Some(cached) = cache.as_ref()
-                && cached.case_sensitive == case_sensitive
-                && (Arc::ptr_eq(&cached.schema, schema) || *cached.schema == **schema)
-                && cached.predicate.as_deref() == Some(predicate.as_ref())
-            {
-                cached.predicate.as_ref().unwrap().clone()
-            } else {
-                predicate
-            }
+            cache
+                .as_ref()
+                .filter(|cached| {
+                    cached.case_sensitive == case_sensitive
+                        && (Arc::ptr_eq(&cached.schema, schema) || *cached.schema == **schema)
+                })
+                .and_then(|cached| cached.predicate.clone())
+                .filter(|existing| *existing == predicate)
+                .unwrap_or(predicate)
         });
         let result = predicate.clone();
         *cache = Some(CachedPredicate {
