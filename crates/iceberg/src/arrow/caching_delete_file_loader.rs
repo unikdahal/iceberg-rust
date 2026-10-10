@@ -1671,40 +1671,60 @@ mod tests {
 
     #[tokio::test]
     async fn test_positional_parse_failure_wakes_waiters_and_preserves_error() {
-        let filter = DeleteFilter::new(Runtime::current());
-        let path = "parse-failed-pos.parquet";
-        let PosDelLoadAction::Load(load_guard) = filter.try_start_pos_del_load(path) else {
-            panic!("expected load ownership")
-        };
-        let PosDelLoadAction::WaitFor(waiter) = filter.try_start_pos_del_load(path) else {
-            panic!("expected waiter")
-        };
-        let stream = futures::stream::iter(vec![Err(Error::new(
-            ErrorKind::DataInvalid,
-            "injected positional parse failure",
-        )
-        .with_retryable(true))])
-        .boxed();
-        let result =
-            CachingDeleteFileLoader::parse_file_content_for_task(DeleteFileContext::PosDels {
-                load_guard,
-                stream,
-            })
-            .await;
-        assert!(result.is_err());
-        tokio::time::timeout(Duration::from_secs(5), waiter)
-            .await
-            .unwrap();
-        let PosDelLoadAction::Failed(error) = filter.try_start_pos_del_load(path) else {
-            panic!("expected cached parse failure")
-        };
-        assert_eq!(error.kind(), ErrorKind::DataInvalid);
-        assert!(error.retryable());
-        assert!(
-            error
-                .to_string()
-                .contains("injected positional parse failure")
-        );
+        for retryable in [false, true] {
+            let filter = DeleteFilter::new(Runtime::current());
+            let path = "parse-failed-pos.parquet";
+            let PosDelLoadAction::Load(load_guard) = filter.try_start_pos_del_load(path) else {
+                panic!("expected load ownership")
+            };
+            let PosDelLoadAction::WaitFor(waiter) = filter.try_start_pos_del_load(path) else {
+                panic!("expected waiter")
+            };
+            let stream = futures::stream::iter(vec![Err(Error::new(
+                ErrorKind::DataInvalid,
+                "injected positional parse failure",
+            )
+            .with_retryable(retryable))])
+            .boxed();
+            let result =
+                CachingDeleteFileLoader::parse_file_content_for_task(DeleteFileContext::PosDels {
+                    load_guard,
+                    stream,
+                })
+                .await;
+            let error = result.err().expect("expected positional parse failure");
+            assert_eq!(error.kind(), ErrorKind::DataInvalid);
+            assert_eq!(error.retryable(), retryable);
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected positional parse failure")
+            );
+            tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .unwrap();
+            if retryable {
+                let PosDelLoadAction::Load(recovered) = filter.try_start_pos_del_load(path) else {
+                    panic!("expected retryable parse failure to release ownership")
+                };
+                assert!(matches!(
+                    filter.try_start_pos_del_load(path),
+                    PosDelLoadAction::WaitFor(_)
+                ));
+                drop(recovered);
+            } else {
+                let PosDelLoadAction::Failed(error) = filter.try_start_pos_del_load(path) else {
+                    panic!("expected permanent parse failure to stay cached")
+                };
+                assert_eq!(error.kind(), ErrorKind::DataInvalid);
+                assert!(!error.retryable());
+                assert!(
+                    error
+                        .to_string()
+                        .contains("injected positional parse failure")
+                );
+            }
+        }
     }
 
     #[tokio::test]
