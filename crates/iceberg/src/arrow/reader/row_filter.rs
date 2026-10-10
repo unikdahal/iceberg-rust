@@ -22,13 +22,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow_arith::boolean::and_kleene;
+use arrow_array::BooleanArray;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowPredicate, ArrowPredicateFn, RowSelection};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::SchemaDescriptor;
 
+use super::predicate_visitor::PredicateResult;
 use super::{ArrowReader, PredicateConverter};
 use crate::error::{Result, invalid_data};
 use crate::expr::BoundPredicate;
@@ -37,19 +40,29 @@ use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
 use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
 use crate::spec::Schema;
 
+type RowPredicate<'a> = (
+    &'a BoundPredicate,
+    &'a HashSet<i32>,
+    &'a HashMap<i32, usize>,
+    bool,
+);
+
 impl ArrowReader {
     /// Converts predicates into one Arrow predicate of a `RowFilter` that ANDs
     /// them. Each is resolved against its own field-id map, and the union of
-    /// their columns is decoded once.
+    /// their columns is decoded once. This shares decoding at the cost of
+    /// evaluating each predicate over every row, rather than progressively
+    /// decoding only survivors of earlier predicates.
     pub(super) fn get_arrow_predicate(
-        predicates: &[(&BoundPredicate, &HashSet<i32>, &HashMap<i32, usize>)],
+        predicates: &[RowPredicate<'_>],
         parquet_schema: &SchemaDescriptor,
+        runtime_disabled: Arc<AtomicBool>,
     ) -> Result<Box<dyn ArrowPredicate>> {
         // Collect Parquet column indices from field ids.
         // If the field id is not found in Parquet schema, it will be ignored due to schema evolution.
         let mut column_indices = predicates
             .iter()
-            .flat_map(|(_, field_ids, field_id_map)| {
+            .flat_map(|(_, field_ids, field_id_map, _)| {
                 field_ids
                     .iter()
                     .filter_map(move |field_id| field_id_map.get(field_id).cloned())
@@ -59,25 +72,19 @@ impl ArrowReader {
         column_indices.dedup();
 
         let mut predicate_funcs = Vec::with_capacity(predicates.len());
-        for (predicate, _, field_id_map) in predicates {
+        for (predicate, _, field_id_map, advisory) in predicates {
             // The converter that converts `BoundPredicates` to `ArrowPredicates`
             let mut converter = PredicateConverter {
                 parquet_schema,
                 column_map: field_id_map,
                 column_indices: &column_indices,
             };
-            predicate_funcs.push(visit(&mut converter, predicate)?);
+            predicate_funcs.push((visit(&mut converter, predicate)?, *advisory));
         }
-        let predicate_func = predicate_funcs
-            .into_iter()
-            .reduce(|mut lhs, mut rhs| {
-                Box::new(move |batch| {
-                    let left = lhs(batch.clone())?;
-                    let right = rhs(batch)?;
-                    and_kleene(&left, &right)
-                })
-            })
-            .ok_or_else(|| invalid_data!("Row filter requires at least one predicate"))?;
+        if predicate_funcs.is_empty() {
+            return Err(invalid_data!("Row filter requires at least one predicate"));
+        }
+        let predicate_func = combine_predicates(predicate_funcs, runtime_disabled);
 
         // After collecting required leaf column indices used in the predicates,
         // creates the projection mask for the Arrow predicate.
@@ -231,18 +238,54 @@ impl ArrowReader {
     }
 }
 
+fn combine_predicates(
+    predicate_funcs: Vec<(Box<PredicateResult>, bool)>,
+    runtime_disabled: Arc<AtomicBool>,
+) -> Box<PredicateResult> {
+    let (mut runtime, mut mandatory): (Vec<_>, Vec<_>) = predicate_funcs
+        .into_iter()
+        .partition(|(_, advisory)| *advisory);
+    Box::new(move |batch| {
+        let mut mask = None;
+        for (evaluate, _) in &mut mandatory {
+            let next = evaluate(batch.clone())?;
+            mask = Some(match mask {
+                Some(mask) => and_kleene(&mask, &next)?,
+                None => next,
+            });
+        }
+        let mut mask = mask.unwrap_or_else(|| BooleanArray::from(vec![true; batch.num_rows()]));
+        if runtime_disabled.load(Ordering::Relaxed) {
+            return Ok(mask);
+        }
+        let mandatory_mask = mask.clone();
+        for (evaluate, _) in &mut runtime {
+            match evaluate(batch.clone()).and_then(|next| and_kleene(&mask, &next)) {
+                Ok(next) => mask = next,
+                Err(error) => {
+                    runtime_disabled.store(true, Ordering::Relaxed);
+                    tracing::debug!("Disabling runtime row evaluation for this task: {error}");
+                    return Ok(mandatory_mask);
+                }
+            }
+        }
+        Ok(mask)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::fs::File;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use arrow_array::cast::AsArray;
     use arrow_array::{
         ArrayRef, Decimal128Array, Float32Array, Int32Array, Int64Array, LargeStringArray,
         RecordBatch, StringArray,
     };
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use arrow_schema::{ArrowError, DataType, Field, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
     use parquet::basic::Compression;
@@ -251,6 +294,89 @@ mod tests {
     use parquet::schema::parser::parse_message_type;
     use parquet::schema::types::SchemaDescriptor;
     use tempfile::TempDir;
+
+    #[test]
+    fn runtime_row_evaluation_error_keeps_mandatory_mask() {
+        let disabled = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runtime_calls = calls.clone();
+        let mut evaluate = super::combine_predicates(
+            vec![
+                (
+                    Box::new(|_| {
+                        Ok(arrow_array::BooleanArray::from(vec![
+                            Some(true),
+                            Some(true),
+                            Some(false),
+                            None,
+                        ]))
+                    }),
+                    false,
+                ),
+                (
+                    Box::new(|_| {
+                        Ok(arrow_array::BooleanArray::from(vec![true, false, true, true]))
+                    }),
+                    false,
+                ),
+                (
+                    Box::new(move |_| {
+                        runtime_calls.fetch_add(1, Ordering::Relaxed);
+                        Err(ArrowError::ComputeError("injected runtime error".into()))
+                    }),
+                    true,
+                ),
+            ],
+            disabled.clone(),
+        );
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+        )])
+        .unwrap();
+        let expected =
+            arrow_array::BooleanArray::from(vec![Some(true), Some(false), Some(false), None]);
+        assert_eq!(evaluate(batch.clone()).unwrap(), expected);
+        assert_eq!(evaluate(batch.clone()).unwrap(), expected);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(disabled.load(Ordering::Relaxed));
+
+        let rebuilt_mask = expected.clone();
+        let mut rebuilt = super::combine_predicates(
+            vec![
+                (Box::new(move |_| Ok(rebuilt_mask.clone())), false),
+                (Box::new(|_| panic!("disabled runtime evaluator ran")), true),
+            ],
+            disabled,
+        );
+        assert_eq!(rebuilt(batch).unwrap(), expected);
+    }
+
+    #[test]
+    fn mandatory_row_evaluation_errors_remain_fatal() {
+        for disabled in [false, true] {
+            let disabled = Arc::new(AtomicBool::new(disabled));
+            let mut evaluate = super::combine_predicates(
+                vec![
+                    (Box::new(|_| panic!("runtime ran before mandatory mask")), true),
+                    (
+                        Box::new(|_| {
+                            Err(ArrowError::ComputeError("injected mandatory error".into()))
+                        }),
+                        false,
+                    ),
+                ],
+                disabled,
+            );
+            let batch = RecordBatch::new_empty(Arc::new(ArrowSchema::empty()));
+            assert!(
+                evaluate(batch)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected mandatory error")
+            );
+        }
+    }
 
     use crate::Runtime;
     use crate::arrow::{ArrowReader, ArrowReaderBuilder};

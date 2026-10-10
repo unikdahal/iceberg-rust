@@ -129,7 +129,9 @@ impl ArrowReaderBuilder {
     }
 
     /// Supplies execution-time predicates, sampled when each data-file task
-    /// starts and combined with the task's filters using AND. See
+    /// starts and, with row-group filtering enabled, at row-group boundaries.
+    /// An in-flight group completes with its captured predicate before a new
+    /// publication is adopted. Predicates combine with task filters using AND. See
     /// [`RuntimePredicateProvider`].
     ///
     /// Only the reader accepts a provider. `TableScan::to_arrow` cannot pass

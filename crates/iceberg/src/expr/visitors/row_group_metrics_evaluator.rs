@@ -542,6 +542,43 @@ mod tests {
     use crate::spec::{Datum, NestedField, PrimitiveType, Schema, Type};
 
     #[test]
+    fn test_row_group_in_with_literals_on_both_sides_of_the_bounds()
+    -> Result<()> {
+        let row_group = create_row_group_metadata(
+            50,
+            50,
+            Some(Statistics::float(
+                Some(30.0),
+                Some(79.0),
+                None,
+                Some(0),
+                false,
+            )),
+            50,
+            None,
+        )?;
+        let (schema, field_id_map) =
+            build_iceberg_schema_and_field_map()?;
+        let cases = [
+            (vec![29.0_f32, 80.0], false),
+            (vec![29.0_f32, 50.0, 80.0], true),
+        ];
+        for (values, expected) in cases {
+            let filter = Reference::new("col_float")
+                .is_in(values.into_iter().map(Datum::float))
+                .bind(schema.clone(), false)?;
+            let actual = RowGroupMetricsEvaluator::eval(
+                &filter,
+                &row_group,
+                &field_id_map,
+                schema.as_ref(),
+            )?;
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn eval_matches_no_rows_for_empty_row_group() -> Result<()> {
         let row_group_metadata = create_row_group_metadata(0, 0, None, 0, None)?;
 

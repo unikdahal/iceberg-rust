@@ -1415,9 +1415,9 @@ impl<'de> serde_core::de::Deserialize<'de> for iceberg::scan::FileScanTaskDelete
 pub fn iceberg::scan::FileScanTaskDeleteFile::deserialize<__D>(__deserializer: __D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 pub struct iceberg::scan::FileScanTaskMetrics
 impl iceberg::scan::FileScanTaskMetrics
+pub fn iceberg::scan::FileScanTaskMetrics::builder() -> FileScanTaskMetricsBuilder<((), (), (), (), (), ())>
 pub fn iceberg::scan::FileScanTaskMetrics::lower_bounds(&self) -> &std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>
 pub fn iceberg::scan::FileScanTaskMetrics::nan_value_counts(&self) -> &std::collections::hash::map::HashMap<i32, u64>
-pub fn iceberg::scan::FileScanTaskMetrics::new(record_count: core::option::Option<u64>, value_counts: std::collections::hash::map::HashMap<i32, u64>, null_value_counts: std::collections::hash::map::HashMap<i32, u64>, nan_value_counts: std::collections::hash::map::HashMap<i32, u64>, lower_bounds: std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>, upper_bounds: std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>) -> Self
 pub fn iceberg::scan::FileScanTaskMetrics::null_value_counts(&self) -> &std::collections::hash::map::HashMap<i32, u64>
 pub fn iceberg::scan::FileScanTaskMetrics::record_count(&self) -> core::option::Option<u64>
 pub fn iceberg::scan::FileScanTaskMetrics::upper_bounds(&self) -> &std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>
@@ -1464,7 +1464,7 @@ pub struct iceberg::scan::TableScanBuilder<'a>
 impl<'a> iceberg::scan::TableScanBuilder<'a>
 pub fn iceberg::scan::TableScanBuilder<'a>::build(self) -> iceberg::Result<iceberg::scan::TableScan>
 pub fn iceberg::scan::TableScanBuilder<'a>::include_column_stats(self) -> Self
-pub fn iceberg::scan::TableScanBuilder<'a>::include_column_stats_for(self, column_names: impl core::iter::traits::collect::IntoIterator<Item = impl core::convert::Into<alloc::string::String>>) -> Self
+pub fn iceberg::scan::TableScanBuilder<'a>::include_column_stats_for(self, column_names: impl core::iter::traits::collect::IntoIterator<Item = impl alloc::string::ToString>) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select(self, column_names: impl core::iter::traits::collect::IntoIterator<Item = impl alloc::string::ToString>) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select_all(self) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select_empty(self) -> Self

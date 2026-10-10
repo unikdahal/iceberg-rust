@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::{
-    ArrayRef, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+    Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
     StringArray,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
@@ -972,7 +972,7 @@ async fn runtime_predicate_with_bloom_filters_keeps_planned_equality() {
 /// A provider whose predicate changes when [`Self::publish`] is called.
 struct ChangingRuntimePredicate {
     generation: AtomicU64,
-    predicate: std::sync::Mutex<Option<Predicate>>,
+    publication: std::sync::Mutex<(u64, Option<Predicate>)>,
     snapshots: AtomicU64,
 }
 
@@ -980,13 +980,25 @@ impl ChangingRuntimePredicate {
     fn new(predicate: Option<Predicate>, generation: u64) -> Self {
         Self {
             generation: AtomicU64::new(generation),
-            predicate: std::sync::Mutex::new(predicate),
+            publication: std::sync::Mutex::new((generation, predicate)),
             snapshots: AtomicU64::new(0),
         }
     }
 
     fn publish(&self, predicate: Option<Predicate>, generation: u64) {
-        *self.predicate.lock().unwrap() = predicate;
+        self.publish_with_gate(predicate, generation, || {});
+    }
+
+    fn publish_with_gate(
+        &self,
+        predicate: Option<Predicate>,
+        generation: u64,
+        gate: impl FnOnce(),
+    ) {
+        let mut publication = self.publication.lock().unwrap();
+        assert!(generation > publication.0);
+        *publication = (generation, predicate);
+        gate();
         self.generation.store(generation, Ordering::Release);
     }
 
@@ -1002,10 +1014,10 @@ impl RuntimePredicateProvider for ChangingRuntimePredicate {
 
     fn snapshot(&self) -> Result<RuntimePredicateSnapshot> {
         self.snapshots.fetch_add(1, Ordering::Relaxed);
-        let predicate = self.predicate.lock().unwrap();
+        let publication = self.publication.lock().unwrap();
         Ok(RuntimePredicateSnapshot::new(
-            predicate.clone(),
-            self.generation.load(Ordering::Acquire),
+            publication.1.clone(),
+            publication.0,
         ))
     }
 }
@@ -1682,14 +1694,14 @@ async fn runtime_predicate_transitions_to_none_and_then_to_a_tighter_predicate()
 }
 
 fn three_group_file_metrics() -> crate::scan::FileScanTaskMetrics {
-    crate::scan::FileScanTaskMetrics::new(
-        Some(12),
-        HashMap::new(),
-        HashMap::new(),
-        HashMap::new(),
-        HashMap::from([(1, Datum::int(0))]),
-        HashMap::from([(1, Datum::int(203))]),
-    )
+    crate::scan::FileScanTaskMetrics::builder()
+        .with_record_count(Some(12))
+        .with_value_counts(HashMap::new())
+        .with_null_value_counts(HashMap::new())
+        .with_nan_value_counts(HashMap::new())
+        .with_lower_bounds(HashMap::from([(1, Datum::int(0))]))
+        .with_upper_bounds(HashMap::from([(1, Datum::int(203))]))
+        .build()
 }
 
 fn with_file_metrics(
@@ -1761,14 +1773,14 @@ async fn planned_all_match_filter_does_not_decode_predicate_only_column() {
         .unwrap();
     let task =
         scan_task_with_deletes_and_projection(path, schema, Some(predicate), vec![], vec![2]);
-    let metrics = crate::scan::FileScanTaskMetrics::new(
-        Some(12),
-        HashMap::from([(1, 12)]),
-        HashMap::from([(1, 0)]),
-        HashMap::new(),
-        HashMap::from([(1, Datum::int(0))]),
-        HashMap::from([(1, Datum::int(203))]),
-    );
+    let metrics = crate::scan::FileScanTaskMetrics::builder()
+        .with_record_count(Some(12))
+        .with_value_counts(HashMap::from([(1, 12)]))
+        .with_null_value_counts(HashMap::from([(1, 0)]))
+        .with_nan_value_counts(HashMap::new())
+        .with_lower_bounds(HashMap::from([(1, Datum::int(0))]))
+        .with_upper_bounds(HashMap::from([(1, Datum::int(203))]))
+        .build();
     let (unproven, unproven_metrics) = execute(task.clone(), None).await;
     let (proven, proven_metrics) = execute(with_file_metrics(task, metrics), None).await;
     assert_eq!(proven, unproven);
@@ -1810,14 +1822,14 @@ async fn nan_equality_deletes_with_file_metrics_preserve_empty_projection_counts
         .with_equality_ids(Some(vec![1]))
         .build()
         .unwrap();
-    let metrics = crate::scan::FileScanTaskMetrics::new(
-        Some(2),
-        HashMap::from([(1, 2)]),
-        HashMap::from([(1, 0)]),
-        HashMap::from([(1, 2)]),
-        HashMap::new(),
-        HashMap::new(),
-    );
+    let metrics = crate::scan::FileScanTaskMetrics::builder()
+        .with_record_count(Some(2))
+        .with_value_counts(HashMap::from([(1, 2)]))
+        .with_null_value_counts(HashMap::from([(1, 0)]))
+        .with_nan_value_counts(HashMap::from([(1, 2)]))
+        .with_lower_bounds(HashMap::new())
+        .with_upper_bounds(HashMap::new())
+        .build();
     for projection in [vec![1], vec![]] {
         let task = scan_task_with_deletes_and_projection(
             data_path.clone(),
@@ -1889,14 +1901,14 @@ async fn runtime_predicate_file_statistics_keep_possible_matches_and_fail_open()
         Reference::new("id").greater_than_or_equal_to(Datum::int(200)),
     ));
     let stats = |lower: Option<Datum>, upper: Option<Datum>, record_count| {
-        crate::scan::FileScanTaskMetrics::new(
-            record_count,
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
-            lower.map(|bound| (1, bound)).into_iter().collect(),
-            upper.map(|bound| (1, bound)).into_iter().collect(),
-        )
+        crate::scan::FileScanTaskMetrics::builder()
+            .with_record_count(record_count)
+            .with_value_counts(HashMap::new())
+            .with_null_value_counts(HashMap::new())
+            .with_nan_value_counts(HashMap::new())
+            .with_lower_bounds(lower.map(|bound| (1, bound)).into_iter().collect())
+            .with_upper_bounds(upper.map(|bound| (1, bound)).into_iter().collect())
+            .build()
     };
     for file_metrics in [
         // Bounds that intersect the predicate keep the file.
@@ -2435,14 +2447,14 @@ async fn runtime_predicate_file_statistics_that_prove_every_row_do_not_change_re
     let temp = TempDir::new().unwrap();
     let path = write_three_row_group_file(temp.path().to_str().unwrap(), "all_rows.parquet");
     let metrics = |nulls: Option<u64>| {
-        crate::scan::FileScanTaskMetrics::new(
-            Some(12),
-            HashMap::new(),
-            nulls.map(|count| (1, count)).into_iter().collect(),
-            HashMap::new(),
-            HashMap::from([(1, Datum::int(0))]),
-            HashMap::from([(1, Datum::int(203))]),
-        )
+        crate::scan::FileScanTaskMetrics::builder()
+            .with_record_count(Some(12))
+            .with_value_counts(HashMap::new())
+            .with_null_value_counts(nulls.map(|count| (1, count)).into_iter().collect())
+            .with_nan_value_counts(HashMap::new())
+            .with_lower_bounds(HashMap::from([(1, Datum::int(0))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::int(203))]))
+            .build()
     };
     let predicates = [
         // Every row satisfies these, so the row filter is skipped for the file.
@@ -2526,18 +2538,18 @@ async fn runtime_predicate_negative_predicates_preserve_null_filtering_with_file
             ArrowWriter::try_new(File::create(&path).unwrap(), arrow_schema, None).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
-        let metrics = crate::scan::FileScanTaskMetrics::new(
-            Some(4),
-            HashMap::from([(1, 4), (2, 4)]),
-            HashMap::from([
+        let metrics = crate::scan::FileScanTaskMetrics::builder()
+            .with_record_count(Some(4))
+            .with_value_counts(HashMap::from([(1, 4), (2, 4)]))
+            .with_null_value_counts(HashMap::from([
                 (1, 0),
                 (
                     2,
                     values.iter().filter(|value| value.is_none()).count() as u64,
                 ),
-            ]),
-            HashMap::new(),
-            std::iter::once((1, Datum::int(1)))
+            ]))
+            .with_nan_value_counts(HashMap::new())
+            .with_lower_bounds(std::iter::once((1, Datum::int(1)))
                 .chain(
                     values
                         .iter()
@@ -2545,8 +2557,8 @@ async fn runtime_predicate_negative_predicates_preserve_null_filtering_with_file
                         .min()
                         .map(|&value| (2, Datum::int(value))),
                 )
-                .collect(),
-            std::iter::once((1, Datum::int(4)))
+                .collect())
+            .with_upper_bounds(std::iter::once((1, Datum::int(4)))
                 .chain(
                     values
                         .iter()
@@ -2554,8 +2566,8 @@ async fn runtime_predicate_negative_predicates_preserve_null_filtering_with_file
                         .max()
                         .map(|&value| (2, Datum::int(value))),
                 )
-                .collect(),
-        );
+                .collect())
+            .build();
         let expected: Vec<_> = values
             .iter()
             .enumerate()
@@ -2625,14 +2637,14 @@ async fn runtime_predicate_float_comparisons_fail_open_before_statistics_pruning
         .bind(schema.clone(), false)
         .unwrap();
     let task = scan_task(path.to_str().unwrap().to_string(), schema, Some(planned));
-    let metrics = crate::scan::FileScanTaskMetrics::new(
-        Some(4),
-        HashMap::from([(2, 4)]),
-        HashMap::from([(2, 0)]),
-        HashMap::from([(2, 2)]),
-        HashMap::from([(2, Datum::double(-0.0))]),
-        HashMap::from([(2, Datum::double(0.0))]),
-    );
+    let metrics = crate::scan::FileScanTaskMetrics::builder()
+        .with_record_count(Some(4))
+        .with_value_counts(HashMap::from([(2, 4)]))
+        .with_null_value_counts(HashMap::from([(2, 0)]))
+        .with_nan_value_counts(HashMap::from([(2, 2)]))
+        .with_lower_bounds(HashMap::from([(2, Datum::double(-0.0))]))
+        .with_upper_bounds(HashMap::from([(2, Datum::double(0.0))]))
+        .build();
     for predicate in [
         Reference::new("value").equal_to(Datum::double(0.0)),
         Reference::new("value").not_equal_to(Datum::double(f64::NAN)),
@@ -2815,4 +2827,855 @@ async fn planned_predicate_without_pruning_still_filters_rows() {
     let task = scan_task(path, schema, Some(planned));
     let (batches, _) = execute(task, None).await;
     assert_eq!(ids(&batches), vec![2]);
+}
+
+#[test]
+fn concurrent_publishers_keep_snapshot_pair_and_generation() {
+    use std::sync::mpsc::channel;
+    use std::thread;
+
+    use super::runtime_predicate::RuntimePredicates;
+
+    let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let cache = Arc::new(RuntimePredicates::new(provider.clone()));
+    let predicate = |generation| {
+        Reference::new("id")
+            .greater_than_or_equal_to(Datum::int(generation))
+    };
+    let (entered_tx, entered_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let first_provider = provider.clone();
+    let first = thread::spawn(move || {
+        first_provider.publish_with_gate(
+            Some(predicate(1)),
+            1,
+            || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            },
+        );
+    });
+    entered_rx.recv().unwrap();
+    assert_eq!(provider.generation(), 0);
+    assert!(provider.publication.try_lock().is_err());
+
+    let (started_tx, started_rx) = channel();
+    let (second_tx, second_rx) = channel();
+    let (finish_tx, finish_rx) = channel();
+    let second_provider = provider.clone();
+    let second = thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        second_provider.publish_with_gate(
+            Some(predicate(2)),
+            2,
+            || {
+                second_tx.send(()).unwrap();
+                finish_rx.recv().unwrap();
+            },
+        );
+    });
+    started_rx.recv().unwrap();
+    let observer_provider = provider.clone();
+    let observer_cache = cache.clone();
+    let observer = thread::spawn(move || {
+        let snapshot = observer_provider.snapshot().unwrap();
+        let generation = snapshot.generation();
+        assert!([1, 2].contains(&generation));
+        assert_eq!(
+            snapshot.into_predicate(),
+            Some(predicate(generation as i32)),
+        );
+        observer_cache.current(&iceberg_schema(), false, "publisher")
+    });
+    release_tx.send(()).unwrap();
+    second_rx.recv().unwrap();
+    assert_eq!(provider.generation(), 1);
+    assert!(provider.publication.try_lock().is_err());
+    finish_tx.send(()).unwrap();
+    first.join().unwrap();
+    second.join().unwrap();
+    let _ = observer.join().unwrap();
+    assert_eq!(provider.generation(), 2);
+    let snapshot = provider.snapshot().unwrap();
+    assert_eq!(snapshot.generation(), 2);
+    assert_eq!(snapshot.into_predicate(), Some(predicate(2)));
+    let schema = iceberg_schema();
+    let latest = cache.current(&schema, false, "publisher").unwrap();
+    assert_eq!(
+        *latest,
+        predicate(2).bind(schema.clone(), false).unwrap(),
+    );
+    assert!(Arc::ptr_eq(
+        &latest,
+        &cache.current(&schema, false, "publisher").unwrap(),
+    ));
+}
+
+fn refresh_metric_counts(metrics: &ScanMetrics) -> [u64; 6] {
+    [
+        metrics.runtime_predicate_tasks(),
+        metrics.runtime_file_tasks_pruned(),
+        metrics.runtime_predicate_refreshes(),
+        metrics.runtime_decoder_rebuilds(),
+        metrics.runtime_row_groups_pruned_live(),
+        metrics.runtime_row_groups_pruned(),
+    ]
+}
+
+async fn check_rebuild_failure(
+    stage: super::runtime_stream::test_support::Stage,
+    expected_error: &str,
+) {
+    use super::runtime_stream::test_support::Probe;
+
+    for initially_active in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let path = write_three_row_group_file(
+            temp.path().to_str().unwrap(),
+            "rebuild-failure.parquet",
+        );
+        let probe = Probe::register(&path);
+        let initial = initially_active.then(|| {
+            Reference::new("id")
+                .greater_than_or_equal_to(Datum::int(0))
+        });
+        let provider = Arc::new(ChangingRuntimePredicate::new(
+            initial, 0,
+        ));
+        let (mut stream, metrics) = start_runtime_scan(
+            scan_task(path, iceberg_schema(), None),
+            Some(provider.clone()),
+            true,
+            true,
+            4,
+        );
+        let first = stream.try_next().await.unwrap().unwrap();
+        assert_eq!(ids(&[first]), vec![0, 1, 2, 3]);
+        let before = refresh_metric_counts(&metrics);
+        probe.fail_at(stage);
+        provider.publish(
+            Some(Reference::new("id")
+                .greater_than_or_equal_to(Datum::int(200))),
+            1,
+        );
+        let error = stream.try_next().await.unwrap_err();
+        assert!(error.to_string().contains(expected_error), "{error}");
+        assert_eq!(refresh_metric_counts(&metrics), before);
+        assert_eq!(&probe.counts()[1..], &[1, 1, 1, 1]);
+        assert!(stream.try_next().await.unwrap().is_none());
+        assert_eq!(refresh_metric_counts(&metrics), before);
+    }
+}
+
+#[tokio::test]
+async fn live_refresh_rebuild_into_builder_failure_metrics() {
+    check_rebuild_failure(
+        super::runtime_stream::test_support::Stage::IntoBuilder,
+        "into_builder called on a finished decoder",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn live_refresh_rebuild_build_failure_metrics() {
+    check_rebuild_failure(
+        super::runtime_stream::test_support::Stage::Build,
+        "with_row_group_selections cannot be combined",
+    )
+    .await;
+}
+
+const LINEAGE_PAGE_ROWS: i32 = 1024;
+const LINEAGE_GROUP_ROWS: i32 = 4 * LINEAGE_PAGE_ROWS;
+const LINEAGE_FIRST_ROW_ID: i64 = 1_000_000;
+
+fn lineage_schema() -> SchemaRef {
+    Arc::new(
+        Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(
+                    1, "id", Type::Primitive(PrimitiveType::Int),
+                )
+                .into(),
+                NestedField::required(
+                    2, "payload",
+                    Type::Primitive(PrimitiveType::String),
+                )
+                .into(),
+                NestedField::required(
+                    3, "k", Type::Primitive(PrimitiveType::Int),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap(),
+    )
+}
+
+fn write_lineage_groups(path: &str, physical_row_id: bool) {
+    use crate::metadata_columns::RESERVED_FIELD_ID_ROW_ID;
+    use parquet::file::metadata::{
+        PageIndexPolicy, ParquetMetaDataReader,
+    };
+
+    let mut fields = vec![
+        field("id", DataType::Int32, 1),
+        field("payload", DataType::Utf8, 2),
+        field("k", DataType::Int32, 3),
+    ];
+    if physical_row_id {
+        fields.push(
+            field("_row_id", DataType::Int64, RESERVED_FIELD_ID_ROW_ID)
+                .with_nullable(true),
+        );
+    }
+    let schema = Arc::new(ArrowSchema::new(fields));
+    let properties = WriterProperties::builder()
+        .set_compression(Compression::UNCOMPRESSED)
+        .set_dictionary_enabled(false)
+        .set_max_row_group_row_count(Some(
+            LINEAGE_GROUP_ROWS as usize,
+        ))
+        .set_data_page_row_count_limit(LINEAGE_PAGE_ROWS as usize)
+        .set_write_batch_size(LINEAGE_PAGE_ROWS as usize)
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(path).unwrap(),
+        schema.clone(),
+        Some(properties),
+    )
+    .unwrap();
+    for group in 0..5 {
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from_iter_values(
+                (0..LINEAGE_GROUP_ROWS).map(|row| group * 10000 + row),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                (0..LINEAGE_GROUP_ROWS).map(|row| {
+                    format!("{group}-{row}-{}", "x".repeat(64))
+                }),
+            )),
+            Arc::new(Int32Array::from_iter_values(
+                (0..LINEAGE_GROUP_ROWS)
+                    .map(|row| row / LINEAGE_PAGE_ROWS),
+            )),
+        ];
+        if physical_row_id {
+            columns.push(Arc::new(Int64Array::from_iter(
+                (0..LINEAGE_GROUP_ROWS).map(|row| {
+                    let pos = i64::from(group * LINEAGE_GROUP_ROWS + row);
+                    (pos % 3 == 0).then_some(9_000_000 + pos)
+                }),
+            )));
+        }
+        writer
+            .write(&RecordBatch::try_new(schema.clone(), columns).unwrap())
+            .unwrap();
+        writer.flush().unwrap();
+    }
+    writer.close().unwrap();
+    let metadata = ParquetMetaDataReader::new()
+        .with_page_index_policy(PageIndexPolicy::Required)
+        .parse_and_finish(&File::open(path).unwrap())
+        .unwrap();
+    assert_eq!(metadata.num_row_groups(), 5);
+    for group in metadata.offset_index().unwrap() {
+        assert_eq!(group[0].page_locations().len(), 4);
+        assert_eq!(group[2].page_locations().len(), 4);
+    }
+}
+
+fn lineage_task(path: &str, planned: Option<Predicate>) -> FileScanTask {
+    use crate::metadata_columns::{
+        RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID,
+    };
+
+    let schema = lineage_schema();
+    FileScanTask::builder()
+        .with_file_size_in_bytes(std::fs::metadata(path).unwrap().len())
+        .with_start(0)
+        .with_length(0)
+        .with_data_file_path(path.to_owned())
+        .with_data_file_format(DataFileFormat::Parquet)
+        .with_schema(schema.clone())
+        .with_project_field_ids(vec![
+            1, 2, RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID,
+        ])
+        .with_first_row_id(Some(LINEAGE_FIRST_ROW_ID))
+        .with_predicate(planned.map(|predicate| {
+            predicate.bind(schema, false).unwrap()
+        }))
+        .with_case_sensitive(false)
+        .build()
+        .unwrap()
+}
+
+fn patch_task(task: FileScanTask, patch: serde_json::Value) -> FileScanTask {
+    let mut value = serde_json::to_value(task).unwrap();
+    for (key, field) in patch.as_object().unwrap() {
+        value[key] = field.clone();
+    }
+    serde_json::from_value(value).unwrap()
+}
+
+fn lineage_rows(batches: &[RecordBatch]) -> Vec<(i32, i64, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let id = batch.column_by_name("id").unwrap()
+            .as_any().downcast_ref::<Int32Array>().unwrap();
+        let pos = batch.column_by_name("_pos").unwrap()
+            .as_any().downcast_ref::<Int64Array>().unwrap();
+        let row_id = batch.column_by_name("_row_id").unwrap()
+            .as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(row_id.null_count(), 0);
+        for row in 0..batch.num_rows() {
+            rows.push((id.value(row), pos.value(row), row_id.value(row)));
+        }
+    }
+    rows
+}
+
+fn expected_lineage(id: i32, physical: bool) -> (i32, i64, i64) {
+    let pos = i64::from(
+        (id / 10000) * LINEAGE_GROUP_ROWS + id % 10000,
+    );
+    let row_id = if physical && pos % 3 == 0 {
+        9_000_000 + pos
+    } else {
+        LINEAGE_FIRST_ROW_ID + pos
+    };
+    (id, pos, row_id)
+}
+
+fn delete_task(path: String, position: bool) -> FileScanTaskDeleteFile {
+    FileScanTaskDeleteFile::builder()
+        .with_file_size_in_bytes(std::fs::metadata(&path).unwrap().len())
+        .with_file_path(path)
+        .with_file_type(if position {
+            DataContentType::PositionDeletes
+        } else {
+            DataContentType::EqualityDeletes
+        })
+        .with_file_format(DataFileFormat::Parquet)
+        .with_partition_spec_id(0)
+        .with_equality_ids((!position).then_some(vec![1]))
+        .build()
+        .unwrap()
+}
+
+fn lineage_deletes(path: &str, dir: &str) -> Vec<FileScanTaskDeleteFile> {
+    let position_path = format!("{dir}/lineage-position.parquet");
+    let equality_path = format!("{dir}/lineage-equality.parquet");
+    let mut positions: Vec<i64> =
+        (LINEAGE_GROUP_ROWS..2 * LINEAGE_GROUP_ROWS)
+            .map(i64::from)
+            .collect();
+    for group in [0, 2, 3, 4] {
+        positions.push(i64::from(
+            group * LINEAGE_GROUP_ROWS + 2 * LINEAGE_PAGE_ROWS + 1,
+        ));
+    }
+    positions.sort_unstable();
+    write_delete(
+        &position_path,
+        vec![
+            field("file_path", DataType::Utf8, 2_147_483_546),
+            field("pos", DataType::Int64, 2_147_483_545),
+        ],
+        vec![
+            Arc::new(StringArray::from(vec![path; positions.len()])),
+            Arc::new(Int64Array::from(positions)),
+        ],
+    );
+    write_delete(
+        &equality_path,
+        vec![field("id", DataType::Int32, 1)],
+        vec![Arc::new(Int32Array::from_iter_values(
+            (0..5).map(|group| {
+                group * 10000 + 2 * LINEAGE_PAGE_ROWS + 2
+            }),
+        ))],
+    );
+    vec![
+        delete_task(position_path, true),
+        delete_task(equality_path, false),
+    ]
+}
+
+#[tokio::test]
+async fn live_refresh_preserves_deletes_and_absolute_lineage_differential() {
+    for physical in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().to_str().unwrap();
+        let path = format!("{dir}/lineage.parquet");
+        write_lineage_groups(&path, physical);
+        let planned = Reference::new("k").not_equal_to(Datum::int(3));
+        let task = patch_task(
+            lineage_task(&path, Some(planned)),
+            serde_json::json!({
+                "deletes": lineage_deletes(&path, dir),
+            }),
+        );
+        let (baseline, _) = execute(task.clone(), None).await;
+        let baseline_rows = lineage_rows(&baseline);
+        let expected_baseline: Vec<_> = (0..5)
+            .filter(|group| *group != 1)
+            .flat_map(|group| {
+                (0..3 * LINEAGE_PAGE_ROWS)
+                    .filter(|row| {
+                        ![2 * LINEAGE_PAGE_ROWS + 1,
+                          2 * LINEAGE_PAGE_ROWS + 2].contains(row)
+                    })
+                    .map(move |row| expected_lineage(
+                        group * 10000 + row, physical,
+                    ))
+            })
+            .collect();
+        assert_eq!(baseline_rows, expected_baseline);
+        for largest_first in [false, true] {
+            let changing = Arc::new(ChangingRuntimePredicate::new(None, 0));
+            let provider: Arc<dyn RuntimePredicateProvider> =
+                if largest_first {
+                    Arc::new(LargestFirstChanging(changing.clone()))
+                } else {
+                    changing.clone()
+                };
+            let (mut stream, metrics) = start_runtime_scan(
+                task.clone(), Some(provider), true, true, 128,
+            );
+            let first = stream.try_next().await.unwrap().unwrap();
+            let first_group = if largest_first { 4 } else { 0 };
+            assert_eq!(
+                lineage_rows(std::slice::from_ref(&first)),
+                (0..128).map(|row| expected_lineage(
+                    first_group * 10000 + row, physical,
+                )).collect::<Vec<_>>(),
+            );
+            changing.publish(
+                Some(Reference::new("k")
+                    .greater_than_or_equal_to(Datum::int(2))
+                    .and(Reference::new("id")
+                        .less_than(Datum::int(20000))
+                        .or(Reference::new("id")
+                            .greater_than_or_equal_to(Datum::int(30000))))),
+                1,
+            );
+            let mut batches = vec![first];
+            batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+            let mut expected: Vec<_> = baseline_rows.iter().copied()
+                .filter(|(id, _, _)| {
+                    id / 10000 == first_group
+                        || (id % 10000 >= 2 * LINEAGE_PAGE_ROWS
+                            && !(20000..30000).contains(id))
+                })
+                .collect();
+            if largest_first {
+                expected.sort_by_key(|(id, _, _)| {
+                    (std::cmp::Reverse(id / 10000), id % 10000)
+                });
+            }
+            assert_eq!(lineage_rows(&batches), expected);
+            assert_eq!(metrics.runtime_predicate_refreshes(), 1);
+            assert_eq!(metrics.runtime_decoder_rebuilds(), 1);
+            assert_eq!(metrics.runtime_row_groups_pruned_live(), 1);
+            assert_eq!(changing.snapshots(), 2);
+        }
+    }
+}
+
+fn start_uncoalesced_scan(
+    task: FileScanTask,
+    provider: Option<Arc<dyn RuntimePredicateProvider>>,
+    pages: bool,
+) -> (ArrowRecordBatchStream, ScanMetrics) {
+    let mut builder = ArrowReaderBuilder::new(
+        FileIO::new_with_fs(), Runtime::current(),
+    )
+    .with_range_coalesce_bytes(0)
+    .with_row_selection_enabled(pages)
+    .with_batch_size(LINEAGE_GROUP_ROWS as usize);
+    if let Some(provider) = provider {
+        builder = builder.with_runtime_predicate_provider(provider);
+    }
+    let tasks = Box::pin(futures::stream::iter([Ok(task)]))
+        as FileScanTaskStream;
+    let scan = builder.build().read(tasks).unwrap();
+    let metrics = scan.metrics().clone();
+    (scan.stream(), metrics)
+}
+
+fn lineage_all_match_metrics() -> crate::scan::FileScanTaskMetrics {
+    crate::scan::FileScanTaskMetrics::builder()
+        .with_record_count(Some(5 * LINEAGE_GROUP_ROWS as u64))
+        .with_value_counts(HashMap::from([
+            (3, 5 * LINEAGE_GROUP_ROWS as u64),
+        ]))
+        .with_null_value_counts(HashMap::from([(3, 0)]))
+        .with_lower_bounds(HashMap::from([(3, Datum::int(0))]))
+        .with_upper_bounds(HashMap::from([(3, Datum::int(3))]))
+        .build()
+}
+
+fn lineage_middle_split(task: FileScanTask) -> FileScanTask {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let parquet = SerializedFileReader::new(
+        File::open(task.data_file_path()).unwrap(),
+    )
+    .unwrap();
+    let metadata = parquet.metadata();
+    let start = 4 + metadata.row_group(0).compressed_size() as u64;
+    let length = metadata.row_group(1).compressed_size() as u64;
+    patch_task(task, serde_json::json!({
+        "start": start, "length": length,
+    }))
+}
+
+async fn check_runtime_page_lineage(split: bool) {
+    for physical in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let path = format!("{}/pages.parquet", temp.path().display());
+        write_lineage_groups(&path, physical);
+        let mut task = lineage_task(&path, None);
+        if split {
+            task = lineage_middle_split(task);
+        }
+        let predicate = Reference::new("k")
+            .equal_to(Datum::int(0))
+            .or(Reference::new("k").equal_to(Datum::int(3)));
+        let provider = Arc::new(FixedRuntimePredicate::new(predicate));
+        let (reference, reference_metrics) = start_uncoalesced_scan(
+            task.clone(), Some(provider.clone()), false,
+        );
+        let reference: Vec<RecordBatch> =
+            reference.try_collect().await.unwrap();
+        let (pruned, metrics) = start_uncoalesced_scan(
+            task.clone(), Some(provider), true,
+        );
+        let pruned: Vec<RecordBatch> =
+            pruned.try_collect().await.unwrap();
+        let groups: Vec<i32> = if split {
+            vec![1]
+        } else {
+            (0..5).collect()
+        };
+        let expected: Vec<_> = groups.into_iter()
+            .flat_map(|group| {
+                (0..LINEAGE_GROUP_ROWS)
+                    .filter(|row| {
+                        *row < LINEAGE_PAGE_ROWS
+                            || *row >= 3 * LINEAGE_PAGE_ROWS
+                    })
+                    .map(move |row| expected_lineage(
+                        group * 10000 + row, physical,
+                    ))
+            })
+            .collect();
+        assert_eq!(lineage_rows(&reference), expected);
+        assert_eq!(lineage_rows(&pruned), expected);
+        assert!(metrics.bytes_read() < reference_metrics.bytes_read());
+        if split {
+            let (whole, whole_metrics) = start_uncoalesced_scan(
+                lineage_task(&path, None), None, false,
+            );
+            let _: Vec<RecordBatch> = whole.try_collect().await.unwrap();
+            assert!(metrics.bytes_read() < whole_metrics.bytes_read());
+        }
+    }
+}
+
+#[tokio::test]
+async fn runtime_page_pruning_preserves_pos_and_row_id() {
+    check_runtime_page_lineage(false).await;
+}
+
+#[tokio::test]
+async fn runtime_page_pruning_within_byte_range_split() {
+    check_runtime_page_lineage(true).await;
+}
+
+async fn check_all_match_lineage(split: bool) {
+    for physical in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let path = format!("{}/all-match.parquet", temp.path().display());
+        write_lineage_groups(&path, physical);
+        let mut task = lineage_task(
+            &path,
+            Some(Reference::new("k")
+                .greater_than_or_equal_to(Datum::int(0))),
+        );
+        if split {
+            task = lineage_middle_split(task);
+        }
+        let (reference, reference_metrics) = start_uncoalesced_scan(
+            task.clone(), None, true,
+        );
+        let reference: Vec<RecordBatch> =
+            reference.try_collect().await.unwrap();
+        let (shortcut, shortcut_metrics) = start_uncoalesced_scan(
+            with_file_metrics(task, lineage_all_match_metrics()),
+            None,
+            true,
+        );
+        let shortcut: Vec<RecordBatch> =
+            shortcut.try_collect().await.unwrap();
+        let groups: Vec<i32> = if split {
+            vec![1]
+        } else {
+            (0..5).collect()
+        };
+        let expected: Vec<_> = groups.into_iter()
+            .flat_map(|group| {
+                (0..LINEAGE_GROUP_ROWS).map(move |row| {
+                    expected_lineage(group * 10000 + row, physical)
+                })
+            })
+            .collect();
+        assert_eq!(lineage_rows(&reference), expected);
+        assert_eq!(lineage_rows(&shortcut), expected);
+        assert_eq!(shortcut, reference);
+        assert!(
+            shortcut_metrics.bytes_read()
+                < reference_metrics.bytes_read(),
+        );
+    }
+}
+
+#[tokio::test]
+async fn file_always_matches_preserves_pos_and_row_id() {
+    check_all_match_lineage(false).await;
+}
+
+#[tokio::test]
+async fn all_match_shortcut_on_byte_range_split() {
+    check_all_match_lineage(true).await;
+}
+
+#[tokio::test]
+async fn unchanged_generation_checks_do_not_replan() {
+    use super::runtime_stream::test_support::Probe;
+
+    for disabled in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().to_str().unwrap();
+        let path = format!("{dir}/unchanged.parquet");
+        write_lineage_groups(&path, false);
+        let probe = Probe::register(&path);
+        let task = patch_task(
+            lineage_task(&path, None),
+            serde_json::json!({
+                "deletes": lineage_deletes(&path, dir),
+            }),
+        );
+        let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+        let (mut stream, metrics) = start_runtime_scan(
+            task, Some(provider.clone()), true, true, 128,
+        );
+        let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
+        assert_eq!(&probe.counts()[1..], &[0, 0, 0, 0]);
+        provider.publish(
+            Some(Reference::new("k")
+                .greater_than_or_equal_to(Datum::int(2))),
+            1,
+        );
+        // Drain the active group; none of its batches samples again.
+        while ids(&batches).last().unwrap() < &10000 {
+            let batch = stream.try_next().await.unwrap().unwrap();
+            let next_group = ids(std::slice::from_ref(&batch))[0] >= 10000;
+            batches.push(batch);
+            if next_group {
+                break;
+            }
+            assert_eq!(&probe.counts()[1..], &[0, 0, 0, 0]);
+        }
+        assert_eq!(ids(&batches).last().unwrap() / 10000, 2);
+        let after_refresh = probe.counts();
+        assert_eq!(&after_refresh[1..], &[1, 1, 1, 1]);
+        assert_eq!(provider.snapshots(), 2);
+        let batch = stream.try_next().await.unwrap().unwrap();
+        batches.push(batch);
+        assert_eq!(probe.counts(), after_refresh);
+        if disabled {
+            probe.disable_runtime();
+            provider.publish(Some(Predicate::AlwaysFalse), 2);
+        }
+        batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+        let expected: Vec<_> = (0..5)
+            .filter(|group| *group != 1)
+            .flat_map(|group| {
+                (0..LINEAGE_GROUP_ROWS)
+                    .filter(move |row| {
+                        (group == 0 || *row >= 2 * LINEAGE_PAGE_ROWS)
+                            && ![2 * LINEAGE_PAGE_ROWS + 1,
+                                 2 * LINEAGE_PAGE_ROWS + 2].contains(row)
+                    })
+                    .map(move |row| expected_lineage(
+                        group * 10000 + row, false,
+                    ))
+            })
+            .collect();
+        assert_eq!(lineage_rows(&batches), expected);
+        let final_counts = probe.counts();
+        assert_eq!(&final_counts[1..], &[1, 1, 1, 1]);
+        if disabled {
+            assert_eq!(final_counts, after_refresh);
+        } else {
+            assert!(final_counts[0] > after_refresh[0]);
+        }
+        assert_eq!(provider.snapshots(), 2);
+        assert_eq!(metrics.runtime_decoder_rebuilds(), 1);
+    }
+}
+
+struct OrderingHint {
+    column: Option<&'static str>,
+}
+
+impl RuntimePredicateProvider for OrderingHint {
+    fn generation(&self) -> u64 {
+        0
+    }
+
+    fn snapshot(&self) -> Result<RuntimePredicateSnapshot> {
+        Ok(RuntimePredicateSnapshot::new(None, 0))
+    }
+
+    fn largest_first_column(&self) -> Option<String> {
+        self.column.map(str::to_owned)
+    }
+}
+
+fn write_ordering_fallback_file(
+    path: &str,
+    field_ids: bool,
+    statistics: bool,
+) -> SchemaRef {
+    use parquet::file::properties::EnabledStatistics;
+
+    let mut fields = vec![
+        field("id", DataType::Int32, 1),
+        field("payload", DataType::Utf8, 2),
+        field("d", DataType::Decimal128(30, 2), 3),
+        field("f", DataType::Float64, 4),
+    ];
+    if !field_ids {
+        for field in &mut fields {
+            *field = field.clone().with_metadata(HashMap::new());
+        }
+    }
+    let schema = Arc::new(ArrowSchema::new(fields));
+    let properties = WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .set_statistics_enabled(if statistics {
+            EnabledStatistics::Page
+        } else {
+            EnabledStatistics::None
+        })
+        .set_max_row_group_row_count(Some(4))
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(path).unwrap(),
+        schema.clone(),
+        Some(properties),
+    )
+    .unwrap();
+    for base in [0, 100, 200] {
+        let values: Vec<i32> = (base..base + 4).collect();
+        let decimal = Decimal128Array::from_iter_values(
+            values.iter().map(|value| i128::from(*value)),
+        )
+        .with_precision_and_scale(30, 2)
+        .unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(Int32Array::from(values.clone())),
+            Arc::new(StringArray::from_iter_values(
+                values.iter().map(|value| format!("{value:03}")),
+            )),
+            Arc::new(decimal),
+            Arc::new(Float64Array::from_iter_values(
+                values.iter().map(|value| f64::from(*value)),
+            )),
+        ])
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.flush().unwrap();
+    }
+    writer.close().unwrap();
+    Arc::new(
+        Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(
+                    1, "id", Type::Primitive(PrimitiveType::Int),
+                ).into(),
+                NestedField::required(
+                    2, "payload",
+                    Type::Primitive(PrimitiveType::String),
+                ).into(),
+                NestedField::required(
+                    3, "d", Type::Primitive(PrimitiveType::Decimal {
+                        precision: 30, scale: 2,
+                    }),
+                ).into(),
+                NestedField::required(
+                    4, "f", Type::Primitive(PrimitiveType::Double),
+                ).into(),
+            ])
+            .build()
+            .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn largest_first_fallback_contract() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    for (hint, field_ids, statistics, row_groups) in [
+        (Some("payload"), true, true, true),
+        (Some("d"), true, true, true),
+        (Some("f"), true, true, true),
+        (Some("missing"), true, true, true),
+        (None, true, true, true),
+        (Some("id"), true, false, true),
+        (Some("id"), false, true, true),
+        (Some("id"), true, true, false),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let path = format!("{}/fallback.parquet", temp.path().display());
+        let schema = write_ordering_fallback_file(
+            &path, field_ids, statistics,
+        );
+        let parquet = SerializedFileReader::new(
+            File::open(&path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            parquet.metadata().file_metadata().schema_descr()
+                .column(2).physical_type(),
+            parquet::basic::Type::FIXED_LEN_BYTE_ARRAY,
+        );
+        if !statistics {
+            assert!(parquet.metadata().row_group(0)
+                .column(0).statistics().is_none());
+        }
+        let task = scan_task(path, schema, None);
+        let (reference, _) = start_runtime_scan(
+            task.clone(), None, true, row_groups, 2,
+        );
+        let reference: Vec<RecordBatch> =
+            reference.try_collect().await.unwrap();
+        let (hinted, metrics) = start_runtime_scan(
+            task,
+            Some(Arc::new(OrderingHint { column: hint })),
+            true,
+            row_groups,
+            2,
+        );
+        let hinted: Vec<RecordBatch> =
+            hinted.try_collect().await.unwrap();
+        assert_eq!(ids(&hinted), all_ids());
+        assert_eq!(hinted, reference);
+        assert_eq!(metrics.runtime_decoder_rebuilds(), 0);
+    }
 }

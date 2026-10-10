@@ -74,8 +74,10 @@ impl RuntimePredicateSnapshot {
 ///   and become visible only after their predicate.
 /// * Provider, snapshot, binding, planning and page-pruning failures are
 ///   advisory: the reader skips the runtime predicate and does not retry them.
-///   Errors while decoding its columns or evaluating it on rows are not
-///   skipped.
+///   A runtime row-evaluation error disables runtime restriction for the rest
+///   of that task, preserving its planned and equality-delete row filters and
+///   selections already applied. Planned-filter, delete-filter and decoding
+///   errors remain fatal.
 /// * Floating-point comparison and set predicates are currently skipped:
 ///   the statistics evaluators and Arrow row filters do not agree on every
 ///   NaN and signed-zero comparison. Floating-point null and NaN tests are
@@ -129,8 +131,9 @@ impl RuntimePredicateSnapshot {
 /// }
 /// ```
 pub trait RuntimePredicateProvider: Send + Sync {
-    /// Returns the current publication generation. Called for every task, so
-    /// keep it cheap, for example an atomic load with acquire ordering.
+    /// Returns the current publication generation. Called at task start and,
+    /// with row-group filtering enabled, at row-group boundaries before further
+    /// fetch/decode attempts. Keep it cheap, for example an atomic acquire load.
     fn generation(&self) -> u64;
 
     /// Returns the current runtime predicate snapshot. The predicate and
@@ -142,11 +145,13 @@ pub trait RuntimePredicateProvider: Send + Sync {
     /// serializes data-file tasks while taking the snapshot and binding it.
     fn snapshot(&self) -> Result<RuntimePredicateSnapshot>;
 
-    /// The column whose largest values tighten the predicate fastest, as for a descending
-    /// top-k or a MAX. The reader then visits each file's row groups by descending maximum of
-    /// that column instead of in file order, so a file sorted by it needs only its last row
-    /// groups. Named here rather than taken from the predicate, which does not exist yet when
-    /// the first file opens. Read order is otherwise unspecified; the default keeps file order.
+    /// Supplies a best-effort hint to visit row groups by descending maximum.
+    ///
+    /// This applies only with row-group filtering enabled and embedded field
+    /// IDs mapping the named column. Only physical INT32/INT64 statistics are
+    /// ranked; unsupported or missing statistics keep their relative file
+    /// order after ranked groups. A missing field ID or column leaves file
+    /// order unchanged. The default is no hint; read order is unspecified.
     fn largest_first_column(&self) -> Option<String> {
         None
     }

@@ -22,7 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use arrow_schema::{DataType, Field};
 use futures::{StreamExt, TryStreamExt};
@@ -189,6 +189,7 @@ struct StreamContext<'a> {
     row_filter: Option<RowFilter>,
     plans: &'a [PlannedPredicate],
     observed_generation: Option<u64>,
+    runtime_disabled: Arc<AtomicBool>,
 }
 
 impl FileScanTaskReader {
@@ -227,10 +228,12 @@ impl FileScanTaskReader {
             projection.use_position_fallback,
         )?;
 
+        let runtime_disabled = Arc::new(AtomicBool::new(false));
         let row_filter = Self::compile_row_filter(
             &task,
             &mut plans,
             projection.record_batch_stream_builder.parquet_schema(),
+            runtime_disabled.clone(),
         )?;
 
         if plans.iter().any(|plan| plan.advisory) {
@@ -267,6 +270,7 @@ impl FileScanTaskReader {
             row_filter,
             plans: &plans,
             observed_generation,
+            runtime_disabled,
         })
     }
 
@@ -829,6 +833,7 @@ impl FileScanTaskReader {
         task: &FileScanTask,
         plans: &mut Vec<PlannedPredicate>,
         parquet_schema: &SchemaDescriptor,
+        runtime_disabled: Arc<AtomicBool>,
     ) -> Result<Option<RowFilter>> {
         // The planned and runtime predicates form one Arrow predicate, so
         // columns they share are decoded once and neither runs on the other's
@@ -841,9 +846,20 @@ impl FileScanTaskReader {
                 let predicates: Vec<_> = plans
                     .iter()
                     .filter(|plan| plan.row_filter)
-                    .map(|plan| (plan.predicate.as_ref(), &plan.field_ids, &plan.field_id_map))
+                    .map(|plan| {
+                        (
+                            plan.predicate.as_ref(),
+                            &plan.field_ids,
+                            &plan.field_id_map,
+                            plan.advisory,
+                        )
+                    })
                     .collect();
-                ArrowReader::get_arrow_predicate(&predicates, parquet_schema)
+                ArrowReader::get_arrow_predicate(
+                    &predicates,
+                    parquet_schema,
+                    runtime_disabled.clone(),
+                )
             };
             if !plans.iter().any(|plan| plan.row_filter) {
                 None
@@ -914,6 +930,7 @@ impl FileScanTaskReader {
             row_filter,
             plans,
             observed_generation,
+            runtime_disabled,
         } = cx;
 
         let first_row_id = task.first_row_id();
@@ -976,6 +993,7 @@ impl FileScanTaskReader {
                         .clone()
                         .expect("provider configured for live-capable task"),
                     seen_generation: observed_generation.unwrap_or_default(),
+                    runtime_disabled,
                     planned: plans
                         .iter()
                         .find(|plan| !plan.advisory && plan.row_filter)
@@ -1193,8 +1211,9 @@ impl FileScanTaskReader {
     /// so its row filter would only confirm it. Statistics whose type does not match the task
     /// schema, and evaluation errors, answer no, which only costs the row filter.
     /// Floating-point binary and set predicates keep their row filters unless provably safe:
-    /// the strict evaluator uses Iceberg float ordering (NaN highest, -0.0 == +0.0), while Arrow's
-    /// row kernels use IEEE total order. String and binary comparisons also keep their row filters:
+    /// strict inequalities use `Datum` total order, while equality and membership use
+    /// `PrimitiveLiteral` (NaN payloads equal). Both can disagree with Arrow kernels on NaN
+    /// and signed zero. String and binary comparisons also keep their row filters:
     /// Iceberg bounds may be truncated and are used only for inclusive pruning.
     fn file_always_matches(predicate: &BoundPredicate, metrics: &FileScanTaskMetrics) -> bool {
         let bounds_match_schema = Self::file_bounds_match_predicate(predicate, metrics);
@@ -1598,14 +1617,14 @@ mod tests {
                 } else {
                     HashMap::from([(1, negative_zero.clone())])
                 };
-                let metrics = FileScanTaskMetrics::new(
-                    Some(2),
-                    HashMap::from([(1, 2)]),
-                    HashMap::from([(1, 0)]),
-                    HashMap::from([(1, nan_count)]),
-                    bounds.clone(),
-                    bounds,
-                );
+                let metrics = FileScanTaskMetrics::builder()
+                    .with_record_count(Some(2))
+                    .with_value_counts(HashMap::from([(1, 2)]))
+                    .with_null_value_counts(HashMap::from([(1, 0)]))
+                    .with_nan_value_counts(HashMap::from([(1, nan_count)]))
+                    .with_lower_bounds(bounds.clone())
+                    .with_upper_bounds(bounds)
+                    .build();
                 for predicate in [
                     Reference::new("key").not_equal_to(nan.clone()),
                     Reference::new("key").is_not_in([nan.clone(), one.clone()]),
@@ -1620,14 +1639,14 @@ mod tests {
                     ));
                 }
             }
-            let metrics = FileScanTaskMetrics::new(
-                Some(2),
-                HashMap::from([(1, 2)]),
-                HashMap::from([(1, 0)]),
-                HashMap::from([(1, 0)]),
-                HashMap::from([(1, negative_zero.clone())]),
-                HashMap::from([(1, negative_zero)]),
-            );
+            let metrics = FileScanTaskMetrics::builder()
+                .with_record_count(Some(2))
+                .with_value_counts(HashMap::from([(1, 2)]))
+                .with_null_value_counts(HashMap::from([(1, 0)]))
+                .with_nan_value_counts(HashMap::from([(1, 0)]))
+                .with_lower_bounds(HashMap::from([(1, negative_zero.clone())]))
+                .with_upper_bounds(HashMap::from([(1, negative_zero)]))
+                .build();
             for predicate in [
                 Reference::new("key").equal_to(positive_zero.clone()),
                 Reference::new("key").is_in([positive_zero, nan]),
@@ -1656,14 +1675,14 @@ mod tests {
         );
 
         // Safe baseline: no NaNs, no nulls, positive bounds [2.0, 5.0], predicate > 1.0.
-        let safe_metrics = FileScanTaskMetrics::new(
-            Some(2),
-            HashMap::from([(1, 2)]),
-            HashMap::from([(1, 0)]),
-            HashMap::from([(1, 0)]),
-            HashMap::from([(1, Datum::float(2.0_f32))]),
-            HashMap::from([(1, Datum::float(5.0_f32))]),
-        );
+        let safe_metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_nan_value_counts(HashMap::from([(1, 0)]))
+            .with_lower_bounds(HashMap::from([(1, Datum::float(2.0_f32))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::float(5.0_f32))]))
+            .build();
         let safe_predicate = Reference::new("key")
             .greater_than(Datum::float(1.0_f32))
             .bind(schema.clone(), false)
@@ -1678,28 +1697,28 @@ mod tests {
         ));
 
         // Unsafe variation: nan_count > 0.
-        let nan_metrics = FileScanTaskMetrics::new(
-            Some(2),
-            HashMap::from([(1, 2)]),
-            HashMap::from([(1, 0)]),
-            HashMap::from([(1, 1)]),
-            HashMap::from([(1, Datum::float(2.0_f32))]),
-            HashMap::from([(1, Datum::float(5.0_f32))]),
-        );
+        let nan_metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_nan_value_counts(HashMap::from([(1, 1)]))
+            .with_lower_bounds(HashMap::from([(1, Datum::float(2.0_f32))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::float(5.0_f32))]))
+            .build();
         assert!(!super::FileScanTaskReader::file_always_matches(
             &safe_predicate,
             &nan_metrics,
         ));
 
         // Unsafe variation: nan_count missing.
-        let missing_nan_metrics = FileScanTaskMetrics::new(
-            Some(2),
-            HashMap::from([(1, 2)]),
-            HashMap::from([(1, 0)]),
-            HashMap::new(),
-            HashMap::from([(1, Datum::float(2.0_f32))]),
-            HashMap::from([(1, Datum::float(5.0_f32))]),
-        );
+        let missing_nan_metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_nan_value_counts(HashMap::new())
+            .with_lower_bounds(HashMap::from([(1, Datum::float(2.0_f32))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::float(5.0_f32))]))
+            .build();
         assert!(!super::FileScanTaskReader::file_always_matches(
             &safe_predicate,
             &missing_nan_metrics,
@@ -1728,14 +1747,14 @@ mod tests {
         }
 
         // Unsafe variation: bounds straddling 0.
-        let straddling_metrics = FileScanTaskMetrics::new(
-            Some(2),
-            HashMap::from([(1, 2)]),
-            HashMap::from([(1, 0)]),
-            HashMap::from([(1, 0)]),
-            HashMap::from([(1, Datum::float(-1.0_f32))]),
-            HashMap::from([(1, Datum::float(5.0_f32))]),
-        );
+        let straddling_metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_nan_value_counts(HashMap::from([(1, 0)]))
+            .with_lower_bounds(HashMap::from([(1, Datum::float(-1.0_f32))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::float(5.0_f32))]))
+            .build();
         let straddling_pred = Reference::new("key")
             .not_equal_to(Datum::float(10.0_f32))
             .bind(schema.clone(), false)
@@ -1753,28 +1772,28 @@ mod tests {
         ));
 
         // Unsafe variation: bounds missing.
-        let missing_bounds_metrics = FileScanTaskMetrics::new(
-            Some(2),
-            HashMap::from([(1, 2)]),
-            HashMap::from([(1, 0)]),
-            HashMap::from([(1, 0)]),
-            HashMap::new(),
-            HashMap::new(),
-        );
+        let missing_bounds_metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_nan_value_counts(HashMap::from([(1, 0)]))
+            .with_lower_bounds(HashMap::new())
+            .with_upper_bounds(HashMap::new())
+            .build();
         assert!(!super::FileScanTaskReader::file_always_matches(
             &safe_predicate,
             &missing_bounds_metrics,
         ));
 
         // Unsafe variation: NotEq with nulls.
-        let null_metrics = FileScanTaskMetrics::new(
-            Some(2),
-            HashMap::from([(1, 2)]),
-            HashMap::from([(1, 1)]),
-            HashMap::from([(1, 0)]),
-            HashMap::from([(1, Datum::float(2.0_f32))]),
-            HashMap::from([(1, Datum::float(5.0_f32))]),
-        );
+        let null_metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 1)]))
+            .with_nan_value_counts(HashMap::from([(1, 0)]))
+            .with_lower_bounds(HashMap::from([(1, Datum::float(2.0_f32))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::float(5.0_f32))]))
+            .build();
         let not_eq_pred = Reference::new("key")
             .not_equal_to(Datum::float(1.0_f32))
             .bind(schema.clone(), false)
@@ -1793,14 +1812,14 @@ mod tests {
         ));
 
         // Safe Set predicate: IS IN [2.0, 3.0] where bounds are [2.0, 2.0].
-        let single_val_metrics = FileScanTaskMetrics::new(
-            Some(2),
-            HashMap::from([(1, 2)]),
-            HashMap::from([(1, 0)]),
-            HashMap::from([(1, 0)]),
-            HashMap::from([(1, Datum::float(2.0_f32))]),
-            HashMap::from([(1, Datum::float(2.0_f32))]),
-        );
+        let single_val_metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_nan_value_counts(HashMap::from([(1, 0)]))
+            .with_lower_bounds(HashMap::from([(1, Datum::float(2.0_f32))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::float(2.0_f32))]))
+            .build();
         let in_pred = Reference::new("key")
             .is_in([Datum::float(2.0_f32), Datum::float(3.0_f32)])
             .bind(schema.clone(), false)
@@ -1829,14 +1848,14 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let double_metrics = FileScanTaskMetrics::new(
-            Some(2),
-            HashMap::from([(1, 2)]),
-            HashMap::from([(1, 0)]),
-            HashMap::from([(1, 0)]),
-            HashMap::from([(1, Datum::double(2.0_f64))]),
-            HashMap::from([(1, Datum::double(5.0_f64))]),
-        );
+        let double_metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_nan_value_counts(HashMap::from([(1, 0)]))
+            .with_lower_bounds(HashMap::from([(1, Datum::double(2.0_f64))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::double(5.0_f64))]))
+            .build();
         let double_pred = Reference::new("key")
             .greater_than(Datum::double(1.0_f64))
             .bind(double_schema, false)
@@ -1869,14 +1888,14 @@ mod tests {
                     .build()
                     .unwrap(),
             );
-            let metrics = FileScanTaskMetrics::new(
-                Some(2),
-                HashMap::from([(1, 2)]),
-                HashMap::from([(1, 0)]),
-                HashMap::new(),
-                HashMap::from([(1, value.clone())]),
-                HashMap::from([(1, value.clone())]),
-            );
+            let metrics = FileScanTaskMetrics::builder()
+                .with_record_count(Some(2))
+                .with_value_counts(HashMap::from([(1, 2)]))
+                .with_null_value_counts(HashMap::from([(1, 0)]))
+                .with_nan_value_counts(HashMap::new())
+                .with_lower_bounds(HashMap::from([(1, value.clone())]))
+                .with_upper_bounds(HashMap::from([(1, value.clone())]))
+                .build();
             for predicate in [
                 Reference::new("key").equal_to(value.clone()),
                 Reference::new("key").not_equal_to(other.clone()),
@@ -1905,6 +1924,140 @@ mod tests {
     }
 
     #[test]
+    fn file_always_matches_rejects_nan_payloads_and_signs() {
+        let float_payloads = (0..23)
+            .map(|bit| 1_u32 << bit)
+            .chain([0x003f_ffff, 0x0040_0001, 0x007f_ffff]);
+        let double_payloads = (0..52)
+            .map(|bit| 1_u64 << bit)
+            .chain([0x0007_ffff_ffff_ffff, 0x0008_0000_0000_0001, 0x000f_ffff_ffff_ffff]);
+        let float_nans = float_payloads.flat_map(|payload| {
+            [0, 0x8000_0000].map(|sign| Datum::float(f32::from_bits(sign | 0x7f80_0000 | payload)))
+        });
+        let double_nans = double_payloads.flat_map(|payload| {
+            [0, 0x8000_0000_0000_0000]
+                .map(|sign| Datum::double(f64::from_bits(sign | 0x7ff0_0000_0000_0000 | payload)))
+        });
+        for (field_type, one, nans) in [
+            (PrimitiveType::Float, Datum::float(1.0), float_nans.collect::<Vec<_>>()),
+            (PrimitiveType::Double, Datum::double(1.0), double_nans.collect::<Vec<_>>()),
+        ] {
+            let schema = Arc::new(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::optional(1, "key", Type::Primitive(field_type)).into(),
+                    ])
+                    .build()
+                    .unwrap(),
+            );
+            let metrics = FileScanTaskMetrics::builder()
+                .with_record_count(Some(2))
+                .with_value_counts(HashMap::from([(1, 2)]))
+                .with_null_value_counts(HashMap::from([(1, 0)]))
+                .with_nan_value_counts(HashMap::from([(1, 0)]))
+                .with_lower_bounds(HashMap::from([(1, one.clone())]))
+                .with_upper_bounds(HashMap::from([(1, one)]))
+                .build();
+            for nan in nans {
+                assert!(nan.is_nan());
+                for predicate in [
+                    Reference::new("key").equal_to(nan.clone()),
+                    Reference::new("key").not_equal_to(nan.clone()),
+                    Reference::new("key").less_than(nan.clone()),
+                    Reference::new("key").less_than_or_equal_to(nan.clone()),
+                    Reference::new("key").greater_than(nan.clone()),
+                    Reference::new("key").greater_than_or_equal_to(nan.clone()),
+                    Reference::new("key").is_in([nan.clone()]),
+                    Reference::new("key").is_not_in([nan]),
+                ] {
+                    let predicate = predicate.bind(schema.clone(), false).unwrap();
+                    assert!(!super::FileScanTaskReader::file_always_matches(
+                        &predicate, &metrics
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn file_always_matches_rejects_promoted_negative_predicate_bounds() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "key", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_lower_bounds(HashMap::from([(1, Datum::int(2))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::int(3))]))
+            .build();
+        for predicate in [
+            Reference::new("key").not_equal_to(Datum::long(1)),
+            Reference::new("key").is_not_in([Datum::long(1)]),
+        ] {
+            let predicate = predicate.bind(schema.clone(), false).unwrap();
+            assert!(
+                super::StrictMetricsEvaluator::eval_metrics(&predicate, (&metrics).into())
+                    .unwrap()
+            );
+            assert!(!super::FileScanTaskReader::file_always_matches(
+                &predicate, &metrics
+            ));
+        }
+    }
+
+    #[test]
+    fn truncated_binary_bounds_remain_inclusive_and_keep_row_filter() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "key", Type::Primitive(PrimitiveType::Binary)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_lower_bounds(HashMap::from([(1, Datum::binary(*b"abcdefghijklmnop"))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::binary(*b"abcdefghijklmnoq"))]))
+            .build();
+        for predicate in [
+            Reference::new("key").equal_to(Datum::binary(*b"abcdefghijklmnop-first")),
+            Reference::new("key").is_in([Datum::binary(*b"abcdefghijklmnop-last")]),
+            Reference::new("key").greater_than_or_equal_to(Datum::binary(*b"abcdefghijklmnop")),
+            Reference::new("key").less_than_or_equal_to(Datum::binary(*b"abcdefghijklmnoq")),
+        ] {
+            let predicate = predicate.bind(schema.clone(), false).unwrap();
+            assert!(
+                super::InclusiveMetricsEvaluator::eval_metrics(
+                    &predicate,
+                    (&metrics).into(),
+                    false
+                )
+                .unwrap()
+            );
+            assert!(!super::FileScanTaskReader::file_always_matches(
+                &predicate, &metrics
+            ));
+        }
+        let outside = Reference::new("key")
+            .equal_to(Datum::binary(*b"z-outside"))
+            .bind(schema, false)
+            .unwrap();
+        assert!(
+            !super::InclusiveMetricsEvaluator::eval_metrics(&outside, (&metrics).into(), false)
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn truncated_string_bounds_remain_inclusive_and_keep_row_filter() {
         let schema = Arc::new(
             Schema::builder()
@@ -1916,14 +2069,14 @@ mod tests {
         );
         // Actual values differ after the first sixteen characters. The lower bound is
         // truncated down and the upper bound rounded up, so neither is an exact value.
-        let metrics = FileScanTaskMetrics::new(
-            Some(2),
-            HashMap::from([(1, 2)]),
-            HashMap::from([(1, 0)]),
-            HashMap::new(),
-            HashMap::from([(1, Datum::string("abcdefghijklmnop"))]),
-            HashMap::from([(1, Datum::string("abcdefghijklmnoq"))]),
-        );
+        let metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_nan_value_counts(HashMap::new())
+            .with_lower_bounds(HashMap::from([(1, Datum::string("abcdefghijklmnop"))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::string("abcdefghijklmnoq"))]))
+            .build();
         for predicate in [
             Reference::new("key").equal_to(Datum::string("abcdefghijklmnop-first")),
             Reference::new("key").is_in([Datum::string("abcdefghijklmnop-last")]),
@@ -1967,14 +2120,14 @@ mod tests {
             .not_equal_to(Datum::int(1))
             .bind(schema, false)
             .unwrap();
-        let metrics = FileScanTaskMetrics::new(
-            Some(2),
-            HashMap::from([(1, 2)]),
-            HashMap::from([(1, 0)]),
-            HashMap::new(),
-            HashMap::from([(1, Datum::int(2))]),
-            HashMap::from([(1, Datum::int(3))]),
-        );
+        let metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_nan_value_counts(HashMap::new())
+            .with_lower_bounds(HashMap::from([(1, Datum::int(2))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::int(3))]))
+            .build();
         assert!(super::FileScanTaskReader::file_always_matches(
             &predicate, &metrics
         ));

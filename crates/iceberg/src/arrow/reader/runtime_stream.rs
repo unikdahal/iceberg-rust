@@ -28,6 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow_array::RecordBatch;
 use parquet::DecodeResult;
@@ -83,6 +84,7 @@ pub(super) struct BoundaryRefresh {
     /// one replaces it, and a later `None` leaves it in place: it never
     /// restores groups, pages or rows already skipped.
     pub(super) runtime: Option<ResolvedPredicate>,
+    pub(super) runtime_disabled: Arc<AtomicBool>,
     pub(super) row_selection_enabled: bool,
     pub(super) task: FileScanTask,
     pub(super) use_position_fallback: bool,
@@ -101,6 +103,8 @@ pub(super) struct RuntimePrunedStream {
     /// The frontier count identifies the group owning any overfetched bytes.
     /// It also changes when the decoder internally skips a fully filtered group.
     buffered_frontier: Option<usize>,
+    #[cfg(test)]
+    probe: Option<Arc<test_support::Probe>>,
 }
 
 /// The decoder is only absent while it is being rebuilt, so a missing decoder means the
@@ -121,6 +125,11 @@ impl RuntimePrunedStream {
         refresh: BoundaryRefresh,
     ) -> Self {
         Self {
+            #[cfg(test)]
+            probe: test_support::find(
+                refresh.task.data_file_path(),
+                refresh.runtime_disabled.clone(),
+            ),
             decoder: Some(decoder),
             active_reader: None,
             file_reader,
@@ -132,11 +141,18 @@ impl RuntimePrunedStream {
     }
 
     fn refresh_at_boundary(&mut self) -> Result<()> {
+        if self.refresh.runtime_disabled.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let decoder = self.decoder.as_ref().ok_or_else(missing_decoder)?;
         if !decoder.is_at_row_group_boundary() || decoder.row_groups_remaining() == 0 {
             return Ok(());
         }
         let generation = self.refresh.predicates.generation();
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.generation_checks.fetch_add(1, Ordering::Relaxed);
+        }
         if generation == self.refresh.seen_generation {
             return Ok(());
         }
@@ -213,6 +229,10 @@ impl RuntimePrunedStream {
         &self,
         predicate: Arc<BoundPredicate>,
     ) -> Result<(ResolvedPredicate, Vec<RowGroupSelection>)> {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.plans.fetch_add(1, Ordering::Relaxed);
+        }
         let parquet_metadata = self.metadata.metadata();
         let task = &self.refresh.task;
         check_runtime_predicate_columns(
@@ -240,6 +260,10 @@ impl RuntimePrunedStream {
             }
         }
         if self.refresh.row_selection_enabled && !kept.is_empty() {
+            #[cfg(test)]
+            if let Some(probe) = &self.probe {
+                probe.page_plans.fetch_add(1, Ordering::Relaxed);
+            }
             // Page selections span the selected groups in file order, while the groups may
             // be read in another order (largest first). Plan and split them in file order,
             // then attach each to its own group by index.
@@ -298,18 +322,31 @@ impl RuntimePrunedStream {
     /// Compiles the planned predicate and `runtime` into one row filter. If the
     /// runtime part cannot be compiled the predicate is not adopted.
     fn compile_row_filter(&self, runtime: &ResolvedPredicate) -> Option<RowFilter> {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.compilations.fetch_add(1, Ordering::Relaxed);
+        }
         let schema_descr = self.metadata.metadata().file_metadata().schema_descr();
-        let planned = self.refresh.planned.iter().chain([runtime]);
-        let predicates: Vec<_> = planned
-            .map(|resolved| {
+        let predicates: Vec<_> = self
+            .refresh
+            .planned
+            .iter()
+            .map(|resolved| (resolved, false))
+            .chain([(runtime, true)])
+            .map(|(resolved, advisory)| {
                 (
                     resolved.predicate.as_ref(),
                     &resolved.field_ids,
                     &resolved.field_id_map,
+                    advisory,
                 )
             })
             .collect();
-        match ArrowReader::get_arrow_predicate(&predicates, schema_descr) {
+        match ArrowReader::get_arrow_predicate(
+            &predicates,
+            schema_descr,
+            self.refresh.runtime_disabled.clone(),
+        ) {
             Ok(predicate) => Some(RowFilter::new(vec![predicate])),
             Err(error) => {
                 tracing::debug!(
@@ -332,11 +369,43 @@ impl RuntimePrunedStream {
         row_filter: RowFilter,
     ) -> Result<()> {
         let decoder = self.decoder.take().ok_or_else(missing_decoder)?;
-        let mut decoder = decoder
+        #[cfg(test)]
+        let decoder = {
+            if let Some(probe) = &self.probe {
+                probe.rebuilds.fetch_add(1, Ordering::Relaxed);
+            }
+            if self.probe.as_ref().is_some_and(|probe| {
+                probe.take_failure(test_support::Stage::IntoBuilder)
+            }) {
+                // A finished decoder exercises parquet's actual
+                // into_builder error after ownership was taken.
+                let mut finished = decoder
+                    .into_builder()?
+                    .with_row_group_selections(vec![])
+                    .build()?;
+                assert!(matches!(
+                    finished.try_next_reader()?,
+                    DecodeResult::Finished
+                ));
+                finished
+            } else {
+                decoder
+            }
+        };
+        let builder = decoder
             .into_builder()?
             .with_row_group_selections(selections)
-            .with_row_filter(row_filter)
-            .build()?;
+            .with_row_filter(row_filter);
+        #[cfg(test)]
+        let builder = if self.probe.as_ref().is_some_and(|probe| {
+            probe.take_failure(test_support::Stage::Build)
+        }) {
+            // Conflicting plans exercise parquet's actual build error.
+            builder.with_row_groups(vec![0])
+        } else {
+            builder
+        };
+        let mut decoder = builder.build()?;
         if next_pruned {
             // Only the next group's ranges can be buffered at a boundary.
             decoder.clear_all_ranges();
@@ -384,5 +453,97 @@ impl RuntimePrunedStream {
             let batch = state.next_batch().await?;
             Ok::<_, Error>(batch.map(|batch| (batch, state)))
         }))
+    }
+}
+
+#[cfg(test)]
+pub(super) mod test_support {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+    #[derive(Clone, Copy)]
+    pub(in crate::arrow::reader) enum Stage {
+        IntoBuilder = 1,
+        Build = 2,
+    }
+
+    #[derive(Default)]
+    pub(in crate::arrow::reader) struct Probe {
+        pub(super) generation_checks: AtomicU64,
+        pub(super) plans: AtomicU64,
+        pub(super) page_plans: AtomicU64,
+        pub(super) compilations: AtomicU64,
+        pub(super) rebuilds: AtomicU64,
+        failure: AtomicU8,
+        disabled: Mutex<Option<Arc<AtomicBool>>>,
+    }
+
+    fn registry() -> &'static Mutex<HashMap<String, Weak<Probe>>> {
+        static REGISTRY: OnceLock<
+            Mutex<HashMap<String, Weak<Probe>>>,
+        > = OnceLock::new();
+        REGISTRY.get_or_init(Mutex::default)
+    }
+
+    impl Probe {
+        pub(in crate::arrow::reader) fn register(
+            path: &str,
+        ) -> Arc<Self> {
+            let probe = Arc::new(Self::default());
+            registry().lock().unwrap().insert(
+                path.to_owned(),
+                Arc::downgrade(&probe),
+            );
+            probe
+        }
+
+        pub(in crate::arrow::reader) fn fail_at(
+            &self,
+            stage: Stage,
+        ) {
+            self.failure.store(stage as u8, Ordering::Relaxed);
+        }
+
+        pub(in crate::arrow::reader) fn disable_runtime(&self) {
+            self.disabled
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .store(true, Ordering::Relaxed);
+        }
+
+        pub(in crate::arrow::reader) fn counts(&self) -> [u64; 5] {
+            [
+                self.generation_checks.load(Ordering::Relaxed),
+                self.plans.load(Ordering::Relaxed),
+                self.page_plans.load(Ordering::Relaxed),
+                self.compilations.load(Ordering::Relaxed),
+                self.rebuilds.load(Ordering::Relaxed),
+            ]
+        }
+
+        pub(super) fn take_failure(&self, stage: Stage) -> bool {
+            self.failure
+                .compare_exchange(
+                    stage as u8,
+                    0,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        }
+    }
+
+    pub(super) fn find(
+        path: &str,
+        disabled: Arc<AtomicBool>,
+    ) -> Option<Arc<Probe>> {
+        let mut registry = registry().lock().unwrap();
+        registry.retain(|_, probe| probe.strong_count() > 0);
+        let probe = registry.get(path)?.upgrade()?;
+        *probe.disabled.lock().unwrap() = Some(disabled);
+        Some(probe)
     }
 }

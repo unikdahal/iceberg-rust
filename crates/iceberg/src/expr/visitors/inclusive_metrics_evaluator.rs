@@ -15,65 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
-
 use fnv::FnvHashSet;
 
+use crate::expr::visitors::FileMetrics;
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
 use crate::expr::{BoundPredicate, BoundReference};
-use crate::scan::FileScanTaskMetrics;
 use crate::spec::{DataFile, Datum, PrimitiveLiteral};
 use crate::{Error, ErrorKind};
 
 const IN_PREDICATE_LIMIT: usize = 200;
 const ROWS_MIGHT_MATCH: crate::Result<bool> = Ok(true);
 const ROWS_CANNOT_MATCH: crate::Result<bool> = Ok(false);
-
-/// Borrowed whole-file column statistics, keyed by Iceberg field ID.
-///
-/// The statistics evaluator only reads these maps, so callers that hold them
-/// outside a [`DataFile`] can be evaluated without building one.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct FileMetrics<'a> {
-    /// Number of records in the file, when known.
-    pub(crate) record_count: Option<u64>,
-    /// Number of values, including nulls and NaNs.
-    pub(crate) value_counts: &'a HashMap<i32, u64>,
-    /// Number of null values.
-    pub(crate) null_value_counts: &'a HashMap<i32, u64>,
-    /// Number of NaN values.
-    pub(crate) nan_value_counts: &'a HashMap<i32, u64>,
-    /// Inclusive lower bounds.
-    pub(crate) lower_bounds: &'a HashMap<i32, Datum>,
-    /// Inclusive upper bounds.
-    pub(crate) upper_bounds: &'a HashMap<i32, Datum>,
-}
-
-impl<'a> From<&'a DataFile> for FileMetrics<'a> {
-    fn from(data_file: &'a DataFile) -> Self {
-        Self {
-            record_count: Some(data_file.record_count),
-            value_counts: &data_file.value_counts,
-            null_value_counts: &data_file.null_value_counts,
-            nan_value_counts: &data_file.nan_value_counts,
-            lower_bounds: &data_file.lower_bounds,
-            upper_bounds: &data_file.upper_bounds,
-        }
-    }
-}
-
-impl<'a> From<&'a FileScanTaskMetrics> for FileMetrics<'a> {
-    fn from(metrics: &'a FileScanTaskMetrics) -> Self {
-        Self {
-            record_count: metrics.record_count(),
-            value_counts: metrics.value_counts(),
-            null_value_counts: metrics.null_value_counts(),
-            nan_value_counts: metrics.nan_value_counts(),
-            lower_bounds: metrics.lower_bounds(),
-            upper_bounds: metrics.upper_bounds(),
-        }
-    }
-}
 
 pub(crate) struct InclusiveMetricsEvaluator<'a> {
     metrics: FileMetrics<'a>,
@@ -539,9 +491,8 @@ mod test {
         Eq, GreaterThan, GreaterThanOrEq, In, IsNan, IsNull, LessThan, LessThanOrEq, NotEq, NotIn,
         NotNan, NotNull, NotStartsWith, StartsWith,
     };
-    use crate::expr::visitors::inclusive_metrics_evaluator::{
-        FileMetrics, InclusiveMetricsEvaluator,
-    };
+    use crate::expr::visitors::FileMetrics;
+    use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
     use crate::expr::{
         BinaryExpression, Bind, BoundPredicate, Predicate, Reference, SetExpression,
         UnaryExpression,

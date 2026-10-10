@@ -20,7 +20,7 @@ use fnv::FnvHashSet;
 use crate::Result;
 use crate::error::invalid_data;
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
-use crate::expr::visitors::inclusive_metrics_evaluator::FileMetrics;
+use crate::expr::visitors::FileMetrics;
 use crate::expr::{BoundPredicate, BoundReference};
 use crate::spec::{DataFile, Datum, PrimitiveType};
 
@@ -103,8 +103,9 @@ impl<'a> StrictMetricsEvaluator<'a> {
         }
     }
 
-    /// A missing NaN count means NaN is possible only for floating-point columns: no other
-    /// type can hold NaN, so its absent count proves nothing about the column.
+    /// Missing NaN counts block proofs for floating columns.
+    /// Unlike Java's evaluator, absence does not imply zero
+    /// NaNs; non-floating columns cannot contain NaNs.
     fn may_contain_nan(&self, reference: &BoundReference) -> bool {
         match self.nan_count(reference.field().id) {
             Some(&nan_count) => nan_count > 0,
@@ -427,6 +428,83 @@ mod test {
 
     const INT_MIN_VALUE: i32 = 30;
     const INT_MAX_VALUE: i32 = 79;
+
+    #[test]
+    fn test_strict_missing_nan_count_blocks_only_floating_columns() {
+        let mut results = Vec::new();
+        for (field_type, lower, literal) in [
+            (PrimitiveType::Int, Datum::int(1), Datum::int(0)),
+            (
+                PrimitiveType::Float,
+                Datum::float(1.0),
+                Datum::float(0.0),
+            ),
+            (
+                PrimitiveType::Double,
+                Datum::double(1.0),
+                Datum::double(0.0),
+            ),
+        ] {
+            let schema = Arc::new(
+                Schema::builder()
+                    .with_fields([Arc::new(NestedField::required(
+                        1,
+                        "x",
+                        Type::Primitive(field_type),
+                    ))])
+                    .build()
+                    .unwrap(),
+            );
+            let predicate = Predicate::Binary(BinaryExpression::new(
+                GreaterThan,
+                Reference::new("x"),
+                literal,
+            ))
+            .bind(schema, true)
+            .unwrap();
+            let counts = HashMap::from([(1, 3)]);
+            let nulls = HashMap::from([(1, 0)]);
+            let nans = HashMap::new();
+            let lower = HashMap::from([(1, lower)]);
+            let upper = HashMap::new();
+            results.push(
+                StrictMetricsEvaluator::eval_metrics(
+                    &predicate,
+                    crate::expr::visitors::FileMetrics {
+                        record_count: Some(3),
+                        value_counts: &counts,
+                        null_value_counts: &nulls,
+                        nan_value_counts: &nans,
+                        lower_bounds: &lower,
+                        upper_bounds: &upper,
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        assert_eq!(results, vec![true, false, false]);
+    }
+
+    #[test]
+    fn file_metrics_strict_eval_with_unknown_record_count() {
+        let predicate = is_null("all_nulls");
+        let counts = HashMap::from([(4, 3)]);
+        let empty_counts = HashMap::new();
+        let bounds = HashMap::new();
+        let result = StrictMetricsEvaluator::eval_metrics(
+            &predicate,
+            crate::expr::visitors::FileMetrics {
+                record_count: None,
+                value_counts: &counts,
+                null_value_counts: &counts,
+                nan_value_counts: &empty_counts,
+                lower_bounds: &bounds,
+                upper_bounds: &bounds,
+            },
+        )
+        .unwrap();
+        assert!(result);
+    }
 
     // Helper: Create a test schema.
     fn create_test_schema() -> Arc<Schema> {
