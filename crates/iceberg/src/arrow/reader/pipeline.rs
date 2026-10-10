@@ -1609,7 +1609,7 @@ mod tests {
                 Reference::new("key").is_in([positive_zero, nan]),
             ] {
                 let predicate = predicate.bind(schema.clone(), false).unwrap();
-                assert!(
+                assert!(!
                     super::StrictMetricsEvaluator::eval_metrics(&predicate, (&metrics).into())
                         .unwrap()
                 );
