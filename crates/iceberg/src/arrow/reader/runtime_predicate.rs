@@ -34,7 +34,8 @@ use crate::{Error, ErrorKind, Result};
 #[derive(Debug)]
 pub struct RuntimePredicateSnapshot {
     predicate: Option<Predicate>,
-    generation: u64,}
+    generation: u64,
+}
 
 impl RuntimePredicateSnapshot {
     /// Creates a runtime predicate snapshot. A `None` predicate adds no
@@ -866,5 +867,4 @@ mod tests {
         let case_sensitive = predicates.current(&schema, true, "case").unwrap();
         assert!(!Arc::ptr_eq(&second, &case_sensitive));
     }
-
 }
