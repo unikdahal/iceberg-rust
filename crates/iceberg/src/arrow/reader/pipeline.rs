@@ -1623,7 +1623,7 @@ mod tests {
                 HashMap::from([(1, 0)]),
                 HashMap::from([(1, 0)]),
                 HashMap::from([(1, positive_zero.clone())]),
-                HashMap::from([(1, positive_zero)]),
+                HashMap::from([(1, positive_zero.clone())]),
             );
             for predicate in [
                 Reference::new("key").equal_to(positive_zero.clone()),
