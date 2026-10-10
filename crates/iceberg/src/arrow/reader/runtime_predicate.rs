@@ -730,4 +730,68 @@ mod tests {
             3
         );
     }
+
+    #[test]
+    #[ignore = "timing test run explicitly by fork CI"]
+    fn runtime_performance_concurrent_cache_miss() {
+        use std::time::Instant;
+
+        struct Provider {
+            predicate: Predicate,
+            snapshots: AtomicU64,
+        }
+        impl RuntimePredicateProvider for Provider {
+            fn generation(&self) -> u64 {
+                1
+            }
+
+            fn snapshot(&self) -> Result<RuntimePredicateSnapshot> {
+                self.snapshots.fetch_add(1, Ordering::Relaxed);
+                Ok(RuntimePredicateSnapshot::new(Some(self.predicate.clone()), 1))
+            }
+        }
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        for callers in [1, 8, 32, 128] {
+            let mut samples = Vec::new();
+            for _ in 0..5 {
+                let provider = Arc::new(Provider {
+                    predicate: Reference::new("id").is_in((0..10_000).map(Datum::long)),
+                    snapshots: AtomicU64::new(0),
+                });
+                let predicates = RuntimePredicates::new(provider.clone());
+                let barrier = Barrier::new(callers + 1);
+                std::thread::scope(|scope| {
+                    let threads: Vec<_> = (0..callers)
+                        .map(|_| {
+                            scope.spawn(|| {
+                                barrier.wait();
+                                let started = Instant::now();
+                                let bound = predicates.current(&schema, false, "timing.parquet");
+                                (started.elapsed(), bound.unwrap())
+                            })
+                        })
+                        .collect();
+                    barrier.wait();
+                    let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+                    assert!(results.iter().all(|(_, bound)| Arc::ptr_eq(bound, &results[0].1)));
+                    let max = results.iter().map(|(time, _)| *time).max().unwrap();
+                    samples.push(max.as_secs_f64() * 1000.0);
+                });
+                assert_eq!(provider.snapshots.load(Ordering::Relaxed), 1);
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "R3 cache callers={callers} keys=10000 median_max_ms={:.3} snapshots=1",
+                samples[2],
+            );
+        }
+    }
+
 }

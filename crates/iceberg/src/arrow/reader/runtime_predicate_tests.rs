@@ -3599,3 +3599,75 @@ async fn largest_first_fallback_contract() {
         assert_eq!(metrics.runtime_decoder_rebuilds(), 0);
     }
 }
+
+
+#[tokio::test]
+#[ignore = "timing test run explicitly by fork CI"]
+async fn runtime_performance_boundary_publications() {
+    use std::time::Instant;
+
+    let temp = TempDir::new().unwrap();
+    let schema = Arc::new(
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "k", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap(),
+    );
+    for groups in [2000, 4000] {
+        let path = temp.path().join(format!("timing-{groups}.parquet"));
+        let path = path.to_str().unwrap();
+        write_cycling_groups(path, groups);
+        for mode in ["no-provider", "none", "stable", "one", "churn", "tightening"] {
+            let mut samples = Vec::new();
+            for _ in 0..3 {
+                let predicate = Reference::new("k").greater_than_or_equal_to(Datum::int(2));
+                let initial = matches!(mode, "stable" | "churn" | "tightening")
+                    .then_some(predicate.clone());
+                let provider = Arc::new(ChangingRuntimePredicate::new(initial, 0));
+                let runtime = (mode != "no-provider")
+                    .then_some(provider.clone() as Arc<dyn RuntimePredicateProvider>);
+                let task = scan_task(path.to_string(), schema.clone(), None);
+                let started = Instant::now();
+                let (mut stream, metrics) = start_runtime_scan(task, runtime, true, true, 4);
+                let mut rows = 0;
+                let mut boundaries = 0;
+                while let Some(batch) = stream.try_next().await.unwrap() {
+                    rows += batch.num_rows();
+                    boundaries += 1;
+                    if boundaries < groups && (mode == "churn" || mode == "tightening"
+                        || (mode == "one" && boundaries == 1))
+                    {
+                        let published = if mode == "tightening" {
+                            predicate.clone().and(
+                                Reference::new("id")
+                                    .greater_than_or_equal_to(Datum::int(boundaries * 4)),
+                            )
+                        } else {
+                            predicate.clone()
+                        };
+                        provider.publish(Some(published), boundaries as u64);
+                    }
+                }
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                let expected_rows = match mode {
+                    "no-provider" | "none" => groups as usize * 4,
+                    "one" => groups as usize * 2 + 2,
+                    _ => groups as usize * 2,
+                };
+                assert_eq!(rows, expected_rows);
+                assert_eq!(boundaries, groups);
+                println!(
+                    "R3 boundary groups={groups} mode={mode} ms={:.3} rebuilds={} snapshots={}",
+                    samples.last().unwrap(),
+                    metrics.runtime_decoder_rebuilds(),
+                    provider.snapshots(),
+                );
+            }
+            samples.sort_by(f64::total_cmp);
+            println!("R3 median groups={groups} mode={mode} ms={:.3}", samples[1]);
+        }
+    }
+}
