@@ -1145,8 +1145,8 @@ impl FileScanTaskReader {
     /// Checks whether floating-point comparisons for Binary and Set predicates
     /// can safely skip Arrow row filtering when strict metrics prove all rows match.
     ///
-    /// Iceberg float ordering (NaN highest, -0.0 == +0.0) differs from Arrow kernels
-    /// (IEEE total order: -0.0 < +0.0, NaN == NaN). The shortcut is safe only when:
+    /// Iceberg literal comparisons and Arrow row kernels can differ for NaNs.
+    /// NaNs and signed zero conservatively retain row filtering. The shortcut is safe only when:
     /// - `nan_value_counts` is present and == 0 (guaranteeing no NaNs exist in the file);
     /// - No predicate literal is NaN (any payload or sign);
     /// - No predicate literal is ±0.0, AND lower and upper bounds are both present and the
@@ -1609,8 +1609,8 @@ mod tests {
                 Reference::new("key").is_in([positive_zero, nan]),
             ] {
                 let predicate = predicate.bind(schema.clone(), false).unwrap();
-                assert!(!
-                    super::StrictMetricsEvaluator::eval_metrics(&predicate, (&metrics).into())
+                assert!(
+                    !super::StrictMetricsEvaluator::eval_metrics(&predicate, (&metrics).into())
                         .unwrap()
                 );
                 assert!(!super::FileScanTaskReader::file_always_matches(
