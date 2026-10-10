@@ -160,6 +160,10 @@ impl DeleteFilter {
         self.runtime.cpu().spawn(async move {
             let result = match receiver.await {
                 Ok(Ok(predicate)) => Some(EqDelState::Loaded(predicate)),
+                // A retryable failure releases the claim instead of caching the
+                // error, so a later attempt can load the file again. The failure
+                // still fails the current caller closed.
+                Ok(Err(error)) if error.retryable() => None,
                 Ok(Err(error)) => Some(EqDelState::Failed(error)),
                 Err(_) => None,
             };
@@ -223,9 +227,16 @@ impl DeleteFilter {
                 return;
             };
             let notify = Arc::clone(notify);
-            state
-                .positional_deletes
-                .insert(file_path.to_string(), PosDelState::Failed(error));
+            // A retryable failure releases the claim so a later attempt can retry;
+            // a permanent failure stays cached for every waiter. Either way the
+            // caller that observed the failure returns it.
+            if error.retryable() {
+                state.positional_deletes.remove(file_path);
+            } else {
+                state
+                    .positional_deletes
+                    .insert(file_path.to_string(), PosDelState::Failed(error));
+            }
             notify
         };
         notify.notify_waiters();
@@ -428,14 +439,14 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn test_eq_load_failure_preserves_cause_and_retryability() {
+    async fn test_eq_non_retryable_load_failure_is_cached() {
         let filter = DeleteFilter::new(Runtime::current());
         let path = "failed-eq-delete.parquet";
         let sender = filter.try_start_eq_del_load(path).unwrap();
         sender
             .send(Err(Arc::new(
                 Error::new(ErrorKind::DataInvalid, "injected equality failure")
-                    .with_retryable(true),
+                    .with_retryable(false),
             )))
             .unwrap();
         for _ in 0..2 {
@@ -447,10 +458,71 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap_err();
             assert_eq!(error.kind(), ErrorKind::DataInvalid);
-            assert!(error.retryable());
+            assert!(!error.retryable());
             assert!(error.to_string().contains("injected equality failure"));
             assert!(filter.try_start_eq_del_load(path).is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn test_eq_retryable_load_failure_releases_claim_for_later_attempt() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let path = "retryable-eq-delete.parquet";
+        let sender = filter.try_start_eq_del_load(path).unwrap();
+        sender
+            .send(Err(Arc::new(
+                Error::new(ErrorKind::Unexpected, "transient equality error")
+                    .with_retryable(true),
+            )))
+            .unwrap();
+        // The waiter observes the failure but the claim is released, so a later
+        // attempt can re-claim and load the file.
+        let predicate = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            filter.get_equality_delete_predicate_for_delete_file_path(path),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(predicate.is_none());
+        assert!(filter.try_start_eq_del_load(path).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_pos_retryable_load_failure_releases_claim_for_later_attempt() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let path = "retryable-pos-delete.parquet";
+        let PosDelLoadAction::Load(guard) = filter.try_start_pos_del_load(path) else {
+            panic!("expected load ownership")
+        };
+        guard.fail(
+            Error::new(ErrorKind::Unexpected, "transient positional error").with_retryable(true),
+        );
+        // The claim is released, so the next caller owns a fresh load rather than
+        // receiving a permanently cached error.
+        assert!(matches!(
+            filter.try_start_pos_del_load(path),
+            PosDelLoadAction::Load(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_pos_non_retryable_load_failure_is_cached() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let path = "failed-pos-delete.parquet";
+        let PosDelLoadAction::Load(guard) = filter.try_start_pos_del_load(path) else {
+            panic!("expected load ownership")
+        };
+        let returned = guard.fail(
+            Error::new(ErrorKind::DataInvalid, "permanent positional error").with_retryable(false),
+        );
+        assert_eq!(returned.kind(), ErrorKind::DataInvalid);
+        assert!(!returned.retryable());
+        let PosDelLoadAction::Failed(error) = filter.try_start_pos_del_load(path) else {
+            panic!("expected the cached failure")
+        };
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(!error.retryable());
     }
 
     #[tokio::test]

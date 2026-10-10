@@ -130,6 +130,12 @@ enum ParsedDeleteFileContext {
     ExistingPosDel,
 }
 
+/// Maximum number of load attempts per delete file within one scan task before
+/// giving up. Retryable failures and reclaimed claims release the cache entry,
+/// so a task re-claims and retries; this bound stops a persistently failing
+/// file from retrying without limit inside a single task.
+const MAX_DELETE_LOAD_ATTEMPTS: usize = 3;
+
 #[allow(unused_variables)]
 impl CachingDeleteFileLoader {
     pub(crate) fn new(
@@ -312,14 +318,15 @@ impl CachingDeleteFileLoader {
                     return Self::load_deletion_vector(task, basic_delete_file_loader).await;
                 }
 
-                loop {
+                for _ in 0..MAX_DELETE_LOAD_ATTEMPTS {
                     match del_filter.try_start_pos_del_load(task.file_path()) {
                         PosDelLoadAction::AlreadyLoaded => {
                             return Ok(DeleteFileContext::ExistingPosDel);
                         }
                         PosDelLoadAction::WaitFor(notified) => {
-                            // Re-check after waking: cancellation releases the entry and
-                            // another waiter may have claimed it before we run again.
+                            // Re-check after waking: cancellation or a retryable
+                            // failure releases the entry and another waiter may
+                            // have claimed it before we run again.
                             notified.await;
                         }
                         PosDelLoadAction::Failed(error) => return Err(error),
@@ -338,20 +345,41 @@ impl CachingDeleteFileLoader {
                         }
                     }
                 }
+                Err(Error::new(
+                    ErrorKind::Unexpected,
+                    format!(
+                        "Exceeded maximum load attempts for delete file '{}'",
+                        task.file_path()
+                    ),
+                ))
             }
 
             DataContentType::EqualityDeletes => {
-                let sender = loop {
-                    if let Some(sender) = del_filter.try_start_eq_del_load(task.file_path()) {
-                        break sender;
+                let sender = {
+                    let mut sender = None;
+                    for _ in 0..MAX_DELETE_LOAD_ATTEMPTS {
+                        if let Some(claimed) = del_filter.try_start_eq_del_load(task.file_path()) {
+                            sender = Some(claimed);
+                            break;
+                        }
+                        if del_filter
+                            .get_equality_delete_predicate_for_delete_file_path(task.file_path())
+                            .await?
+                            .is_some()
+                        {
+                            return Ok(DeleteFileContext::ExistingEqDel);
+                        }
                     }
-                    if del_filter
-                        .get_equality_delete_predicate_for_delete_file_path(task.file_path())
-                        .await?
-                        .is_some()
-                    {
-                        return Ok(DeleteFileContext::ExistingEqDel);
-                    }
+                    sender
+                };
+                let Some(sender) = sender else {
+                    return Err(Error::new(
+                        ErrorKind::Unexpected,
+                        format!(
+                            "Exceeded maximum load attempts for equality delete file '{}'",
+                            task.file_path()
+                        ),
+                    ));
                 };
 
                 // Per the Iceberg spec, evolve schema for equality deletes but only for the
@@ -1023,7 +1051,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fs::File;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use arrow_array::cast::AsArray;
@@ -1071,6 +1099,12 @@ mod tests {
         release: tokio::sync::Semaphore,
         dropped: tokio::sync::Notify,
         completed_bytes: AtomicU64,
+        /// Number of storage reads that fail before reaching the inner reader.
+        fail_reads: AtomicUsize,
+        /// Retryability reported by injected failures.
+        fail_retryable: AtomicBool,
+        /// Storage reads that reached the inner reader.
+        read_calls: AtomicUsize,
     }
 
     impl ReadGate {
@@ -1080,7 +1114,18 @@ mod tests {
                 release: tokio::sync::Semaphore::new(0),
                 dropped: tokio::sync::Notify::new(),
                 completed_bytes: AtomicU64::new(0),
+                fail_reads: AtomicUsize::new(0),
+                fail_retryable: AtomicBool::new(false),
+                read_calls: AtomicUsize::new(0),
             }
+        }
+
+        /// A gate whose reads proceed without releasing, for tests that inject
+        /// failures rather than block on I/O.
+        fn open() -> Arc<Self> {
+            let gate = Arc::new(Self::new());
+            gate.release.close();
+            gate
         }
     }
 
@@ -1104,7 +1149,21 @@ mod tests {
             self.gate.started.add_permits(1);
             // Closing the gate releases this read and all subsequent reads.
             let _ = self.gate.release.acquire().await;
+            let should_fail = self
+                .gate
+                .fail_reads
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    (remaining > 0).then_some(remaining - 1)
+                })
+                .is_ok();
+            if should_fail {
+                return Err(
+                    Error::new(ErrorKind::Unexpected, "injected storage read failure")
+                        .with_retryable(self.gate.fail_retryable.load(Ordering::SeqCst)),
+                );
+            }
             let bytes = self.inner.read(range).await?;
+            self.gate.read_calls.fetch_add(1, Ordering::SeqCst);
             self.gate
                 .completed_bytes
                 .fetch_add(bytes.len() as u64, Ordering::SeqCst);
@@ -1302,6 +1361,223 @@ mod tests {
             0, 1, 3, 5, 6, 8, 1022, 1023
         ]);
         assert_equality_delete_contents(&filter, equality_delete.file_path()).await;
+    }
+
+    #[tokio::test]
+    async fn test_retryable_pos_failure_does_not_poison_later_load() {
+        let directory = TempDir::new().unwrap();
+        let tasks = setup(directory.path());
+        let task = &tasks[0];
+        let delete = &task.deletes()[0];
+        let gate = ReadGate::open();
+        gate.fail_reads.store(1, Ordering::SeqCst);
+        gate.fail_retryable.store(true, Ordering::SeqCst);
+        let file_io = crate::io::FileIOBuilder::new(Arc::new(MetadataCountingStorageFactory {
+            read_gate: Some(Arc::clone(&gate)),
+            ..Default::default()
+        }))
+        .build();
+        let loader = CachingDeleteFileLoader::new(file_io, 2, Runtime::current());
+
+        // The first attempt fails with a retryable storage error...
+        let first_err = tokio::time::timeout(
+            Duration::from_secs(5),
+            loader.load_deletes(std::slice::from_ref(delete), task.schema_ref()),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(first_err.retryable());
+
+        // ...and a later load on the same loader succeeds instead of reading the
+        // cached failure.
+        let filter = tokio::time::timeout(
+            Duration::from_secs(5),
+            loader.load_deletes(std::slice::from_ref(delete), task.schema_ref()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let vector = filter.get_delete_vector(task).unwrap();
+        assert_eq!(vector.lock().unwrap().iter().collect::<Vec<_>>(), vec![
+            0, 1, 3, 5, 6, 8, 1022, 1023
+        ]);
+    }
+
+    #[tokio::test]
+    async fn test_retryable_eq_failure_does_not_poison_later_load() {
+        let directory = TempDir::new().unwrap();
+        let (delete, schema) = equality_delete_fixture(&directory);
+        let gate = ReadGate::open();
+        gate.fail_reads.store(1, Ordering::SeqCst);
+        gate.fail_retryable.store(true, Ordering::SeqCst);
+        let file_io = crate::io::FileIOBuilder::new(Arc::new(MetadataCountingStorageFactory {
+            read_gate: Some(Arc::clone(&gate)),
+            ..Default::default()
+        }))
+        .build();
+        let loader = CachingDeleteFileLoader::new(file_io, 2, Runtime::current());
+
+        let first_err = tokio::time::timeout(
+            Duration::from_secs(5),
+            loader.load_deletes(std::slice::from_ref(&delete), schema.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(first_err.retryable());
+
+        let filter = tokio::time::timeout(
+            Duration::from_secs(5),
+            loader.load_deletes(std::slice::from_ref(&delete), schema),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_equality_delete_contents(&filter, delete.file_path()).await;
+    }
+
+    #[tokio::test]
+    async fn test_non_retryable_pos_failure_is_cached_without_new_read() {
+        let directory = TempDir::new().unwrap();
+        let tasks = setup(directory.path());
+        let task = &tasks[0];
+        let delete = &task.deletes()[0];
+        let gate = ReadGate::open();
+        gate.fail_reads.store(1, Ordering::SeqCst);
+        gate.fail_retryable.store(false, Ordering::SeqCst);
+        let file_io = crate::io::FileIOBuilder::new(Arc::new(MetadataCountingStorageFactory {
+            read_gate: Some(Arc::clone(&gate)),
+            ..Default::default()
+        }))
+        .build();
+        let loader = CachingDeleteFileLoader::new(file_io, 2, Runtime::current());
+
+        let first_err = tokio::time::timeout(
+            Duration::from_secs(5),
+            loader.load_deletes(std::slice::from_ref(delete), task.schema_ref()),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(!first_err.retryable());
+
+        // The cached failure is returned without any further storage read.
+        let second_err = tokio::time::timeout(
+            Duration::from_secs(5),
+            loader.load_deletes(std::slice::from_ref(delete), task.schema_ref()),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(!second_err.retryable());
+        assert!(second_err.to_string().contains("injected storage read failure"));
+        assert_eq!(gate.read_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_retryable_pos_failure_waiter_reclaims_single_flight() {
+        let directory = TempDir::new().unwrap();
+        let tasks = setup(directory.path());
+        let task = &tasks[0];
+        let delete = &task.deletes()[0];
+        let gate = Arc::new(ReadGate::new());
+        gate.fail_reads.store(1, Ordering::SeqCst);
+        gate.fail_retryable.store(true, Ordering::SeqCst);
+        let file_io = crate::io::FileIOBuilder::new(Arc::new(MetadataCountingStorageFactory {
+            read_gate: Some(Arc::clone(&gate)),
+            ..Default::default()
+        }))
+        .build();
+        let loader = CachingDeleteFileLoader::new(file_io, 2, Runtime::current());
+
+        // Task A owns the load; task B waits on it.
+        let owner = loader.load_deletes(std::slice::from_ref(delete), task.schema_ref());
+        tokio::time::timeout(Duration::from_secs(5), gate.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let waiter = loader.load_deletes(std::slice::from_ref(delete), task.schema_ref());
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::arrow::delete_filter::tests::wait_for_load_waiters(&loader.delete_filter, 1),
+        )
+        .await
+        .unwrap();
+
+        // A's read fails with a retryable error; the owner fails closed...
+        gate.release.add_permits(1);
+        let owner_err = tokio::time::timeout(Duration::from_secs(5), owner)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(owner_err.retryable());
+
+        // ...and B wakes, re-claims, and reads again without a second owner.
+        tokio::time::timeout(Duration::from_secs(5), gate.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        gate.release.close();
+        // With a fresh read count of one, exactly one waiter re-claimed the load.
+        let filter = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        let vector = filter.get_delete_vector(task).unwrap();
+        assert_eq!(vector.lock().unwrap().iter().collect::<Vec<_>>(), vec![
+            0, 1, 3, 5, 6, 8, 1022, 1023
+        ]);
+    }
+
+    #[tokio::test]
+    async fn test_retryable_eq_failure_waiter_reclaims_single_flight() {
+        let directory = TempDir::new().unwrap();
+        let (delete, schema) = equality_delete_fixture(&directory);
+        let gate = Arc::new(ReadGate::new());
+        gate.fail_reads.store(1, Ordering::SeqCst);
+        gate.fail_retryable.store(true, Ordering::SeqCst);
+        let file_io = crate::io::FileIOBuilder::new(Arc::new(MetadataCountingStorageFactory {
+            read_gate: Some(Arc::clone(&gate)),
+            ..Default::default()
+        }))
+        .build();
+        let loader = CachingDeleteFileLoader::new(file_io, 2, Runtime::current());
+
+        let owner = loader.load_deletes(std::slice::from_ref(&delete), schema.clone());
+        tokio::time::timeout(Duration::from_secs(5), gate.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let waiter = loader.load_deletes(std::slice::from_ref(&delete), schema.clone());
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::arrow::delete_filter::tests::wait_for_load_waiters(&loader.delete_filter, 1),
+        )
+        .await
+        .unwrap();
+
+        gate.release.add_permits(1);
+        let owner_err = tokio::time::timeout(Duration::from_secs(5), owner)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(owner_err.retryable());
+
+        tokio::time::timeout(Duration::from_secs(5), gate.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        gate.release.close();
+        let filter = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_equality_delete_contents(&filter, delete.file_path()).await;
     }
 
     #[tokio::test]

@@ -119,7 +119,15 @@ impl BasicDeleteFileLoader {
         let record_batch_stream =
             ParquetRecordBatchStreamBuilder::new_with_metadata(parquet_file_reader, arrow_metadata)
                 .build()?
-                .map_err(|e| Error::new(ErrorKind::Unexpected, format!("{e}")));
+                .map_err(|e| {
+                    let retryable = match &e {
+                        parquet::errors::ParquetError::External(source) => {
+                            source.downcast_ref::<Error>().is_some_and(Error::retryable)
+                        }
+                        _ => false,
+                    };
+                    Error::new(ErrorKind::Unexpected, format!("{e}")).with_retryable(retryable)
+                });
 
         Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
     }

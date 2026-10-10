@@ -1455,7 +1455,31 @@ impl ArrowReader {
         let arrow_metadata = ArrowReaderMetadata::load_async(&mut reader, arrow_reader_options)
             .await
             .map_err(|e| {
-                Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata").with_source(e)
+                let retryable = match &e {
+                    parquet::errors::ParquetError::External(source) => {
+                        if let Some(err) = source.downcast_ref::<Error>() {
+                            err.retryable()
+                        } else if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
+                            matches!(
+                                io_err.kind(),
+                                std::io::ErrorKind::TimedOut
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::NotConnected
+                                    | std::io::ErrorKind::Interrupted
+                            )
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                // A storage error that is retryable must stay retryable through
+                // the metadata load so the delete loader can release its claim
+                // and retry it.
+                Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata")
+                    .with_retryable(retryable)
+                    .with_source(e)
             })?;
 
         Ok((reader, arrow_metadata))
