@@ -34,8 +34,7 @@ use crate::{Error, ErrorKind, Result};
 #[derive(Debug)]
 pub struct RuntimePredicateSnapshot {
     predicate: Option<Predicate>,
-    generation: u64,
-}
+    generation: u64,}
 
 impl RuntimePredicateSnapshot {
     /// Creates a runtime predicate snapshot. A `None` predicate adds no
@@ -368,10 +367,13 @@ pub(super) fn check_runtime_predicate_columns(
             && target_type == arrow_schema::DataType::Int64
             && parquet_schema.column(column).converted_type()
                 != parquet::basic::ConvertedType::UINT_32
-            && !parquet_schema.column(column).logical_type_ref().is_some_and(|logical| {
-                matches!(logical, parquet::basic::LogicalType::Integer(integer)
+            && !parquet_schema
+                .column(column)
+                .logical_type_ref()
+                .is_some_and(|logical| {
+                    matches!(logical, parquet::basic::LogicalType::Integer(integer)
                     if !integer.is_signed)
-            });
+                });
         if column_needs_type_promotion(source_field.data_type(), &target_type)
             && !signed_int_to_long
         {
@@ -851,7 +853,16 @@ mod tests {
         provider.0.store(2, Ordering::Release);
         let second = predicates.current(&schema, false, "second").unwrap();
         assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(predicates.cached.read().unwrap().as_ref().unwrap().generation, 2);
+        assert_eq!(
+            predicates
+                .cached
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .generation,
+            2
+        );
         let case_sensitive = predicates.current(&schema, true, "case").unwrap();
         assert!(!Arc::ptr_eq(&second, &case_sensitive));
     }

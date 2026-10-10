@@ -3680,7 +3680,6 @@ async fn runtime_performance_boundary_publications() {
     }
 }
 
-
 #[tokio::test]
 #[ignore = "timing test run explicitly by fork CI"]
 async fn runtime_performance_promoted_integer() {
@@ -3711,10 +3710,9 @@ async fn runtime_performance_promoted_integer() {
             samples.clear();
             for _ in 0..3 {
                 let task = scan_task(path.to_string(), schema.clone(), None);
-                let provider = runtime.then_some(
-                    Arc::new(FixedRuntimePredicate::new(predicate.clone()))
-                        as Arc<dyn RuntimePredicateProvider>,
-                );
+                let provider = runtime
+                    .then_some(Arc::new(FixedRuntimePredicate::new(predicate.clone()))
+                        as Arc<dyn RuntimePredicateProvider>);
                 let started = Instant::now();
                 let (batches, metrics) = execute(task, provider).await;
                 samples.push(started.elapsed().as_secs_f64() * 1000.0);
@@ -3727,12 +3725,14 @@ async fn runtime_performance_promoted_integer() {
                     metrics.runtime_row_groups_pruned(),
                 );
             }
-        samples.sort_by(f64::total_cmp);
-        println!("R3 promotion median table={primitive} runtime={runtime} ms={:.3}", samples[1]);
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "R3 promotion median table={primitive} runtime={runtime} ms={:.3}",
+                samples[1]
+            );
         }
     }
 }
-
 
 #[tokio::test]
 async fn runtime_int_to_long_operator_matrix() {
@@ -3758,10 +3758,20 @@ async fn runtime_int_to_long_operator_matrix() {
         Some(properties),
     )
     .unwrap();
-    let values = [Some(i32::MIN), None, Some(-1), Some(0), Some(1), Some(i32::MAX)];
+    let values = [
+        Some(i32::MIN),
+        None,
+        Some(-1),
+        Some(0),
+        Some(1),
+        Some(i32::MAX),
+    ];
     for (group, values) in values.chunks(2).enumerate() {
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(Int32Array::from(vec![group as i32 * 2, group as i32 * 2 + 1])),
+            Arc::new(Int32Array::from(vec![
+                group as i32 * 2,
+                group as i32 * 2 + 1,
+            ])),
             Arc::new(Int32Array::from(values.to_vec())),
         ])
         .unwrap();
@@ -3782,14 +3792,32 @@ async fn runtime_int_to_long_operator_matrix() {
     let above = Datum::long(i64::from(i32::MAX) + 1);
     for (predicate, expected) in [
         (Reference::new("value").less_than(below.clone()), vec![]),
-        (Reference::new("value").less_than(above.clone()), vec![0, 2, 3, 4, 5]),
-        (Reference::new("value").less_than_or_equal_to(Datum::long(0)), vec![0, 2, 3]),
-        (Reference::new("value").greater_than(Datum::long(0)), vec![4, 5]),
-        (Reference::new("value").greater_than_or_equal_to(above.clone()), vec![]),
+        (Reference::new("value").less_than(above.clone()), vec![
+            0, 2, 3, 4, 5,
+        ]),
+        (
+            Reference::new("value").less_than_or_equal_to(Datum::long(0)),
+            vec![0, 2, 3],
+        ),
+        (Reference::new("value").greater_than(Datum::long(0)), vec![
+            4, 5,
+        ]),
+        (
+            Reference::new("value").greater_than_or_equal_to(above.clone()),
+            vec![],
+        ),
         (Reference::new("value").equal_to(Datum::long(1)), vec![4]),
-        (Reference::new("value").not_equal_to(above.clone()), vec![0, 2, 3, 4, 5]),
-        (Reference::new("value").is_in([below.clone(), Datum::long(-1), above.clone()]), vec![2]),
-        (Reference::new("value").is_not_in([below, Datum::long(-1), above]), vec![0, 3, 4, 5]),
+        (Reference::new("value").not_equal_to(above.clone()), vec![
+            0, 2, 3, 4, 5,
+        ]),
+        (
+            Reference::new("value").is_in([below.clone(), Datum::long(-1), above.clone()]),
+            vec![2],
+        ),
+        (
+            Reference::new("value").is_not_in([below, Datum::long(-1), above]),
+            vec![0, 3, 4, 5],
+        ),
         (Reference::new("value").is_null(), vec![1]),
         (Reference::new("value").is_not_null(), vec![0, 2, 3, 4, 5]),
     ] {
@@ -3801,12 +3829,15 @@ async fn runtime_int_to_long_operator_matrix() {
             let task = scan_task(path.to_string(), schema.clone(), None);
             let provider = Arc::new(FixedRuntimePredicate::new(predicate.clone()));
             let (batches, metrics) = execute_tasks(vec![task], Some(provider), bloom).await;
-            assert_eq!(ids(&batches), expected, "runtime: {predicate}, bloom={bloom}");
+            assert_eq!(
+                ids(&batches),
+                expected,
+                "runtime: {predicate}, bloom={bloom}"
+            );
             assert_eq!(metrics.runtime_predicate_tasks(), 1);
         }
     }
 }
-
 
 #[tokio::test]
 async fn runtime_publication_budget_retains_mandatory_filters_and_deletes() {
@@ -3854,18 +3885,20 @@ async fn runtime_publication_budget_retains_mandatory_filters_and_deletes() {
             delete_task(position_path.to_string(), true),
             delete_task(equality_path.to_string(), false),
         ],
-        vec![1, 2, crate::spec::RESERVED_FIELD_ID_POS],
+        vec![1, 2, crate::metadata_columns::RESERVED_FIELD_ID_POS],
     );
     let predicate = Reference::new("k").greater_than_or_equal_to(Datum::int(2));
     let provider = Arc::new(ChangingRuntimePredicate::new(Some(predicate.clone()), 0));
     let (mut stream, metrics) = start_runtime_scan(task, Some(provider.clone()), true, true, 4);
     let mut batches = Vec::new();
-    for boundary in 1..=12 {
+    for boundary in 1_i32..=12 {
         batches.push(stream.try_next().await.unwrap().unwrap());
         provider.publish(
-            Some(predicate.clone().and(
-                Reference::new("id").greater_than_or_equal_to(Datum::int(boundary * 4)),
-            )),
+            Some(
+                predicate
+                    .clone()
+                    .and(Reference::new("id").greater_than_or_equal_to(Datum::int(boundary * 4))),
+            ),
             boundary as u64,
         );
     }
@@ -3881,10 +3914,19 @@ async fn runtime_publication_budget_retains_mandatory_filters_and_deletes() {
     let positions: Vec<_> = batches
         .iter()
         .flat_map(|batch| {
-            batch.column(2).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()
+            batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
         })
         .collect();
-    assert_eq!(positions, expected.into_iter().map(i64::from).collect::<Vec<_>>());
+    assert_eq!(
+        positions,
+        expected.into_iter().map(i64::from).collect::<Vec<_>>()
+    );
     assert_eq!(metrics.runtime_decoder_rebuilds(), rebuilds);
     assert_eq!(metrics.runtime_predicate_refreshes(), rebuilds);
     assert!(provider.snapshots() < 13);
@@ -3912,7 +3954,13 @@ async fn runtime_int_to_long_live_publication_prunes_groups_and_pages() {
     let values: Vec<_> = batches
         .iter()
         .flat_map(|batch| {
-            batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
         })
         .collect();
     assert_eq!(values, vec![0, 1, 2, 3, 201, 202, 203]);

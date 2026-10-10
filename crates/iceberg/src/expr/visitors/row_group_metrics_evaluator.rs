@@ -159,7 +159,11 @@ impl<'a> RowGroupMetricsEvaluator<'a> {
             {
                 return Ok(None);
             }
-            let value = if lower { stats.min_opt() } else { stats.max_opt() };
+            let value = if lower {
+                stats.min_opt()
+            } else {
+                stats.max_opt()
+            };
             return Ok(value.map(|value| Datum::long(i64::from(*value))));
         }
         if lower {
