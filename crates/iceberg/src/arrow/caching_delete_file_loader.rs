@@ -2011,6 +2011,28 @@ mod tests {
         }
     }
 
+    /// Copies `delete` with a different location and recorded size.
+    fn relocated_delete(
+        delete: &FileScanTaskDeleteFile,
+        file_path: String,
+        file_size_in_bytes: u64,
+    ) -> FileScanTaskDeleteFile {
+        FileScanTaskDeleteFile::builder()
+            .with_file_path(file_path)
+            .with_file_size_in_bytes(file_size_in_bytes)
+            .with_file_type(delete.file_type())
+            .with_file_format(delete.file_format())
+            .with_partition_spec_id(delete.partition_spec_id())
+            .with_equality_ids(delete.equality_ids().map(<[i32]>::to_vec))
+            .with_referenced_data_file(delete.referenced_data_file().map(str::to_string))
+            .with_content_offset(delete.content_offset())
+            .with_content_size_in_bytes(delete.content_size_in_bytes())
+            .with_record_count(delete.record_count())
+            .with_key_metadata(delete.key_metadata().map(Box::from))
+            .build()
+            .unwrap()
+    }
+
     #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
     struct MetadataCountingStorageFactory {
         #[serde(skip)]
@@ -2045,11 +2067,7 @@ mod tests {
         let unknown: Vec<_> = task
             .deletes()
             .iter()
-            .cloned()
-            .map(|mut delete| {
-                delete.file_size_in_bytes = 0;
-                delete
-            })
+            .map(|delete| relocated_delete(delete, delete.file_path().to_string(), 0))
             .collect();
         let positions = |filter: &DeleteFilter| -> Vec<u64> {
             filter
@@ -2116,6 +2134,7 @@ mod tests {
                 .with_partition_spec_id(0)
                 .with_equality_ids(Some(vec![2, 3]))
                 .build()
+                .unwrap()
         };
         let data_task = |name: &str, delete| {
             FileScanTask::builder()
@@ -2171,12 +2190,7 @@ mod tests {
         let tmp_dir = TempDir::new().unwrap();
         let file_scan_tasks = setup(tmp_dir.path());
         let task = &file_scan_tasks[0];
-        let unknown_size = |path: String| {
-            let mut delete = task.deletes()[0].clone();
-            delete.file_path = path;
-            delete.file_size_in_bytes = 0;
-            delete
-        };
+        let unknown_size = |path: String| relocated_delete(&task.deletes()[0], path, 0);
 
         // A missing delete file fails the load instead of dropping its deletes.
         let missing = unknown_size(format!(
@@ -2198,7 +2212,7 @@ mod tests {
             ..Default::default()
         });
         let file_io = crate::io::FileIOBuilder::new(factory).build();
-        let present = unknown_size(task.deletes()[0].file_path.clone());
+        let present = unknown_size(task.deletes()[0].file_path().to_string());
         let error = CachingDeleteFileLoader::new(file_io, 10, Runtime::current())
             .load_deletes(&[present], task.schema_ref())
             .await

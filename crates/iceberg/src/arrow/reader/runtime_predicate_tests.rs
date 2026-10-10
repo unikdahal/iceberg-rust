@@ -610,6 +610,7 @@ async fn runtime_predicate_preserves_position_and_equality_deletes() {
             .with_partition_spec_id(0)
             .with_equality_ids(equality_ids)
             .build()
+            .unwrap()
     };
     let position = delete(position_path, DataContentType::PositionDeletes, None);
     let equality = delete(
@@ -710,7 +711,8 @@ async fn runtime_predicate_reader_preserves_promoted_columns_with_out_of_range_e
             .with_file_format(DataFileFormat::Parquet)
             .with_partition_spec_id(0)
             .with_equality_ids(Some(vec![1]))
-            .build();
+            .build()
+            .unwrap();
         let task = scan_task_with_deletes(data_path.clone(), schema.clone(), None, vec![delete]);
         let expected: Vec<_> = all_ids()
             .into_iter()
@@ -1806,7 +1808,8 @@ async fn nan_equality_deletes_with_file_metrics_preserve_empty_projection_counts
         .with_file_format(DataFileFormat::Parquet)
         .with_partition_spec_id(0)
         .with_equality_ids(Some(vec![1]))
-        .build();
+        .build()
+            .unwrap();
     let metrics = crate::scan::FileScanTaskMetrics::new(
         Some(2),
         HashMap::from([(1, 2)]),
@@ -1850,6 +1853,7 @@ async fn runtime_predicate_file_rejection_precedes_data_and_delete_io() {
                         (file_type == DataContentType::EqualityDeletes).then_some(vec![1]),
                     )
                     .build()
+                    .unwrap()
             })
             .into_iter()
             .collect();
@@ -2202,7 +2206,8 @@ async fn runtime_predicate_live_refresh_preserves_cached_equality_deletes() {
         .with_file_format(DataFileFormat::Parquet)
         .with_partition_spec_id(0)
         .with_equality_ids(Some(vec![1]))
-        .build();
+        .build()
+            .unwrap();
     let task = scan_task_with_deletes(path, iceberg_schema(), None, vec![delete]);
     let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
     let (mut stream, _) = start_runtime_scan(task, Some(provider.clone()), false, true, 4);

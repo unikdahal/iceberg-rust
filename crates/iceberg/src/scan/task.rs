@@ -962,7 +962,7 @@ mod tests {
 
     #[test]
     fn file_metrics_retain_only_selected_columns() {
-        let file = crate::spec::DataFileBuilder::default()
+        let file = DataFileBuilder::default()
             .content(DataContentType::Data)
             .file_path("data.parquet".to_string())
             .file_format(DataFileFormat::Parquet)
