@@ -24,12 +24,15 @@ use std::sync::Arc;
 
 use arrow_arith::boolean::{and, and_kleene, is_not_null, is_null, not, or, or_kleene};
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Float32Type, Float64Type};
+use arrow_array::types::{
+    Date32Type, Float32Type, Float64Type, Int32Type, Int64Type, Time64MicrosecondType,
+    TimestampMicrosecondType, TimestampNanosecondType,
+};
 use arrow_array::{Array, ArrayRef, BooleanArray, Datum as ArrowDatum, RecordBatch, Scalar};
 use arrow_buffer::BooleanBuffer;
 use arrow_cast::cast::cast;
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
-use arrow_schema::{ArrowError, DataType};
+use arrow_schema::{ArrowError, DataType, TimeUnit};
 use arrow_string::like::starts_with;
 use fnv::FnvHashSet;
 use parquet::schema::types::SchemaDescriptor;
@@ -236,6 +239,50 @@ impl PredicateConverter<'_> {
         }
     }
 
+    /// Compiles membership once per physical column type. Large sets use a
+    /// hash lookup per row, including the negated form used by equality deletes.
+    fn build_set_predicate(
+        &self,
+        column_idx: usize,
+        literals: &FnvHashSet<Datum>,
+        negate: bool,
+    ) -> Result<Box<PredicateResult>> {
+        let literals: Vec<_> = literals
+            .iter()
+            .map(get_arrow_datum)
+            .collect::<Result<_>>()?;
+        let mut set: Option<Option<InSet>> = None;
+        Ok(Box::new(move |batch| {
+            let mut column = project_column(&batch, column_idx)?;
+            if let Some(literal) = literals.first() {
+                column = promote_column_for_literal(column, literal.get().0.data_type())?;
+            }
+            if literals.len() > IN_SET_THRESHOLD {
+                if set.is_none() {
+                    set = Some(InSet::build(column.data_type(), &literals)?);
+                }
+                if let Some(mask) = set
+                    .as_ref()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|set| set.mask(&column))
+                {
+                    return if negate { not(&mask) } else { Ok(mask) };
+                }
+            }
+            let mut acc = constant_bool_array(negate, batch.num_rows());
+            for literal in &literals {
+                let literal = try_cast_literal(literal, column.data_type())?;
+                acc = if negate {
+                    and(&acc, &neq(&column, literal.as_ref())?)?
+                } else {
+                    or(&acc, &eq(&column, literal.as_ref())?)?
+                };
+            }
+            Ok(acc)
+        }))
+    }
+
     /// Build an Arrow predicate that always returns true.
     fn build_always_true(&self) -> Result<Box<PredicateResult>> {
         Ok(Box::new(|batch| {
@@ -428,6 +475,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
 
             Ok(Box::new(move |batch| {
                 let left = project_column(&batch, idx)?;
+                let left = promote_column_for_literal(left, literal.get().0.data_type())?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 lt(&left, literal.as_ref())
             }))
@@ -448,6 +496,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
 
             Ok(Box::new(move |batch| {
                 let left = project_column(&batch, idx)?;
+                let left = promote_column_for_literal(left, literal.get().0.data_type())?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 lt_eq(&left, literal.as_ref())
             }))
@@ -468,6 +517,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
 
             Ok(Box::new(move |batch| {
                 let left = project_column(&batch, idx)?;
+                let left = promote_column_for_literal(left, literal.get().0.data_type())?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 gt(&left, literal.as_ref())
             }))
@@ -488,6 +538,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
 
             Ok(Box::new(move |batch| {
                 let left = project_column(&batch, idx)?;
+                let left = promote_column_for_literal(left, literal.get().0.data_type())?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 gt_eq(&left, literal.as_ref())
             }))
@@ -508,6 +559,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
 
             Ok(Box::new(move |batch| {
                 let left = project_column(&batch, idx)?;
+                let left = promote_column_for_literal(left, literal.get().0.data_type())?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 eq(&left, literal.as_ref())
             }))
@@ -528,6 +580,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
 
             Ok(Box::new(move |batch| {
                 let left = project_column(&batch, idx)?;
+                let left = promote_column_for_literal(left, literal.get().0.data_type())?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 neq(&left, literal.as_ref())
             }))
@@ -585,23 +638,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
         if let Some(idx) = self.bound_reference(reference)? {
-            let literals: Vec<_> = literals
-                .iter()
-                .map(|lit| get_arrow_datum(lit).unwrap())
-                .collect();
-
-            Ok(Box::new(move |batch| {
-                // update this if arrow ever adds a native is_in kernel
-                let left = project_column(&batch, idx)?;
-
-                let mut acc = constant_bool_array(false, batch.num_rows());
-                for literal in &literals {
-                    let literal = try_cast_literal(literal, left.data_type())?;
-                    acc = or(&acc, &eq(&left, literal.as_ref())?)?
-                }
-
-                Ok(acc)
-            }))
+            self.build_set_predicate(idx, literals, false)
         } else {
             // A missing column, treating it as null.
             self.build_always_false()
@@ -615,22 +652,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
         if let Some(idx) = self.bound_reference(reference)? {
-            let literals: Vec<_> = literals
-                .iter()
-                .map(|lit| get_arrow_datum(lit).unwrap())
-                .collect();
-
-            Ok(Box::new(move |batch| {
-                // update this if arrow ever adds a native not_in kernel
-                let left = project_column(&batch, idx)?;
-                let mut acc = constant_bool_array(true, batch.num_rows());
-                for literal in &literals {
-                    let literal = try_cast_literal(literal, left.data_type())?;
-                    acc = and(&acc, &neq(&left, literal.as_ref())?)?
-                }
-
-                Ok(acc)
-            }))
+            self.build_set_predicate(idx, literals, true)
         } else {
             // A missing column, treating it as null.
             self.build_always_true()
@@ -638,10 +660,219 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
     }
 }
 
-/// The Arrow type of an array that the Parquet reader reads may not match the exact Arrow type
-/// that Iceberg uses for literals - but they are effectively the same logical type,
-/// i.e. LargeUtf8 and Utf8 or Utf8View and Utf8 or Utf8View and LargeUtf8.
-///
+/// Literal count above which `IN` and `NOT IN` switch from one comparison
+/// pass per literal to a hash lookup per row, for the column types `InSet`
+/// supports.
+pub(crate) const IN_SET_THRESHOLD: usize = 8;
+
+/// The literals of an `IN` predicate as a hash set over one column type.
+enum InSet {
+    Int32(FnvHashSet<i32>),
+    Int64(FnvHashSet<i64>),
+    Date32(FnvHashSet<i32>),
+    TimestampMicrosecond(FnvHashSet<i64>, DataType),
+    TimestampNanosecond(FnvHashSet<i64>, DataType),
+    Time64Microsecond(FnvHashSet<i64>),
+    Utf8(FnvHashSet<String>),
+    LargeUtf8(FnvHashSet<String>),
+    Utf8View(FnvHashSet<String>),
+}
+
+impl InSet {
+    /// Builds the set for `column_type`, casting each literal to it first.
+    /// `None` keeps the comparison kernels for unsupported types and null casts.
+    fn build(
+        column_type: &DataType,
+        literals: &[Arc<dyn ArrowDatum + Send + Sync>],
+    ) -> std::result::Result<Option<Self>, ArrowError> {
+        macro_rules! collect {
+            ($variant:ident, $array_type:ty $(, $data_type:expr)?) => {{
+                let mut set = FnvHashSet::default();
+                for literal in literals {
+                    let literal = try_cast_literal(literal, column_type)?;
+                    let (array, _) = literal.get();
+                    // A narrowing cast may produce null. The comparison
+                    // kernels propagate that null through the whole mask;
+                    // ignoring the literal would change their semantics.
+                    if array.is_null(0) {
+                        return Ok(None);
+                    }
+                    set.insert(array.as_primitive::<$array_type>().value(0));
+                }
+                Ok(Some(Self::$variant(set $(, $data_type)?)))
+            }};
+        }
+        match column_type {
+            DataType::Int32 => collect!(Int32, Int32Type),
+            DataType::Int64 => collect!(Int64, Int64Type),
+            DataType::Date32 => collect!(Date32, Date32Type),
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                collect!(
+                    TimestampMicrosecond,
+                    TimestampMicrosecondType,
+                    column_type.clone()
+                )
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                collect!(
+                    TimestampNanosecond,
+                    TimestampNanosecondType,
+                    column_type.clone()
+                )
+            }
+            DataType::Time64(TimeUnit::Microsecond) => {
+                collect!(Time64Microsecond, Time64MicrosecondType)
+            }
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+                let mut set = FnvHashSet::default();
+                for literal in literals {
+                    let literal = try_cast_literal(literal, column_type)?;
+                    let (array, _) = literal.get();
+                    if !array.is_null(0) {
+                        let value = match column_type {
+                            DataType::Utf8 => array.as_string::<i32>().value(0),
+                            DataType::LargeUtf8 => array.as_string::<i64>().value(0),
+                            DataType::Utf8View => array.as_string_view().value(0),
+                            _ => unreachable!(),
+                        };
+                        set.insert(value.to_string());
+                    }
+                }
+                Ok(Some(match column_type {
+                    DataType::Utf8 => Self::Utf8(set),
+                    DataType::LargeUtf8 => Self::LargeUtf8(set),
+                    DataType::Utf8View => Self::Utf8View(set),
+                    _ => unreachable!(),
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Membership of each row, null where the row is null, like the comparison kernels.
+    /// `None` when `column` is not the type the set was built for.
+    fn mask(&self, column: &ArrayRef) -> Option<BooleanArray> {
+        match (self, column.data_type()) {
+            (Self::Int32(set), DataType::Int32) => Some(
+                column
+                    .as_primitive::<Int32Type>()
+                    .iter()
+                    .map(|value| value.map(|value| set.contains(&value)))
+                    .collect(),
+            ),
+            (Self::Int64(set), DataType::Int64) => Some(
+                column
+                    .as_primitive::<Int64Type>()
+                    .iter()
+                    .map(|value| value.map(|value| set.contains(&value)))
+                    .collect(),
+            ),
+            (Self::Date32(set), DataType::Date32) => Some(
+                column
+                    .as_primitive::<Date32Type>()
+                    .iter()
+                    .map(|value| value.map(|value| set.contains(&value)))
+                    .collect(),
+            ),
+            (
+                Self::TimestampMicrosecond(set, data_type),
+                DataType::Timestamp(TimeUnit::Microsecond, _),
+            ) if data_type == column.data_type() => Some(
+                column
+                    .as_primitive::<TimestampMicrosecondType>()
+                    .iter()
+                    .map(|value| value.map(|value| set.contains(&value)))
+                    .collect(),
+            ),
+            (
+                Self::TimestampNanosecond(set, data_type),
+                DataType::Timestamp(TimeUnit::Nanosecond, _),
+            ) if data_type == column.data_type() => Some(
+                column
+                    .as_primitive::<TimestampNanosecondType>()
+                    .iter()
+                    .map(|value| value.map(|value| set.contains(&value)))
+                    .collect(),
+            ),
+            (Self::Time64Microsecond(set), DataType::Time64(TimeUnit::Microsecond)) => Some(
+                column
+                    .as_primitive::<Time64MicrosecondType>()
+                    .iter()
+                    .map(|value| value.map(|value| set.contains(&value)))
+                    .collect(),
+            ),
+            (Self::Utf8(set), DataType::Utf8) => Some(
+                column
+                    .as_string::<i32>()
+                    .iter()
+                    .map(|value| value.map(|value| set.contains(value)))
+                    .collect(),
+            ),
+            (Self::LargeUtf8(set), DataType::LargeUtf8) => Some(
+                column
+                    .as_string::<i64>()
+                    .iter()
+                    .map(|value| value.map(|value| set.contains(value)))
+                    .collect(),
+            ),
+            (Self::Utf8View(set), DataType::Utf8View) => Some(
+                column
+                    .as_string_view()
+                    .iter()
+                    .map(|value| value.map(|value| set.contains(value)))
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+}
+
+/// Evaluate comparisons after the same lossless numeric widening as the
+/// output transformer. Narrowing a table literal to an old physical column
+/// can overflow, round, or become null and reject valid rows. Set predicates
+/// call this once per batch rather than casting once per literal.
+fn promote_column_for_literal(
+    column: ArrayRef,
+    literal_type: &DataType,
+) -> std::result::Result<ArrayRef, ArrowError> {
+    // Parquet may restore the Arrow dictionary type from the embedded
+    // schema. Compare the dictionary's values in the table type, preserving
+    // both dictionary and value nulls when flattening.
+    let mut source_type = column.data_type();
+    while let DataType::Dictionary(_, value_type) = source_type {
+        source_type = value_type;
+    }
+    let decimal = |data_type: &DataType| match data_type {
+        DataType::Decimal32(precision, scale)
+        | DataType::Decimal64(precision, scale)
+        | DataType::Decimal128(precision, scale)
+        | DataType::Decimal256(precision, scale) => Some((*precision, *scale)),
+        _ => None,
+    };
+    let promote = match (source_type, literal_type) {
+        // These conversions are infallible over the complete source domain.
+        (
+            DataType::Int8 | DataType::Int16 | DataType::UInt8 | DataType::UInt16,
+            DataType::Int32 | DataType::Int64,
+        )
+        | (DataType::Int32 | DataType::UInt32, DataType::Int64)
+        | (DataType::Float32, DataType::Float64) => true,
+        _ => match (decimal(source_type), decimal(literal_type)) {
+            (Some((source_precision, source_scale)), Some((target_precision, target_scale))) => {
+                source_scale == target_scale
+                    && source_precision <= target_precision
+                    && source_type != literal_type
+            }
+            _ => source_type == literal_type && source_type != column.data_type(),
+        },
+    };
+    if promote {
+        cast(&column, literal_type)
+    } else {
+        Ok(column)
+    }
+}
+
 /// The Arrow compute kernels that we use must match the type exactly, so first cast the literal
 /// into the type of the batch we read from Parquet before sending it to the compute kernel.
 fn try_cast_literal(
@@ -835,5 +1066,188 @@ mod tests {
             [true, false, true, true]
         );
         assert!(!result.is_null(2));
+    }
+
+    #[test]
+    fn in_set_matches_the_comparison_kernels() {
+        use arrow_array::{ArrayRef, Datum as ArrowDatum, Int64Array, StringArray};
+
+        use super::InSet;
+        use crate::arrow::get_arrow_datum;
+        use crate::spec::Datum;
+
+        let longs: Vec<Arc<dyn ArrowDatum + Send + Sync>> = (0..20)
+            .map(|value| get_arrow_datum(&Datum::long(value * 3)).unwrap())
+            .collect();
+        let column: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(0),
+            Some(1),
+            None,
+            Some(57),
+            Some(58),
+        ]));
+        let set = InSet::build(&DataType::Int64, &longs).unwrap().unwrap();
+        assert_eq!(
+            set.mask(&column).unwrap(),
+            BooleanArray::from(vec![Some(true), Some(false), None, Some(true), Some(false)])
+        );
+        // A set built for one column type never answers for another.
+        let other: ArrayRef = Arc::new(StringArray::from(vec!["a"]));
+        assert!(set.mask(&other).is_none());
+
+        let strings: Vec<Arc<dyn ArrowDatum + Send + Sync>> = ["k1", "k2", "k3"]
+            .iter()
+            .map(|value| get_arrow_datum(&Datum::string(*value)).unwrap())
+            .collect();
+        let column: ArrayRef = Arc::new(StringArray::from(vec![Some("k2"), None, Some("k9")]));
+        let set = InSet::build(&DataType::Utf8, &strings).unwrap().unwrap();
+        assert_eq!(
+            set.mask(&column).unwrap(),
+            BooleanArray::from(vec![Some(true), None, Some(false)])
+        );
+        // Types without a hash path keep the comparison kernels.
+        assert!(InSet::build(&DataType::Float64, &longs).unwrap().is_none());
+    }
+
+    #[test]
+    fn membership_predicates_match_kernels_for_small_and_large_sets() {
+        use arrow_array::{
+            ArrayRef, Int32Array, Int64Array, StringArray, Time64MicrosecondArray,
+            TimestampMicrosecondArray, TimestampNanosecondArray,
+        };
+        use arrow_cast::cast;
+        use fnv::FnvHashSet;
+
+        use super::{and, eq, neq, or, promote_column_for_literal, try_cast_literal};
+        use crate::arrow::get_arrow_datum;
+        use crate::spec::Datum;
+
+        let parquet_schema = SchemaDescriptor::new(Arc::new(
+            parse_message_type("message schema { optional int64 value = 1; }").unwrap(),
+        ));
+        let column_map = HashMap::from([(1, 0)]);
+        let column_indices = vec![0];
+        let converter = PredicateConverter {
+            parquet_schema: &parquet_schema,
+            column_map: &column_map,
+            column_indices: &column_indices,
+        };
+        let strings: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("key-1-冰"),
+            None,
+            Some("key-19-冰"),
+            Some("absent"),
+        ]));
+        let longs: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(19), Some(-1)]));
+        let narrowed: ArrayRef =
+            Arc::new(Int32Array::from(vec![Some(1), None, Some(19), Some(-1)]));
+        let cases = [
+            (longs, (0..20).map(Datum::long).collect::<Vec<_>>()),
+            (
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    Some(1),
+                    None,
+                    Some(19),
+                    Some(-1),
+                ])) as ArrayRef,
+                (0..20).map(Datum::timestamp_micros).collect(),
+            ),
+            (
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![Some(1), None, Some(19), Some(-1)])
+                        .with_timezone("UTC"),
+                ) as ArrayRef,
+                (0..20).map(Datum::timestamptz_micros).collect(),
+            ),
+            (
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![Some(1), None, Some(19), Some(-1)])
+                        .with_timezone("+00:00"),
+                ) as ArrayRef,
+                (0..20).map(Datum::timestamptz_micros).collect(),
+            ),
+            (
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    Some(1),
+                    None,
+                    Some(19),
+                    Some(-1),
+                ])) as ArrayRef,
+                (0..20).map(Datum::timestamp_nanos).collect(),
+            ),
+            (
+                Arc::new(Time64MicrosecondArray::from(vec![
+                    Some(1),
+                    None,
+                    Some(19),
+                    Some(0),
+                ])) as ArrayRef,
+                (0..20)
+                    .map(|value| Datum::time_micros(value).unwrap())
+                    .collect(),
+            ),
+            (
+                narrowed,
+                std::iter::once(Datum::long(i64::from(i32::MAX) + 1))
+                    .chain((1..20).map(Datum::long))
+                    .collect(),
+            ),
+            (
+                strings.clone(),
+                (0..20)
+                    .map(|value| Datum::string(format!("key-{value}-冰")))
+                    .collect(),
+            ),
+            (
+                cast(&strings, &DataType::LargeUtf8).unwrap(),
+                (0..20)
+                    .map(|value| Datum::string(format!("key-{value}-冰")))
+                    .collect(),
+            ),
+            (
+                cast(&strings, &DataType::Utf8View).unwrap(),
+                (0..20)
+                    .map(|value| Datum::string(format!("key-{value}-冰")))
+                    .collect(),
+            ),
+        ];
+        for (column, literals) in cases {
+            for count in [5, 20] {
+                let literals: FnvHashSet<_> = literals.iter().take(count).cloned().collect();
+                for negate in [false, true] {
+                    let mut expected = constant_bool_array(negate, column.len());
+                    for literal in &literals {
+                        let literal = get_arrow_datum(literal).unwrap();
+                        let promoted =
+                            promote_column_for_literal(column.clone(), literal.get().0.data_type())
+                                .unwrap();
+                        let literal = try_cast_literal(&literal, promoted.data_type()).unwrap();
+                        expected = if negate {
+                            and(&expected, &neq(&promoted, literal.as_ref()).unwrap()).unwrap()
+                        } else {
+                            or(&expected, &eq(&promoted, literal.as_ref()).unwrap()).unwrap()
+                        };
+                    }
+                    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                        "value",
+                        column.data_type().clone(),
+                        true,
+                    )]));
+                    let batch = RecordBatch::try_new(schema, vec![column.clone()]).unwrap();
+                    let mut predicate =
+                        converter.build_set_predicate(0, &literals, negate).unwrap();
+                    // Exercise both first-use set compilation and cached reuse.
+                    for _ in 0..2 {
+                        assert_eq!(
+                            predicate(batch.clone()).unwrap(),
+                            expected,
+                            "{} with {count} literals, negate={negate}",
+                            column.data_type()
+                        );
+                    }
+                    assert!(expected.is_null(1));
+                }
+            }
+        }
     }
 }

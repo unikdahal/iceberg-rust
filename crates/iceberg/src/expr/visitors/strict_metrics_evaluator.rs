@@ -19,13 +19,12 @@ use fnv::FnvHashSet;
 
 use crate::Result;
 use crate::error::invalid_data;
+use crate::expr::visitors::FileMetrics;
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
 use crate::expr::{BoundPredicate, BoundReference};
-use crate::spec::{DataFile, Datum};
+use crate::spec::{DataFile, Datum, PrimitiveType};
 
-#[allow(dead_code)]
 const ROWS_MUST_MATCH: Result<bool> = Ok(true);
-#[allow(dead_code)]
 const ROWS_MIGHT_NOT_MATCH: Result<bool> = Ok(false);
 
 /// Evaluates an `Expression` on a `DataFile` to test whether all rows in the file match.
@@ -36,49 +35,50 @@ const ROWS_MIGHT_NOT_MATCH: Result<bool> = Ok(false);
 ///
 /// Files are passed to `eval(DataFile)`, which returns true if all rows in the file
 /// must contain matching rows and false if the file may contain rows that do not match.
-#[allow(dead_code)]
 pub(crate) struct StrictMetricsEvaluator<'a> {
-    data_file: &'a DataFile,
+    metrics: FileMetrics<'a>,
 }
 
 impl<'a> StrictMetricsEvaluator<'a> {
-    #[allow(dead_code)]
-    fn new(data_file: &'a DataFile) -> Self {
-        StrictMetricsEvaluator { data_file }
-    }
-
     /// Evaluate this `StrictMetricsEvaluator`'s filter predicate against the
-    /// provided [`DataFile`]'s metrics. Used by [`TableScan`] to
-    /// see if this `DataFile` contains data that could match
-    /// the scan's filter.
+    /// provided [`DataFile`]'s metrics.
     #[allow(dead_code)]
     pub(crate) fn eval(filter: &'a BoundPredicate, data_file: &'a DataFile) -> Result<bool> {
-        if data_file.record_count == 0 {
+        Self::eval_metrics(filter, data_file.into())
+    }
+
+    /// Evaluate `filter` against borrowed whole-file statistics. A file known to be empty
+    /// matches trivially; an unknown record count decides nothing by itself.
+    pub(crate) fn eval_metrics(
+        filter: &'a BoundPredicate,
+        metrics: FileMetrics<'a>,
+    ) -> Result<bool> {
+        if metrics.record_count == Some(0) {
             return ROWS_MUST_MATCH;
         }
 
-        let mut evaluator = Self::new(data_file);
+        let mut evaluator = Self { metrics };
         visit(&mut evaluator, filter)
     }
 
     fn nan_count(&self, field_id: i32) -> Option<&u64> {
-        self.data_file.nan_value_counts.get(&field_id)
+        self.metrics.nan_value_counts.get(&field_id)
     }
 
     fn null_count(&self, field_id: i32) -> Option<&u64> {
-        self.data_file.null_value_counts.get(&field_id)
+        self.metrics.null_value_counts.get(&field_id)
     }
 
     fn value_count(&self, field_id: i32) -> Option<&u64> {
-        self.data_file.value_counts.get(&field_id)
+        self.metrics.value_counts.get(&field_id)
     }
 
     fn lower_bound(&self, field_id: i32) -> Option<&Datum> {
-        self.data_file.lower_bounds.get(&field_id)
+        self.metrics.lower_bounds.get(&field_id)
     }
 
     fn upper_bound(&self, field_id: i32) -> Option<&Datum> {
-        self.data_file.upper_bounds.get(&field_id)
+        self.metrics.upper_bounds.get(&field_id)
     }
 
     fn contains_nans_only(&self, field_id: i32) -> bool {
@@ -103,11 +103,16 @@ impl<'a> StrictMetricsEvaluator<'a> {
         }
     }
 
-    fn may_contain_nan(&self, field_id: i32) -> bool {
-        if let Some(&nan_count) = self.nan_count(field_id) {
-            nan_count > 0
-        } else {
-            true
+    /// Missing NaN counts block proofs for floating columns.
+    /// Unlike Java's evaluator, absence does not imply zero
+    /// NaNs; non-floating columns cannot contain NaNs.
+    fn may_contain_nan(&self, reference: &BoundReference) -> bool {
+        match self.nan_count(reference.field().id) {
+            Some(&nan_count) => nan_count > 0,
+            None => matches!(
+                reference.field().field_type.as_primitive_type(),
+                Some(PrimitiveType::Float | PrimitiveType::Double)
+            ),
         }
     }
 
@@ -120,7 +125,7 @@ impl<'a> StrictMetricsEvaluator<'a> {
     ) -> Result<bool> {
         let field_id = reference.field().id;
 
-        if self.may_contain_null(field_id) || self.may_contain_nan(field_id) {
+        if self.may_contain_null(field_id) || self.may_contain_nan(reference) {
             return ROWS_MIGHT_NOT_MATCH;
         }
 
@@ -270,7 +275,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
     ) -> Result<bool> {
         let field_id = reference.field().id;
 
-        if self.may_contain_null(field_id) || self.may_contain_nan(field_id) {
+        if self.may_contain_null(field_id) || self.may_contain_nan(reference) {
             return ROWS_MIGHT_NOT_MATCH;
         }
 
@@ -347,7 +352,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
     ) -> Result<bool> {
         let field_id = reference.field().id;
 
-        if self.may_contain_null(field_id) || self.may_contain_nan(field_id) {
+        if self.may_contain_null(field_id) || self.may_contain_nan(reference) {
             return ROWS_MIGHT_NOT_MATCH;
         }
 
@@ -423,6 +428,81 @@ mod test {
 
     const INT_MIN_VALUE: i32 = 30;
     const INT_MAX_VALUE: i32 = 79;
+
+    #[test]
+    fn test_strict_missing_nan_count_blocks_only_floating_columns() {
+        let mut results = Vec::new();
+        for (field_type, lower, literal) in [
+            (PrimitiveType::Int, Datum::int(1), Datum::int(0)),
+            (
+                PrimitiveType::Float,
+                Datum::float(1.0_f32),
+                Datum::float(0.0_f32),
+            ),
+            (
+                PrimitiveType::Double,
+                Datum::double(1.0),
+                Datum::double(0.0),
+            ),
+        ] {
+            let schema = Arc::new(
+                Schema::builder()
+                    .with_fields([Arc::new(NestedField::required(
+                        1,
+                        "x",
+                        Type::Primitive(field_type),
+                    ))])
+                    .build()
+                    .unwrap(),
+            );
+            let predicate = Predicate::Binary(BinaryExpression::new(
+                GreaterThan,
+                Reference::new("x"),
+                literal,
+            ))
+            .bind(schema, true)
+            .unwrap();
+            let counts = HashMap::from([(1, 3)]);
+            let nulls = HashMap::from([(1, 0)]);
+            let nans = HashMap::new();
+            let lower = HashMap::from([(1, lower)]);
+            let upper = HashMap::new();
+            results.push(
+                StrictMetricsEvaluator::eval_metrics(
+                    &predicate,
+                    crate::expr::visitors::FileMetrics {
+                        record_count: Some(3),
+                        value_counts: &counts,
+                        null_value_counts: &nulls,
+                        nan_value_counts: &nans,
+                        lower_bounds: &lower,
+                        upper_bounds: &upper,
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        assert_eq!(results, vec![true, false, false]);
+    }
+
+    #[test]
+    fn file_metrics_strict_eval_with_unknown_record_count() {
+        let predicate = is_null("all_nulls");
+        let counts = HashMap::from([(4, 3)]);
+        let empty_counts = HashMap::new();
+        let bounds = HashMap::new();
+        let result =
+            StrictMetricsEvaluator::eval_metrics(&predicate, crate::expr::visitors::FileMetrics {
+                record_count: None,
+                value_counts: &counts,
+                null_value_counts: &counts,
+                nan_value_counts: &empty_counts,
+                lower_bounds: &bounds,
+                upper_bounds: &bounds,
+            })
+            .unwrap();
+        assert!(result);
+    }
 
     // Helper: Create a test schema.
     fn create_test_schema() -> Arc<Schema> {

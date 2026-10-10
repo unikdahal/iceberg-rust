@@ -16,11 +16,11 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use tokio::sync::Notify;
 use tokio::sync::futures::OwnedNotified;
-use tokio::sync::oneshot::Receiver;
+use tokio::sync::oneshot::{Sender, channel};
 
 use crate::delete_vector::DeleteVector;
 use crate::expr::Predicate::AlwaysTrue;
@@ -34,7 +34,12 @@ use crate::{Error, ErrorKind, Result};
 enum EqDelState {
     Loading(Arc<Notify>),
     Loaded(Predicate),
+    /// A permanent load failure, returned to every later waiter.
+    Failed(Arc<Error>),
 }
+
+/// The outcome an equality-delete loader sends to the cache.
+pub(crate) type EqDelLoadResult = std::result::Result<Predicate, Arc<Error>>;
 
 /// State tracking for positional delete files.
 /// Unlike equality deletes, positional deletes must be fully loaded before
@@ -46,6 +51,8 @@ enum PosDelState {
     Loading(Arc<Notify>),
     /// The file has been fully loaded and merged into the delete vector map.
     Loaded,
+    /// A permanent load failure, returned to every later waiter.
+    Failed(Arc<Error>),
 }
 
 #[derive(Debug, Default)]
@@ -64,7 +71,7 @@ pub(crate) struct DeleteFilter {
 /// Action to take when trying to start loading a positional delete file
 pub(crate) enum PosDelLoadAction {
     /// The file is not loaded, the caller should load it.
-    Load,
+    Load(PosDelLoadGuard),
     /// The file is already loaded, nothing to do.
     AlreadyLoaded,
     /// The file is currently being loaded by another task.
@@ -73,6 +80,43 @@ pub(crate) enum PosDelLoadAction {
     /// future is created under the state lock so it cannot miss the loader's
     /// `notify_waiters()` (which stores no permit).
     WaitFor(OwnedNotified),
+    /// An earlier load failed permanently; the caller returns this error.
+    Failed(Error),
+}
+
+/// Owns a positional-delete load through opening, parsing and publishing its vectors.
+/// Dropping an unfinished load releases its claim so waiters can retry.
+pub(crate) struct PosDelLoadGuard {
+    filter: DeleteFilter,
+    file_path: String,
+    finished: bool,
+}
+
+impl PosDelLoadGuard {
+    /// Publishes the load as complete and wakes the waiters.
+    pub(crate) fn finish(mut self) {
+        self.filter.finish_pos_del_load(&self.file_path);
+        self.finished = true;
+    }
+
+    /// Records a failed load and returns the error for the caller. A retryable error releases
+    /// the claim so a later attempt loads the file again; any other error is cached for every
+    /// waiter. Retryability is whatever the storage implementation reports on its errors.
+    pub(crate) fn fail(mut self, error: Error) -> Error {
+        let error = Arc::new(error);
+        self.filter
+            .fail_pos_del_load(&self.file_path, Arc::clone(&error));
+        self.finished = true;
+        DeleteFilter::load_error(&self.file_path, &error)
+    }
+}
+
+impl Drop for PosDelLoadGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.filter.cancel_pos_del_load(&self.file_path);
+        }
+    }
 }
 
 impl DeleteFilter {
@@ -103,21 +147,45 @@ impl DeleteFilter {
             .and_then(|st| st.delete_vectors.get(data_file_path).cloned())
     }
 
-    pub(crate) fn try_start_eq_del_load(&self, file_path: &str) -> Option<Arc<Notify>> {
-        let mut state = self.state.write().unwrap();
-
-        // Skip if already loaded/loading - another task owns it
-        if state.equality_deletes.contains_key(file_path) {
-            return None;
-        }
-
-        // Mark as loading to prevent duplicate work
-        let notifier = Arc::new(Notify::new());
-        state
-            .equality_deletes
-            .insert(file_path.to_string(), EqDelState::Loading(notifier.clone()));
-
-        Some(notifier)
+    /// Atomically reserves a cache entry and its sole completion channel.
+    /// Returning the sender transfers ownership of the load; dropping it releases the claim.
+    pub(crate) fn try_start_eq_del_load(&self, file_path: &str) -> Option<Sender<EqDelLoadResult>> {
+        let (notify, sender, receiver) = {
+            let mut state = self.state.write().unwrap();
+            if state.equality_deletes.contains_key(file_path) {
+                return None;
+            }
+            let notify = Arc::new(Notify::new());
+            let (sender, receiver) = channel::<EqDelLoadResult>();
+            state.equality_deletes.insert(
+                file_path.to_string(),
+                EqDelState::Loading(Arc::clone(&notify)),
+            );
+            (notify, sender, receiver)
+        };
+        let state = Arc::clone(&self.state);
+        let delete_file_path = file_path.to_string();
+        self.runtime.cpu().spawn(async move {
+            let result = match receiver.await {
+                Ok(Ok(predicate)) => Some(EqDelState::Loaded(predicate)),
+                // A retryable failure releases the claim instead of caching the
+                // error, so a later attempt can load the file again. The failure
+                // still fails the current caller closed.
+                Ok(Err(error)) if error.retryable() => None,
+                Ok(Err(error)) => Some(EqDelState::Failed(error)),
+                Err(_) => None,
+            };
+            {
+                let mut state = state.write().unwrap_or_else(PoisonError::into_inner);
+                if let Some(result) = result {
+                    state.equality_deletes.insert(delete_file_path, result);
+                } else {
+                    state.equality_deletes.remove(&delete_file_path);
+                }
+            }
+            notify.notify_waiters();
+        });
+        Some(sender)
     }
 
     /// Attempts to mark a positional delete file as "loading".
@@ -133,6 +201,9 @@ impl DeleteFilter {
                 PosDelState::Loading(notify) => {
                     return PosDelLoadAction::WaitFor(notify.clone().notified_owned());
                 }
+                PosDelState::Failed(error) => {
+                    return PosDelLoadAction::Failed(Self::load_error(file_path, error));
+                }
             }
         }
 
@@ -141,13 +212,60 @@ impl DeleteFilter {
             .positional_deletes
             .insert(file_path.to_string(), PosDelState::Loading(notifier));
 
-        PosDelLoadAction::Load
+        PosDelLoadAction::Load(PosDelLoadGuard {
+            filter: self.clone(),
+            file_path: file_path.to_string(),
+            finished: false,
+        })
+    }
+
+    /// Wraps a delete-file load error for one caller, keeping its kind and retryability.
+    pub(crate) fn load_error(file_path: &str, error: &Arc<Error>) -> Error {
+        Error::new(
+            error.kind(),
+            format!("Loading delete file '{file_path}' failed"),
+        )
+        .with_retryable(error.retryable())
+        .with_source(Arc::clone(error))
+    }
+
+    fn fail_pos_del_load(&self, file_path: &str, error: Arc<Error>) {
+        let notify = {
+            let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+            let Some(PosDelState::Loading(notify)) = state.positional_deletes.get(file_path) else {
+                return;
+            };
+            let notify = Arc::clone(notify);
+            // A retryable failure releases the claim so a later attempt can retry;
+            // a permanent failure stays cached for every waiter. Either way the
+            // caller that observed the failure returns it.
+            if error.retryable() {
+                state.positional_deletes.remove(file_path);
+            } else {
+                state
+                    .positional_deletes
+                    .insert(file_path.to_string(), PosDelState::Failed(error));
+            }
+            notify
+        };
+        notify.notify_waiters();
+    }
+
+    fn cancel_pos_del_load(&self, file_path: &str) {
+        let notify = {
+            let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+            match state.positional_deletes.remove(file_path) {
+                Some(PosDelState::Loading(notify)) => notify,
+                _ => return,
+            }
+        };
+        notify.notify_waiters();
     }
 
     /// Marks a positional delete file as successfully loaded and notifies any waiting tasks.
-    pub(crate) fn finish_pos_del_load(&self, file_path: &str) {
+    fn finish_pos_del_load(&self, file_path: &str) {
         let notify = {
-            let mut state = self.state.write().unwrap();
+            let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
             if let Some(PosDelState::Loading(notify)) = state
                 .positional_deletes
                 .insert(file_path.to_string(), PosDelState::Loaded)
@@ -167,27 +285,27 @@ impl DeleteFilter {
     pub(crate) async fn get_equality_delete_predicate_for_delete_file_path(
         &self,
         file_path: &str,
-    ) -> Option<Predicate> {
-        // Build the `Notified` while holding the read lock. `notified_owned()` records tokio's
-        // `notify_waiters_calls` counter at construction and completes on first poll if that
-        // counter has since advanced. Reading the counter under the lock guarantees it is taken
-        // before `insert_equality_delete` can advance it via `notify_waiters()`, so the
-        // notification is never missed even though we `.await` after releasing the lock.
-        let notified = {
-            match self.state.read().unwrap().equality_deletes.get(file_path) {
-                None => return None,
-                Some(EqDelState::Loading(notifier)) => notifier.clone().notified_owned(),
-                Some(EqDelState::Loaded(predicate)) => {
-                    return Some(predicate.clone());
+    ) -> Result<Option<Predicate>> {
+        loop {
+            // Construct `Notified` under the state lock, before the loader can change the
+            // entry and call `notify_waiters()`. It records the notification counter even
+            // before its first poll, so completion or cancellation cannot be missed.
+            let notified = {
+                match self.state.read().unwrap().equality_deletes.get(file_path) {
+                    None => return Ok(None),
+                    Some(EqDelState::Loading(notifier)) => notifier.clone().notified_owned(),
+                    Some(EqDelState::Loaded(predicate)) => {
+                        return Ok(Some(predicate.clone()));
+                    }
+                    Some(EqDelState::Failed(error)) => {
+                        return Err(Self::load_error(file_path, error));
+                    }
                 }
-            }
-        };
+            };
 
-        notified.await;
-
-        match self.state.read().unwrap().equality_deletes.get(file_path) {
-            Some(EqDelState::Loaded(predicate)) => Some(predicate.clone()),
-            _ => unreachable!("Cannot be any other state than loaded"),
+            // Cancellation or a retryable failure releases the entry. Re-check in case another
+            // waiter has already claimed it; otherwise return None so the caller can claim it.
+            notified.await;
         }
     }
 
@@ -209,7 +327,7 @@ impl DeleteFilter {
 
             let Some(predicate) = self
                 .get_equality_delete_predicate_for_delete_file_path(delete.file_path())
-                .await
+                .await?
             else {
                 return Err(Error::new(
                     ErrorKind::Unexpected,
@@ -248,34 +366,6 @@ impl DeleteFilter {
 
         *entry.lock().unwrap() |= delete_vector;
     }
-
-    pub(crate) fn insert_equality_delete(
-        &self,
-        delete_file_path: &str,
-        eq_del: Receiver<Predicate>,
-    ) {
-        let notify = Arc::new(Notify::new());
-        {
-            let mut state = self.state.write().unwrap();
-            state.equality_deletes.insert(
-                delete_file_path.to_string(),
-                EqDelState::Loading(notify.clone()),
-            );
-        }
-
-        let state = self.state.clone();
-        let delete_file_path = delete_file_path.to_string();
-        self.runtime.cpu().spawn(async move {
-            let eq_del = eq_del.await.unwrap();
-            {
-                let mut state = state.write().unwrap();
-                state
-                    .equality_deletes
-                    .insert(delete_file_path, EqDelState::Loaded(eq_del));
-            }
-            notify.notify_waiters();
-        });
-    }
 }
 
 pub(crate) fn is_equality_delete(f: &FileScanTaskDeleteFile) -> bool {
@@ -303,8 +393,198 @@ pub(crate) mod tests {
 
     type ArrowSchemaRef = Arc<ArrowSchema>;
 
+    /// Number of `Notified` futures currently registered on in-flight loads.
+    ///
+    /// Each waiter holds an owned clone of the load's `Notify`, so the strong count above the
+    /// baseline holders (the state entry itself, plus the spawned completion task for equality
+    /// deletes) is the number of registered waiters.
+    fn registered_load_waiters(filter: &DeleteFilter) -> usize {
+        let state = filter.state.read().unwrap();
+        let positional = state
+            .positional_deletes
+            .values()
+            .filter_map(|s| match s {
+                PosDelState::Loading(notify) => Some(Arc::strong_count(notify) - 1),
+                _ => None,
+            })
+            .sum::<usize>();
+        let equality = state
+            .equality_deletes
+            .values()
+            .filter_map(|s| match s {
+                EqDelState::Loading(notify) => Some(Arc::strong_count(notify) - 2),
+                _ => None,
+            })
+            .sum::<usize>();
+        positional + equality
+    }
+
+    /// Yields until at least `count` waiters are registered on in-flight loads.
+    ///
+    /// Callers bound this with a timeout; there is no sleep.
+    pub(crate) async fn wait_for_load_waiters(filter: &DeleteFilter, count: usize) {
+        while registered_load_waiters(filter) < count {
+            tokio::task::yield_now().await;
+        }
+    }
+
     const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: u64 = 2147483546;
     const FIELD_ID_POSITIONAL_DELETE_POS: u64 = 2147483545;
+
+    #[tokio::test]
+    async fn test_eq_waiter_wakes_on_completion() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let path = "eq-delete.parquet";
+        let sender = filter.try_start_eq_del_load(path).unwrap();
+        let mut waiter = Box::pin(filter.get_equality_delete_predicate_for_delete_file_path(path));
+        assert!(futures::poll!(waiter.as_mut()).is_pending());
+        sender.send(Ok(AlwaysTrue)).unwrap();
+        let predicate = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(predicate, AlwaysTrue);
+    }
+
+    #[tokio::test]
+    async fn test_eq_non_retryable_load_failure_is_cached() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let path = "failed-eq-delete.parquet";
+        let sender = filter.try_start_eq_del_load(path).unwrap();
+        sender
+            .send(Err(Arc::new(
+                Error::new(ErrorKind::DataInvalid, "injected equality failure")
+                    .with_retryable(false),
+            )))
+            .unwrap();
+        for _ in 0..2 {
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                filter.get_equality_delete_predicate_for_delete_file_path(path),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::DataInvalid);
+            assert!(!error.retryable());
+            assert!(error.to_string().contains("injected equality failure"));
+            assert!(filter.try_start_eq_del_load(path).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_eq_retryable_load_failure_releases_claim_for_later_attempt() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let path = "retryable-eq-delete.parquet";
+        let sender = filter.try_start_eq_del_load(path).unwrap();
+        sender
+            .send(Err(Arc::new(
+                Error::new(ErrorKind::Unexpected, "transient equality error").with_retryable(true),
+            )))
+            .unwrap();
+        let predicate = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            filter.get_equality_delete_predicate_for_delete_file_path(path),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(predicate.is_none());
+        assert!(filter.try_start_eq_del_load(path).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_poisoned_state_still_releases_claims_and_wakes_waiters() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let PosDelLoadAction::Load(guard) = filter.try_start_pos_del_load("pos.parquet") else {
+            panic!("expected load ownership")
+        };
+        let PosDelLoadAction::WaitFor(pos_waiter) = filter.try_start_pos_del_load("pos.parquet")
+        else {
+            panic!("expected to wait for the in-flight load")
+        };
+        let sender = filter.try_start_eq_del_load("eq.parquet").unwrap();
+        let eq_waiter = match filter
+            .state
+            .read()
+            .unwrap()
+            .equality_deletes
+            .get("eq.parquet")
+        {
+            Some(EqDelState::Loading(notify)) => Arc::clone(notify).notified_owned(),
+            other => panic!("expected an in-flight equality load, found {other:?}"),
+        };
+
+        let state = Arc::clone(&filter.state);
+        std::thread::spawn(move || {
+            let _state = state.write().unwrap();
+            panic!("poison the delete filter state");
+        })
+        .join()
+        .unwrap_err();
+        assert!(filter.state.is_poisoned());
+
+        drop(guard);
+        drop(sender);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            pos_waiter.await;
+            eq_waiter.await;
+        })
+        .await
+        .unwrap();
+        let state = filter.state.read().unwrap_or_else(PoisonError::into_inner);
+        assert!(state.positional_deletes.is_empty());
+        assert!(state.equality_deletes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_eq_load_releases_claim() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let sender = filter
+            .try_start_eq_del_load("cancelled-eq.parquet")
+            .unwrap();
+        drop(sender);
+        let predicate = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            filter.get_equality_delete_predicate_for_delete_file_path("cancelled-eq.parquet"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(predicate.is_none());
+        assert!(
+            filter
+                .try_start_eq_del_load("cancelled-eq.parquet")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_pos_load_releases_every_waiter_and_claim() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let path = "cancelled-pos.parquet";
+        let PosDelLoadAction::Load(guard) = filter.try_start_pos_del_load(path) else {
+            panic!("expected load ownership")
+        };
+        let mut waiters = Vec::new();
+        for _ in 0..3 {
+            let PosDelLoadAction::WaitFor(waiter) = filter.try_start_pos_del_load(path) else {
+                panic!("expected waiter")
+            };
+            waiters.push(waiter);
+        }
+        drop(guard);
+        for waiter in waiters {
+            tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            filter.try_start_pos_del_load(path),
+            PosDelLoadAction::Load(_)
+        ));
+    }
 
     // Regression test for the positional-delete lost-wakeup hang.
     //
@@ -319,17 +599,16 @@ pub(crate) mod tests {
         let filter = DeleteFilter::new(Runtime::current());
         let path = "s3://bucket/pos-delete.parquet";
 
-        assert!(matches!(
-            filter.try_start_pos_del_load(path),
-            PosDelLoadAction::Load
-        ));
+        let PosDelLoadAction::Load(load_guard) = filter.try_start_pos_del_load(path) else {
+            panic!("expected ownership of the initial positional-delete load");
+        };
 
         let PosDelLoadAction::WaitFor(notified) = filter.try_start_pos_del_load(path) else {
             panic!("expected WaitFor for an in-progress load");
         };
 
         // Loader completes and signals before the waiter awaits.
-        filter.finish_pos_del_load(path);
+        load_guard.finish();
 
         let waited = tokio::time::timeout(std::time::Duration::from_secs(5), notified).await;
         assert!(
@@ -355,7 +634,6 @@ pub(crate) mod tests {
                 file_scan_tasks[0].schema_ref(),
             )
             .await
-            .unwrap()
             .unwrap();
 
         let result = delete_filter
@@ -369,7 +647,6 @@ pub(crate) mod tests {
                 file_scan_tasks[1].schema_ref(),
             )
             .await
-            .unwrap()
             .unwrap();
 
         let result = delete_filter
@@ -576,10 +853,9 @@ pub(crate) mod tests {
         // ---------- insert equality delete predicate ----------
         let pred = Reference::new("id").equal_to(Datum::long(10));
 
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        filter.insert_equality_delete("eq-del.parquet", rx);
+        let tx = filter.try_start_eq_del_load("eq-del.parquet").unwrap();
 
-        tx.send(pred).unwrap();
+        tx.send(Ok(pred)).unwrap();
 
         // ---------- should FAIL ----------
         let result = filter.build_equality_delete_predicate(&task).await;

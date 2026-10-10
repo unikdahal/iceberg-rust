@@ -121,7 +121,10 @@ impl ArrowReader {
         }
 
         if field_ids.is_empty() {
-            return Ok(ProjectionMask::all());
+            // A COUNT(*)-style scan has no output fields. Parquet still emits
+            // zero-column batches with the selected row count; predicates and
+            // equality deletes request their own columns through the row filter.
+            return Ok(ProjectionMask::none(parquet_schema.num_columns()));
         }
 
         // Reading variant columns is not supported yet (see #2188 follow-ups): reject any
@@ -230,8 +233,8 @@ impl ArrowReader {
 
         if indices.is_empty() {
             // Edge case: All requested columns are new (don't exist in file).
-            // Project all columns so RecordBatchTransformer has a batch to transform.
-            Ok(ProjectionMask::all())
+            // Zero-column batches retain row counts for default/NULL synthesis.
+            Ok(ProjectionMask::none(parquet_schema.num_columns()))
         } else {
             Ok(ProjectionMask::leaves(parquet_schema, indices))
         }
@@ -258,7 +261,7 @@ impl ArrowReader {
         }
 
         if root_indices.is_empty() {
-            Ok(ProjectionMask::all())
+            Ok(ProjectionMask::none(parquet_schema.num_columns()))
         } else {
             Ok(ProjectionMask::roots(parquet_schema, root_indices))
         }
@@ -614,6 +617,26 @@ message schema {
         )
         .expect("Some ProjectionMask");
         assert_eq!(mask, ProjectionMask::leaves(&parquet_schema, vec![0]));
+
+        let evolved_schema = Schema::builder()
+            .with_fields([Arc::new(NestedField::optional(
+                4,
+                "new_column",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        for fallback in [false, true] {
+            let mask = ArrowReader::get_arrow_projection_mask(
+                &[4],
+                &evolved_schema,
+                &parquet_schema,
+                &arrow_schema,
+                fallback,
+            )
+            .unwrap();
+            assert_eq!(mask, ProjectionMask::none(parquet_schema.num_columns()));
+        }
     }
 
     #[test]

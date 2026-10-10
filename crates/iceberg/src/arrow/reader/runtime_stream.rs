@@ -1,0 +1,539 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Decoding with row-group-local selections and boundary refresh. When a
+//! runtime predicate provider is configured, a task is decoded with parquet's
+//! push decoder, so each row group keeps its own page and positional-delete
+//! selection. At a row-group boundary after a newer publication, the remaining
+//! groups are pruned and their page selections and the row filter refreshed
+//! before any further column ranges are fetched.
+//!
+//! Cost: a boundary with an unchanged generation costs one cheap generation
+//! check, with no snapshot, binding or replanning. Each new generation costs
+//! one pass over the remaining row groups (statistics and page index) and one
+//! decoder rebuild.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use arrow_array::RecordBatch;
+use parquet::DecodeResult;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ParquetRecordBatchReader, RowFilter, RowSelection,
+};
+use parquet::arrow::push_decoder::{ParquetPushDecoder, RowGroupSelection};
+use parquet::file::metadata::ParquetMetaData;
+
+use super::runtime_predicate::{RuntimePredicates, check_runtime_predicate_columns};
+use super::{ArrowFileReader, ArrowReader};
+use crate::arrow::ScanMetrics;
+use crate::expr::BoundPredicate;
+use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
+use crate::scan::{ArrowRecordBatchStream, FileScanTask};
+use crate::{Error, ErrorKind, Result};
+
+/// Splits a selection over the concatenated rows of `row_groups` (ascending)
+/// into one selection per row group. `None` selects every row.
+pub(super) fn split_row_selection(
+    metadata: &ParquetMetaData,
+    row_groups: &[usize],
+    mut selection: Option<RowSelection>,
+) -> Vec<RowGroupSelection> {
+    row_groups
+        .iter()
+        .map(|&index| {
+            let rows = metadata.row_group(index).num_rows() as usize;
+            let local = selection
+                .as_mut()
+                .map(|selection| selection.split_off(rows));
+            RowGroupSelection::new(index, local)
+        })
+        .collect()
+}
+
+/// A predicate resolved against the open file.
+#[derive(Clone)]
+pub(super) struct ResolvedPredicate {
+    pub(super) predicate: Arc<BoundPredicate>,
+    pub(super) field_ids: HashSet<i32>,
+    pub(super) field_id_map: HashMap<i32, usize>,
+}
+
+/// What a task needs to refresh its runtime predicate at row-group boundaries.
+pub(super) struct BoundaryRefresh {
+    pub(super) predicates: Arc<RuntimePredicates>,
+    /// The generation the task last looked at.
+    pub(super) seen_generation: u64,
+    /// The planned and equality-delete predicate.
+    pub(super) planned: Option<ResolvedPredicate>,
+    /// The runtime predicate in force. Publications only tighten, so a newer
+    /// one replaces it, and a later `None` leaves it in place: it never
+    /// restores groups, pages or rows already skipped.
+    pub(super) runtime: Option<ResolvedPredicate>,
+    pub(super) runtime_disabled: Arc<AtomicBool>,
+    pub(super) row_selection_enabled: bool,
+    pub(super) task: FileScanTask,
+    pub(super) use_position_fallback: bool,
+    pub(super) metrics: ScanMetrics,
+}
+
+pub(super) struct RuntimePrunedStream {
+    decoder: Option<ParquetPushDecoder>,
+    active_reader: Option<ParquetRecordBatchReader>,
+    file_reader: ArrowFileReader,
+    metadata: ArrowReaderMetadata,
+    /// Selections installed in the decoder for the row groups not yet started,
+    /// in file order.
+    selections: Vec<RowGroupSelection>,
+    refresh: BoundaryRefresh,
+    /// The frontier count identifies the group owning any overfetched bytes.
+    /// It also changes when the decoder internally skips a fully filtered group.
+    buffered_frontier: Option<usize>,
+    #[cfg(test)]
+    probe: Option<Arc<test_support::Probe>>,
+}
+
+/// The decoder is only absent while it is being rebuilt, so a missing decoder means the
+/// stream was polled again after a failed rebuild.
+fn missing_decoder() -> Error {
+    Error::new(
+        ErrorKind::Unexpected,
+        "Runtime-pruned stream has no parquet decoder; it was polled after a failed rebuild",
+    )
+}
+
+impl RuntimePrunedStream {
+    pub(super) fn new(
+        decoder: ParquetPushDecoder,
+        file_reader: ArrowFileReader,
+        metadata: ArrowReaderMetadata,
+        selections: Vec<RowGroupSelection>,
+        refresh: BoundaryRefresh,
+    ) -> Self {
+        Self {
+            #[cfg(test)]
+            probe: test_support::find(
+                refresh.task.data_file_path(),
+                refresh.runtime_disabled.clone(),
+            ),
+            decoder: Some(decoder),
+            active_reader: None,
+            file_reader,
+            metadata,
+            selections,
+            refresh,
+            buffered_frontier: None,
+        }
+    }
+
+    fn refresh_at_boundary(&mut self) -> Result<()> {
+        if self.refresh.runtime_disabled.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let decoder = self.decoder.as_ref().ok_or_else(missing_decoder)?;
+        if !decoder.is_at_row_group_boundary() || decoder.row_groups_remaining() == 0 {
+            return Ok(());
+        }
+        let generation = self.refresh.predicates.generation();
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.generation_checks.fetch_add(1, Ordering::Relaxed);
+        }
+        if generation == self.refresh.seen_generation {
+            return Ok(());
+        }
+        self.refresh.seen_generation = generation;
+        // `None`, a failed publication or a predicate already in force keep the
+        // current restrictions.
+        let Some(predicate) = self.refresh.predicates.current(
+            &self.refresh.task.schema_ref(),
+            self.refresh.task.case_sensitive(),
+            self.refresh.task.data_file_path(),
+        ) else {
+            return Ok(());
+        };
+        if self
+            .refresh
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| Arc::ptr_eq(&runtime.predicate, &predicate))
+        {
+            return Ok(());
+        }
+
+        // Bring the local plan in lock-step with the decoder, which may have
+        // skipped groups internally (for example an empty static selection).
+        let Some(next) = decoder.peek_next_row_group()? else {
+            self.selections.clear();
+            return Ok(());
+        };
+        let started = self
+            .selections
+            .iter()
+            .take_while(|selection| selection.row_group_index() != next)
+            .count();
+        self.selections.drain(..started);
+
+        let (runtime, selections) = match self.restrict_remaining(predicate) {
+            Ok(restricted) => restricted,
+            Err(error) => {
+                tracing::debug!(
+                    "Skipping live runtime predicate for {}: {error}",
+                    self.refresh.task.data_file_path()
+                );
+                return Ok(());
+            }
+        };
+        let Some(row_filter) = self.compile_row_filter(&runtime) else {
+            return Ok(());
+        };
+        let pruned = self.selections.len() - selections.len();
+        let next_pruned = selections
+            .first()
+            .is_none_or(|selection| selection.row_group_index() != next);
+        // Rebuild before committing the refresh: a failed rebuild is fatal, and
+        // the refresh, pruning and rebuild counters must not report work that
+        // never took effect.
+        self.rebuild_decoder(next_pruned, selections.clone(), row_filter)?;
+        self.selections = selections;
+        // A task whose first usable runtime predicate arrives after the file was
+        // opened was not counted by the task-start path. Count it when that
+        // predicate is first adopted; later refreshes keep the same task count.
+        if self.refresh.runtime.is_none() {
+            self.refresh.metrics.record_runtime_predicate_task();
+        }
+        self.refresh.runtime = Some(runtime);
+        self.refresh.metrics.record_runtime_refresh(pruned);
+        Ok(())
+    }
+
+    /// Returns the remaining selections narrowed by `predicate`: row groups
+    /// whose statistics cannot match are dropped, and the page selections of
+    /// the rest are intersected with the predicate's page selections. An error
+    /// makes the predicate unusable for this file.
+    fn restrict_remaining(
+        &self,
+        predicate: Arc<BoundPredicate>,
+    ) -> Result<(ResolvedPredicate, Vec<RowGroupSelection>)> {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.plans.fetch_add(1, Ordering::Relaxed);
+        }
+        let parquet_metadata = self.metadata.metadata();
+        let task = &self.refresh.task;
+        check_runtime_predicate_columns(
+            &predicate,
+            parquet_metadata.file_metadata().schema_descr(),
+            self.metadata.schema(),
+            task.schema(),
+            self.refresh.use_position_fallback,
+        )?;
+        let (field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
+            parquet_metadata.file_metadata().schema_descr(),
+            self.metadata.schema(),
+            &predicate,
+            self.refresh.use_position_fallback,
+        )?;
+        let mut kept = Vec::with_capacity(self.selections.len());
+        for selection in &self.selections {
+            if RowGroupMetricsEvaluator::eval(
+                &predicate,
+                parquet_metadata.row_group(selection.row_group_index()),
+                &field_id_map,
+                task.schema(),
+            )? {
+                kept.push(selection.clone());
+            }
+        }
+        if self.refresh.row_selection_enabled && !kept.is_empty() {
+            #[cfg(test)]
+            if let Some(probe) = &self.probe {
+                probe.page_plans.fetch_add(1, Ordering::Relaxed);
+            }
+            // Page selections span the selected groups in file order, while the groups may
+            // be read in another order (largest first). Plan and split them in file order,
+            // then attach each to its own group by index.
+            let mut indices: Vec<usize> = kept
+                .iter()
+                .map(RowGroupSelection::row_group_index)
+                .collect();
+            indices.sort_unstable();
+            // Page pruning only narrows reads, and the row filter still applies
+            // the predicate, so a failure keeps the groups without refinement.
+            match ArrowReader::get_row_selection_for_filter_predicate(
+                &predicate,
+                parquet_metadata,
+                &Some(indices.clone()),
+                &field_id_map,
+                task.schema(),
+            ) {
+                Ok(Some(pages)) => {
+                    let pages: HashMap<usize, RowGroupSelection> =
+                        split_row_selection(parquet_metadata, &indices, Some(pages))
+                            .into_iter()
+                            .map(|pages| (pages.row_group_index(), pages))
+                            .collect();
+                    kept = kept
+                        .into_iter()
+                        .map(|current| {
+                            let runtime = &pages[&current.row_group_index()];
+                            let combined = match (current.selection(), runtime.selection()) {
+                                (Some(current), Some(runtime)) => {
+                                    Some(current.intersection(runtime))
+                                }
+                                (Some(current), None) => Some(current.clone()),
+                                (None, runtime) => runtime.cloned(),
+                            };
+                            RowGroupSelection::new(current.row_group_index(), combined)
+                        })
+                        .collect();
+                }
+                Ok(None) => {}
+                Err(error) => tracing::debug!(
+                    "Skipping live page pruning for {}: {error}",
+                    task.data_file_path()
+                ),
+            }
+        }
+        Ok((
+            ResolvedPredicate {
+                predicate,
+                field_ids,
+                field_id_map,
+            },
+            kept,
+        ))
+    }
+
+    /// Compiles the planned predicate and `runtime` into one row filter. If the
+    /// runtime part cannot be compiled the predicate is not adopted.
+    fn compile_row_filter(&self, runtime: &ResolvedPredicate) -> Option<RowFilter> {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.compilations.fetch_add(1, Ordering::Relaxed);
+        }
+        let schema_descr = self.metadata.metadata().file_metadata().schema_descr();
+        let predicates: Vec<_> = self
+            .refresh
+            .planned
+            .iter()
+            .map(|resolved| (resolved, false))
+            .chain([(runtime, true)])
+            .map(|(resolved, advisory)| {
+                (
+                    resolved.predicate.as_ref(),
+                    &resolved.field_ids,
+                    &resolved.field_id_map,
+                    advisory,
+                )
+            })
+            .collect();
+        match ArrowReader::get_arrow_predicate(
+            &predicates,
+            schema_descr,
+            self.refresh.runtime_disabled.clone(),
+        ) {
+            Ok(predicate) => Some(RowFilter::new(vec![predicate])),
+            Err(error) => {
+                tracing::debug!(
+                    "Skipping live row filter for {}: {error}",
+                    self.refresh.task.data_file_path()
+                );
+                None
+            }
+        }
+    }
+
+    /// Rebuilds the decoder once with the current selections and row filter.
+    /// The caller must have verified that the decoder is at a row-group
+    /// boundary with groups remaining; `into_builder` cannot fail otherwise, so
+    /// a rebuild error is an internal invariant violation and is fatal.
+    fn rebuild_decoder(
+        &mut self,
+        next_pruned: bool,
+        selections: Vec<RowGroupSelection>,
+        row_filter: RowFilter,
+    ) -> Result<()> {
+        let decoder = self.decoder.take().ok_or_else(missing_decoder)?;
+        #[cfg(test)]
+        let decoder = {
+            if let Some(probe) = &self.probe {
+                probe.rebuilds.fetch_add(1, Ordering::Relaxed);
+            }
+            if self
+                .probe
+                .as_ref()
+                .is_some_and(|probe| probe.take_failure(test_support::Stage::IntoBuilder))
+            {
+                // A finished decoder exercises parquet's actual
+                // into_builder error after ownership was taken.
+                let mut finished = decoder
+                    .into_builder()?
+                    .with_row_group_selections(vec![])
+                    .build()?;
+                assert!(matches!(
+                    finished.try_next_reader()?,
+                    DecodeResult::Finished
+                ));
+                finished
+            } else {
+                decoder
+            }
+        };
+        let builder = decoder
+            .into_builder()?
+            .with_row_group_selections(selections)
+            .with_row_filter(row_filter);
+        #[cfg(test)]
+        let builder = if self
+            .probe
+            .as_ref()
+            .is_some_and(|probe| probe.take_failure(test_support::Stage::Build))
+        {
+            // Conflicting plans exercise parquet's actual build error.
+            builder.with_row_groups(vec![0])
+        } else {
+            builder
+        };
+        let mut decoder = builder.build()?;
+        if next_pruned {
+            // Only the next group's ranges can be buffered at a boundary.
+            decoder.clear_all_ranges();
+        }
+        self.decoder = Some(decoder);
+        Ok(())
+    }
+
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        loop {
+            if let Some(reader) = self.active_reader.as_mut() {
+                if let Some(batch) = reader.next() {
+                    return Ok(Some(batch?));
+                }
+                self.active_reader = None;
+            }
+            self.refresh_at_boundary()?;
+            let decoder = self.decoder.as_mut().ok_or_else(missing_decoder)?;
+            match decoder.try_next_reader()? {
+                DecodeResult::NeedsData(ranges) => {
+                    let frontier = decoder.row_groups_remaining();
+                    if self.buffered_frontier != Some(frontier) {
+                        // No future group is prefetched. Release coalesced ranges
+                        // from an internally skipped group before fetching the next.
+                        decoder.clear_all_ranges();
+                        self.buffered_frontier = Some(frontier);
+                    }
+                    let (fetched_ranges, bytes) = self.file_reader.fetch_ranges(&ranges).await?;
+                    decoder.push_ranges(fetched_ranges, bytes)?;
+                }
+                DecodeResult::Data(reader) => {
+                    // The reader owns its column chunks now. Extra coalesced bytes
+                    // need not survive this group or accumulate across the file.
+                    decoder.clear_all_ranges();
+                    self.buffered_frontier = None;
+                    self.active_reader = Some(reader);
+                }
+                DecodeResult::Finished => return Ok(None),
+            }
+        }
+    }
+
+    pub(super) fn into_stream(self) -> ArrowRecordBatchStream {
+        Box::pin(futures::stream::try_unfold(self, |mut state| async move {
+            let batch = state.next_batch().await?;
+            Ok::<_, Error>(batch.map(|batch| (batch, state)))
+        }))
+    }
+}
+
+#[cfg(test)]
+pub(super) mod test_support {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+    #[derive(Clone, Copy)]
+    pub(in crate::arrow::reader) enum Stage {
+        IntoBuilder = 1,
+        Build = 2,
+    }
+
+    #[derive(Default)]
+    pub(in crate::arrow::reader) struct Probe {
+        pub(super) generation_checks: AtomicU64,
+        pub(super) plans: AtomicU64,
+        pub(super) page_plans: AtomicU64,
+        pub(super) compilations: AtomicU64,
+        pub(super) rebuilds: AtomicU64,
+        failure: AtomicU8,
+        disabled: Mutex<Option<Arc<AtomicBool>>>,
+    }
+
+    fn registry() -> &'static Mutex<HashMap<String, Weak<Probe>>> {
+        static REGISTRY: OnceLock<Mutex<HashMap<String, Weak<Probe>>>> = OnceLock::new();
+        REGISTRY.get_or_init(Mutex::default)
+    }
+
+    impl Probe {
+        pub(in crate::arrow::reader) fn register(path: &str) -> Arc<Self> {
+            let probe = Arc::new(Self::default());
+            registry()
+                .lock()
+                .unwrap()
+                .insert(path.to_owned(), Arc::downgrade(&probe));
+            probe
+        }
+
+        pub(in crate::arrow::reader) fn fail_at(&self, stage: Stage) {
+            self.failure.store(stage as u8, Ordering::Relaxed);
+        }
+
+        pub(in crate::arrow::reader) fn disable_runtime(&self) {
+            self.disabled
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .store(true, Ordering::Relaxed);
+        }
+
+        pub(in crate::arrow::reader) fn counts(&self) -> [u64; 5] {
+            [
+                self.generation_checks.load(Ordering::Relaxed),
+                self.plans.load(Ordering::Relaxed),
+                self.page_plans.load(Ordering::Relaxed),
+                self.compilations.load(Ordering::Relaxed),
+                self.rebuilds.load(Ordering::Relaxed),
+            ]
+        }
+
+        pub(super) fn take_failure(&self, stage: Stage) -> bool {
+            self.failure
+                .compare_exchange(stage as u8, 0, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        }
+    }
+
+    pub(super) fn find(path: &str, disabled: Arc<AtomicBool>) -> Option<Arc<Probe>> {
+        let mut registry = registry().lock().unwrap();
+        registry.retain(|_, probe| probe.strong_count() > 0);
+        let probe = registry.get(path)?.upgrade()?;
+        *probe.disabled.lock().unwrap() = Some(disabled);
+        Some(probe)
+    }
+}
