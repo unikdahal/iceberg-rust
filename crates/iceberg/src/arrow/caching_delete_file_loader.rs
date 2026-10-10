@@ -1312,7 +1312,8 @@ mod tests {
         let delete = &task.deletes()[0];
         let loader = CachingDeleteFileLoader::new(FileIO::new_with_fs(), 2, Runtime::current());
         let filter = &loader.delete_filter;
-        let PosDelLoadAction::Load(owner) = filter.try_start_pos_del_load(delete.file_path()) else {
+        let PosDelLoadAction::Load(owner) = filter.try_start_pos_del_load(delete.file_path())
+        else {
             panic!("expected positional load ownership")
         };
         let mut waiter = Box::pin(CachingDeleteFileLoader::load_file_for_task(
@@ -1382,7 +1383,10 @@ mod tests {
         let task = &tasks[0];
         let orig = &task.deletes()[0];
         let delete = FileScanTaskDeleteFile::builder()
-            .with_file_path(format!("{}/missing-pos-delete.parquet", directory.path().display()))
+            .with_file_path(format!(
+                "{}/missing-pos-delete.parquet",
+                directory.path().display()
+            ))
             .with_file_size_in_bytes(orig.file_size_in_bytes())
             .with_file_type(orig.file_type())
             .with_file_format(orig.file_format())
