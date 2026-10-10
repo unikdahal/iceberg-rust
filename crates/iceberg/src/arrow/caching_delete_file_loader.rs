@@ -1125,7 +1125,11 @@ mod tests {
                 .gate
                 .fail_reads
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    if remaining > 0 { Some(remaining - 1) } else { None }
+                    if remaining > 0 {
+                        Some(remaining - 1)
+                    } else {
+                        None
+                    }
                 })
                 .is_ok();
             if should_fail {
@@ -1443,7 +1447,11 @@ mod tests {
         .unwrap()
         .unwrap_err();
         assert!(!second_err.retryable());
-        assert!(second_err.to_string().contains("injected storage read failure"));
+        assert!(
+            second_err
+                .to_string()
+                .contains("injected storage read failure")
+        );
         assert_eq!(gate.read_calls.load(Ordering::SeqCst), 0);
     }
 

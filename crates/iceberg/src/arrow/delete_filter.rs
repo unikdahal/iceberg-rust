@@ -471,8 +471,7 @@ pub(crate) mod tests {
         let sender = filter.try_start_eq_del_load(path).unwrap();
         sender
             .send(Err(Arc::new(
-                Error::new(ErrorKind::Unexpected, "transient equality error")
-                    .with_retryable(true),
+                Error::new(ErrorKind::Unexpected, "transient equality error").with_retryable(true),
             )))
             .unwrap();
         // The waiter observes the failure but the claim is released, so a later
