@@ -2188,7 +2188,7 @@ mod tests {
     #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
     struct MetadataCountingStorage {
         #[serde(skip)]
-        calls: Arc<std::sync::atomic::AtomicUsize>,
+        calls: Arc<AtomicUsize>,
         /// Fail every metadata request with a retryable error.
         #[serde(skip)]
         fail_metadata: bool,
@@ -2292,7 +2292,7 @@ mod tests {
     #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
     struct MetadataCountingStorageFactory {
         #[serde(skip)]
-        calls: Arc<std::sync::atomic::AtomicUsize>,
+        calls: Arc<AtomicUsize>,
         #[serde(skip)]
         fail_metadata: bool,
         #[serde(skip)]
