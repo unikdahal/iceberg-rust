@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures::stream::BoxStream;
@@ -24,13 +25,130 @@ use typed_builder::TypedBuilder;
 use crate::error::invalid_data;
 use crate::expr::BoundPredicate;
 use crate::spec::{
-    DataContentType, DataFileFormat, ManifestEntryRef, NameMapping, PartitionSpec, Schema,
-    SchemaRef, SortOrderRef, Struct, StructType,
+    DataContentType, DataFile, DataFileFormat, Datum, ManifestEntryRef, NameMapping, PartitionSpec,
+    PrimitiveLiteral, Schema, SchemaRef, SortOrderRef, Struct, StructType,
 };
 use crate::{Error, Result};
 
 /// A stream of [`FileScanTask`].
 pub type FileScanTaskStream = BoxStream<'static, Result<FileScanTask>>;
+
+/// Whole-file Iceberg manifest statistics used before opening a data file.
+///
+/// Bounds and counts describe the entire physical file, including when a task
+/// reads only a byte range. Missing column statistics never imply exclusion.
+/// Infinite and NaN float bounds are dropped on construction: they are
+/// advisory, and every task serialization format can then carry the rest, so
+/// a deserialized task prunes exactly like the original.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FileScanTaskMetrics {
+    #[serde(default)]
+    pub(crate) record_count: Option<u64>,
+    #[serde(default)]
+    pub(crate) value_counts: HashMap<i32, u64>,
+    #[serde(default)]
+    pub(crate) null_value_counts: HashMap<i32, u64>,
+    #[serde(default)]
+    pub(crate) nan_value_counts: HashMap<i32, u64>,
+    #[serde(default)]
+    pub(crate) lower_bounds: HashMap<i32, Datum>,
+    #[serde(default)]
+    pub(crate) upper_bounds: HashMap<i32, Datum>,
+}
+
+impl FileScanTaskMetrics {
+    /// Creates whole-file statistics keyed by Iceberg field ID. Value counts
+    /// include nulls and NaNs; bounds are inclusive.
+    pub fn new(
+        record_count: Option<u64>,
+        value_counts: HashMap<i32, u64>,
+        null_value_counts: HashMap<i32, u64>,
+        nan_value_counts: HashMap<i32, u64>,
+        lower_bounds: HashMap<i32, Datum>,
+        upper_bounds: HashMap<i32, Datum>,
+    ) -> Self {
+        fn finite(mut bounds: HashMap<i32, Datum>) -> HashMap<i32, Datum> {
+            bounds.retain(|_, bound| match bound.literal() {
+                PrimitiveLiteral::Float(value) => value.0.is_finite(),
+                PrimitiveLiteral::Double(value) => value.0.is_finite(),
+                _ => true,
+            });
+            bounds
+        }
+        Self {
+            record_count,
+            value_counts,
+            null_value_counts,
+            nan_value_counts,
+            lower_bounds: finite(lower_bounds),
+            upper_bounds: finite(upper_bounds),
+        }
+    }
+
+    /// Number of records in the entire data file, or None when unavailable.
+    pub fn record_count(&self) -> Option<u64> {
+        self.record_count
+    }
+
+    /// Number of values, including nulls and NaNs, by Iceberg field ID.
+    pub fn value_counts(&self) -> &HashMap<i32, u64> {
+        &self.value_counts
+    }
+
+    /// Number of null values by Iceberg field ID.
+    pub fn null_value_counts(&self) -> &HashMap<i32, u64> {
+        &self.null_value_counts
+    }
+
+    /// Number of NaN values by Iceberg field ID.
+    pub fn nan_value_counts(&self) -> &HashMap<i32, u64> {
+        &self.nan_value_counts
+    }
+
+    /// Inclusive lower bounds by Iceberg field ID.
+    pub fn lower_bounds(&self) -> &HashMap<i32, Datum> {
+        &self.lower_bounds
+    }
+
+    /// Inclusive upper bounds by Iceberg field ID.
+    pub fn upper_bounds(&self) -> &HashMap<i32, Datum> {
+        &self.upper_bounds
+    }
+
+    /// Copies the record count and only the selected columns' statistics.
+    pub(crate) fn from_data_file(file: &DataFile, selection: &ColumnStatsSelection) -> Self {
+        fn select<V: Clone>(
+            values: &HashMap<i32, V>,
+            selection: &ColumnStatsSelection,
+        ) -> HashMap<i32, V> {
+            match selection {
+                ColumnStatsSelection::All => values.clone(),
+                ColumnStatsSelection::Fields(ids) => values
+                    .iter()
+                    .filter(|(id, _)| ids.contains(id))
+                    .map(|(id, value)| (*id, value.clone()))
+                    .collect(),
+            }
+        }
+        Self::new(
+            Some(file.record_count),
+            select(&file.value_counts, selection),
+            select(&file.null_value_counts, selection),
+            select(&file.nan_value_counts, selection),
+            select(&file.lower_bounds, selection),
+            select(&file.upper_bounds, selection),
+        )
+    }
+}
+
+/// Column statistics retained on planned tasks, when requested by the scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ColumnStatsSelection {
+    /// Retain statistics for every column.
+    All,
+    /// Retain statistics only for these field IDs.
+    Fields(HashSet<i32>),
+}
 
 /// A task to scan part of file.
 #[derive(Debug, Clone, Deserialize, PartialEq, TypedBuilder)]
@@ -53,6 +171,10 @@ pub struct FileScanTask {
     /// reading the entire data file.
     #[builder(default)]
     record_count: Option<u64>,
+
+    /// Whole-file statistics retained from the manifest for runtime file pruning.
+    #[builder(default)]
+    file_metrics: Option<Arc<FileScanTaskMetrics>>,
 
     /// The first row id assigned to the data file.
     ///
@@ -171,6 +293,11 @@ impl FileScanTask {
     /// Returns the number of records in the file when the whole file is scanned.
     pub fn record_count(&self) -> Option<u64> {
         self.record_count
+    }
+
+    /// Returns whole-file manifest statistics, including for split tasks.
+    pub fn file_metrics(&self) -> Option<&FileScanTaskMetrics> {
+        self.file_metrics.as_deref()
     }
 
     /// Returns the first row id assigned to the data file.
@@ -366,7 +493,12 @@ pub struct FileScanTaskDeleteFile {
     /// The delete file path
     file_path: String,
 
-    /// The total size of the delete file in bytes, from the manifest entry.
+    /// The total size of the delete file in bytes.
+    ///
+    /// Tasks planned from manifest entries carry the recorded file size.
+    /// Externally constructed tasks may use `0` when the size is unavailable;
+    /// the Parquet delete-file loader then resolves it with one metadata
+    /// request when the file is first loaded. Deletion vectors do not use it.
     file_size_in_bytes: u64,
 
     /// delete file type
@@ -434,7 +566,7 @@ mod _serde {
 
     use serde::{Deserialize, Serialize};
 
-    use super::{FileScanTask, FileScanTaskDeleteFile};
+    use super::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskMetrics};
     use crate::error::invalid_data;
     use crate::expr::BoundPredicate;
     use crate::spec::{
@@ -449,6 +581,8 @@ mod _serde {
         start: u64,
         length: u64,
         record_count: Option<u64>,
+        #[serde(default)]
+        file_metrics: Option<Arc<FileScanTaskMetrics>>,
         first_row_id: Option<i64>,
         data_sequence_number: Option<i64>,
         data_file_path: String,
@@ -481,6 +615,8 @@ mod _serde {
         length: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         record_count: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_metrics: Option<&'a Arc<FileScanTaskMetrics>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         first_row_id: Option<i64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -539,6 +675,7 @@ mod _serde {
                 start: value.start,
                 length: value.length,
                 record_count: value.record_count,
+                file_metrics: value.file_metrics.as_ref(),
                 first_row_id: value.first_row_id,
                 data_sequence_number: value.data_sequence_number,
                 data_file_path: &value.data_file_path,
@@ -589,6 +726,7 @@ mod _serde {
                 .with_start(value.start)
                 .with_length(value.length)
                 .with_record_count(value.record_count)
+                .with_file_metrics(value.file_metrics)
                 .with_first_row_id(value.first_row_id)
                 .with_data_sequence_number(value.data_sequence_number)
                 .with_data_file_path(value.data_file_path)
@@ -770,6 +908,87 @@ mod tests {
         DataFileBuilder, Literal, ManifestEntry, ManifestStatus, NestedField, PrimitiveType,
         Transform, Type,
     };
+
+    #[test]
+    fn file_metrics_with_non_finite_bounds_round_trip_through_task_json() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "f", Type::Primitive(PrimitiveType::Float)).into(),
+                    NestedField::optional(2, "d", Type::Primitive(PrimitiveType::Double)).into(),
+                    NestedField::optional(3, "i", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let metrics = FileScanTaskMetrics::new(
+            Some(4),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                (1, Datum::float(f32::NEG_INFINITY)),
+                (2, Datum::double(f64::NEG_INFINITY)),
+                (3, Datum::int(1)),
+            ]),
+            HashMap::from([
+                (1, Datum::float(f32::INFINITY)),
+                (2, Datum::double(f64::NAN)),
+                (3, Datum::int(9)),
+            ]),
+        );
+        // Non-finite float bounds are advisory and dropped on construction.
+        assert_eq!(metrics.lower_bounds(), &HashMap::from([(3, Datum::int(1))]));
+        assert_eq!(metrics.upper_bounds(), &HashMap::from([(3, Datum::int(9))]));
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(100)
+            .with_start(0)
+            .with_length(100)
+            .with_data_file_path("data_file_path".to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema)
+            .with_project_field_ids(vec![1, 2, 3])
+            .with_file_metrics(Some(Arc::new(metrics.clone())))
+            .with_case_sensitive(false)
+            .build()
+            .unwrap();
+
+        let json = serde_json::to_string(&task).unwrap();
+        let decoded: FileScanTask = serde_json::from_str(&json).unwrap();
+        // Serialization is lossless: the round trip prunes like the original.
+        assert_eq!(decoded, task);
+        assert_eq!(decoded.file_metrics(), Some(&metrics));
+    }
+
+    #[test]
+    fn file_metrics_retain_only_selected_columns() {
+        let file = crate::spec::DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("data.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(10)
+            .record_count(3)
+            .partition(Struct::empty())
+            .value_counts(HashMap::from([(1, 3), (2, 3)]))
+            .null_value_counts(HashMap::from([(1, 0), (2, 1)]))
+            .lower_bounds(HashMap::from([(1, Datum::int(1)), (2, Datum::long(5))]))
+            .upper_bounds(HashMap::from([(1, Datum::int(9)), (2, Datum::long(7))]))
+            .build()
+            .unwrap();
+
+        let all = FileScanTaskMetrics::from_data_file(&file, &ColumnStatsSelection::All);
+        assert_eq!(all.lower_bounds.len(), 2);
+
+        let selected = FileScanTaskMetrics::from_data_file(
+            &file,
+            &ColumnStatsSelection::Fields(HashSet::from([2])),
+        );
+        assert_eq!(selected.record_count, Some(3));
+        assert_eq!(selected.value_counts, HashMap::from([(2, 3)]));
+        assert_eq!(selected.null_value_counts, HashMap::from([(2, 1)]));
+        assert_eq!(selected.lower_bounds, HashMap::from([(2, Datum::long(5))]));
+        assert_eq!(selected.upper_bounds, HashMap::from([(2, Datum::long(7))]));
+    }
 
     fn build_file_scan_task(
         schema: SchemaRef,

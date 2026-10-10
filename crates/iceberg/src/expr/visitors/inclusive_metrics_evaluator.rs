@@ -15,10 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
+
 use fnv::FnvHashSet;
 
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
 use crate::expr::{BoundPredicate, BoundReference};
+use crate::scan::FileScanTaskMetrics;
 use crate::spec::{DataFile, Datum, PrimitiveLiteral};
 use crate::{Error, ErrorKind};
 
@@ -26,15 +29,57 @@ const IN_PREDICATE_LIMIT: usize = 200;
 const ROWS_MIGHT_MATCH: crate::Result<bool> = Ok(true);
 const ROWS_CANNOT_MATCH: crate::Result<bool> = Ok(false);
 
+/// Borrowed whole-file column statistics, keyed by Iceberg field ID.
+///
+/// The statistics evaluator only reads these maps, so callers that hold them
+/// outside a [`DataFile`] can be evaluated without building one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FileMetrics<'a> {
+    /// Number of records in the file, when known.
+    pub(crate) record_count: Option<u64>,
+    /// Number of values, including nulls and NaNs.
+    pub(crate) value_counts: &'a HashMap<i32, u64>,
+    /// Number of null values.
+    pub(crate) null_value_counts: &'a HashMap<i32, u64>,
+    /// Number of NaN values.
+    pub(crate) nan_value_counts: &'a HashMap<i32, u64>,
+    /// Inclusive lower bounds.
+    pub(crate) lower_bounds: &'a HashMap<i32, Datum>,
+    /// Inclusive upper bounds.
+    pub(crate) upper_bounds: &'a HashMap<i32, Datum>,
+}
+
+impl<'a> From<&'a DataFile> for FileMetrics<'a> {
+    fn from(data_file: &'a DataFile) -> Self {
+        Self {
+            record_count: Some(data_file.record_count),
+            value_counts: &data_file.value_counts,
+            null_value_counts: &data_file.null_value_counts,
+            nan_value_counts: &data_file.nan_value_counts,
+            lower_bounds: &data_file.lower_bounds,
+            upper_bounds: &data_file.upper_bounds,
+        }
+    }
+}
+
+impl<'a> From<&'a FileScanTaskMetrics> for FileMetrics<'a> {
+    fn from(metrics: &'a FileScanTaskMetrics) -> Self {
+        Self {
+            record_count: metrics.record_count(),
+            value_counts: metrics.value_counts(),
+            null_value_counts: metrics.null_value_counts(),
+            nan_value_counts: metrics.nan_value_counts(),
+            lower_bounds: metrics.lower_bounds(),
+            upper_bounds: metrics.upper_bounds(),
+        }
+    }
+}
+
 pub(crate) struct InclusiveMetricsEvaluator<'a> {
-    data_file: &'a DataFile,
+    metrics: FileMetrics<'a>,
 }
 
 impl<'a> InclusiveMetricsEvaluator<'a> {
-    fn new(data_file: &'a DataFile) -> Self {
-        InclusiveMetricsEvaluator { data_file }
-    }
-
     /// Evaluate this `InclusiveMetricsEvaluator`'s filter predicate against the
     /// provided [`DataFile`]'s metrics. Used by [`TableScan`] to
     /// see if this `DataFile` contains data that could match
@@ -44,32 +89,45 @@ impl<'a> InclusiveMetricsEvaluator<'a> {
         data_file: &'a DataFile,
         include_empty_files: bool,
     ) -> crate::Result<bool> {
-        if !include_empty_files && data_file.record_count == 0 {
+        Self::eval_metrics(filter, data_file.into(), include_empty_files)
+    }
+
+    /// Evaluate `filter` against borrowed whole-file statistics. A file whose
+    /// record count is known to be zero cannot match unless
+    /// `include_empty_files` is set. An unknown record count does not by
+    /// itself exclude the file, but the available bounds and counts may still
+    /// prune it.
+    pub(crate) fn eval_metrics(
+        filter: &'a BoundPredicate,
+        metrics: FileMetrics<'a>,
+        include_empty_files: bool,
+    ) -> crate::Result<bool> {
+        if !include_empty_files && metrics.record_count == Some(0) {
             return ROWS_CANNOT_MATCH;
         }
 
-        let mut evaluator = Self::new(data_file);
+        let mut evaluator = Self { metrics };
         visit(&mut evaluator, filter)
     }
 
     fn nan_count(&self, field_id: i32) -> Option<&u64> {
-        self.data_file.nan_value_counts.get(&field_id)
+        self.metrics.nan_value_counts.get(&field_id)
     }
 
     fn null_count(&self, field_id: i32) -> Option<&u64> {
-        self.data_file.null_value_counts.get(&field_id)
+        self.metrics.null_value_counts.get(&field_id)
     }
 
     fn value_count(&self, field_id: i32) -> Option<&u64> {
-        self.data_file.value_counts.get(&field_id)
+        self.metrics.value_counts.get(&field_id)
     }
 
     fn lower_bound(&self, field_id: i32) -> Option<&Datum> {
-        self.data_file.lower_bounds.get(&field_id)
+        self.metrics.lower_bounds.get(&field_id)
     }
 
     fn upper_bound(&self, field_id: i32) -> Option<&Datum> {
-        self.data_file.upper_bounds.get(&field_id)
+        self.metrics.upper_bounds.get(&field_id)
     }
 
     fn contains_nans_only(&self, field_id: i32) -> bool {
@@ -437,28 +495,20 @@ impl BoundPredicateVisitor for InclusiveMetricsEvaluator<'_> {
             return ROWS_MIGHT_MATCH;
         }
 
-        if let Some(lower_bound) = self.lower_bound(field_id) {
-            if lower_bound.is_nan() {
-                // NaN indicates unreliable bounds. See the InclusiveMetricsEvaluator docs for more.
-                return ROWS_MIGHT_MATCH;
-            }
-
-            if !literals.iter().any(|datum| datum.ge(lower_bound)) {
-                // if all values are less than lower bound, rows cannot match.
-                return ROWS_CANNOT_MATCH;
-            }
+        let lower_bound = self.lower_bound(field_id);
+        let upper_bound = self.upper_bound(field_id);
+        if lower_bound.is_some_and(Datum::is_nan) || upper_bound.is_some_and(Datum::is_nan) {
+            // NaN indicates unreliable bounds. See the InclusiveMetricsEvaluator docs for more.
+            return ROWS_MIGHT_MATCH;
         }
 
-        if let Some(upper_bound) = self.upper_bound(field_id) {
-            if upper_bound.is_nan() {
-                // NaN indicates unreliable bounds. See the InclusiveMetricsEvaluator docs for more.
-                return ROWS_MIGHT_MATCH;
-            }
-
-            if !literals.iter().any(|datum| datum.le(upper_bound)) {
-                // if all values are greater than upper bound, rows cannot match.
-                return ROWS_CANNOT_MATCH;
-            }
+        // Like Java's evaluator, a literal must lie within both bounds at once: a set with
+        // one value below the lower bound and another above the upper bound cannot match.
+        if !literals.iter().any(|datum| {
+            lower_bound.is_none_or(|lower| datum.ge(lower))
+                && upper_bound.is_none_or(|upper| datum.le(upper))
+        }) {
+            return ROWS_CANNOT_MATCH;
         }
 
         ROWS_MIGHT_MATCH
@@ -489,7 +539,9 @@ mod test {
         Eq, GreaterThan, GreaterThanOrEq, In, IsNan, IsNull, LessThan, LessThanOrEq, NotEq, NotIn,
         NotNan, NotNull, NotStartsWith, StartsWith,
     };
-    use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
+    use crate::expr::visitors::inclusive_metrics_evaluator::{
+        FileMetrics, InclusiveMetricsEvaluator,
+    };
     use crate::expr::{
         BinaryExpression, Bind, BoundPredicate, Predicate, Reference, SetExpression,
         UnaryExpression,
@@ -944,6 +996,48 @@ mod test {
         let result =
             InclusiveMetricsEvaluator::eval(&bound_pred, &get_test_file_1(), true).unwrap();
         assert!(!result, "Should skip: or(false, false)");
+    }
+
+    #[test]
+    fn test_file_metrics_from_independent_maps() {
+        // Whole-file statistics held outside any DataFile: `id` (field 1)
+        // spans 10..=20 with no nulls; `no_stats` (field 2) has none.
+        let value_counts = HashMap::from([(1, 5)]);
+        let null_value_counts = HashMap::from([(1, 0)]);
+        let nan_value_counts = HashMap::new();
+        let lower_bounds = HashMap::from([(1, Datum::int(10))]);
+        let upper_bounds = HashMap::from([(1, Datum::int(20))]);
+        let metrics = |record_count| FileMetrics {
+            record_count,
+            value_counts: &value_counts,
+            null_value_counts: &null_value_counts,
+            nan_value_counts: &nan_value_counts,
+            lower_bounds: &lower_bounds,
+            upper_bounds: &upper_bounds,
+        };
+        let eval = |predicate: &BoundPredicate, record_count, include_empty_files| {
+            InclusiveMetricsEvaluator::eval_metrics(
+                predicate,
+                metrics(record_count),
+                include_empty_files,
+            )
+            .unwrap()
+        };
+
+        // Bounds prune or keep the file regardless of the record count.
+        for record_count in [Some(5), None] {
+            assert!(!eval(&less_than_int("id", 5), record_count, false));
+            assert!(!eval(&greater_than_int("id", 20), record_count, false));
+            assert!(eval(&less_than_int("id", 15), record_count, false));
+            assert!(!eval(&is_null("id"), record_count, false));
+            assert!(eval(&not_null("id"), record_count, false));
+            // Missing statistics never exclude.
+            assert!(eval(&is_null("no_stats"), record_count, false));
+        }
+
+        // A known empty file is skipped unless empty files are included.
+        assert!(!eval(&less_than_int("id", 15), Some(0), false));
+        assert!(eval(&less_than_int("id", 15), Some(0), true));
     }
 
     #[test]
@@ -1442,6 +1536,31 @@ mod test {
         )
         .unwrap();
         assert!(result, "Should read: range matches");
+    }
+
+    #[test]
+    fn test_in_with_literals_on_both_sides_of_the_bounds() {
+        // id spans INT_MIN_VALUE..=INT_MAX_VALUE in this file. One literal below and one above
+        // the range: neither can match, although each passes one of the two bound checks.
+        let result = InclusiveMetricsEvaluator::eval(
+            &r#in_int("id", &[INT_MIN_VALUE - 1, INT_MAX_VALUE + 1]),
+            &get_test_file_1(),
+            true,
+        )
+        .unwrap();
+        assert!(!result, "Should skip: no literal inside [lower, upper]");
+
+        let result = InclusiveMetricsEvaluator::eval(
+            &r#in_int("id", &[
+                INT_MIN_VALUE - 1,
+                INT_MIN_VALUE + 1,
+                INT_MAX_VALUE + 1,
+            ]),
+            &get_test_file_1(),
+            true,
+        )
+        .unwrap();
+        assert!(result, "Should read: one literal inside [lower, upper]");
     }
 
     #[test]
