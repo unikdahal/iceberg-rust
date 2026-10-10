@@ -142,6 +142,15 @@ pub struct TableScanBuilder<'a> {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     bloom_filter_enabled: bool,
+    column_stats: ColumnStatsRequest,
+}
+
+/// Which manifest column statistics planned tasks should retain.
+#[derive(Debug, Clone)]
+enum ColumnStatsRequest {
+    None,
+    All,
+    Columns(Vec<String>),
 }
 
 impl<'a> TableScanBuilder<'a> {
@@ -161,7 +170,39 @@ impl<'a> TableScanBuilder<'a> {
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
             bloom_filter_enabled: false,
+            column_stats: ColumnStatsRequest::None,
         }
+    }
+
+    /// Retains every column's manifest statistics on planned [`FileScanTask`]s.
+    ///
+    /// Statistics are dropped by default to keep planning and task serialization
+    /// cheap. When retained, [`FileScanTask::file_metrics`] lets a reader with an
+    /// execution-time predicate reject a file before opening it.
+    /// Readers can also skip row filters proven by these statistics.
+    /// The most recent statistics selection call replaces earlier calls.
+    pub fn include_column_stats(mut self) -> Self {
+        self.column_stats = ColumnStatsRequest::All;
+        self
+    }
+
+    /// Retains manifest statistics only for the named columns on planned
+    /// [`FileScanTask`]s. The record count is always retained.
+    /// Readers can use them to prune files or prove row filters.
+    /// Names must identify primitive fields; unknown or container names
+    /// cause [`Self::build`] to fail. The most recent statistics
+    /// selection call replaces earlier calls.
+    pub fn include_column_stats_for(
+        mut self,
+        column_names: impl IntoIterator<Item = impl ToString>,
+    ) -> Self {
+        self.column_stats = ColumnStatsRequest::Columns(
+            column_names
+                .into_iter()
+                .map(|name| name.to_string())
+                .collect(),
+        );
+        self
     }
 
     /// Sets the desired size of batches in the response
@@ -322,6 +363,35 @@ impl<'a> TableScanBuilder<'a> {
             .default_name_mapping()?
             .map(Arc::new);
         let unified_partition_type = projected_partition_type(self.table, &schema, &field_ids)?;
+        let column_stats = match &self.column_stats {
+            ColumnStatsRequest::None => None,
+            ColumnStatsRequest::All => Some(Arc::new(ColumnStatsSelection::All)),
+            ColumnStatsRequest::Columns(names) => {
+                let ids = names
+                    .iter()
+                    .map(|name| {
+                        let id = resolve_field_id(&schema, name, self.case_sensitive)
+                            .ok_or_else(|| {
+                                invalid_data!(
+                                    "Column {name} requested for statistics not found in table. Schema: {schema}"
+                                )
+                            })?;
+                        if !schema
+                            .field_by_id(id)
+                            .expect("resolved field")
+                            .field_type
+                            .is_primitive()
+                        {
+                            return Err(invalid_data!(
+                                "Column {name} requested for statistics must be primitive"
+                            ));
+                        }
+                        Ok(id)
+                    })
+                    .collect::<Result<_>>()?;
+                Some(Arc::new(ColumnStatsSelection::Fields(ids)))
+            }
+        };
 
         // Precompute the table's sort orders once, keyed by id, so each manifest-file
         // context carries only this narrow map instead of the full table metadata.
@@ -348,6 +418,7 @@ impl<'a> TableScanBuilder<'a> {
             expression_evaluator_cache: Arc::new(ExpressionEvaluatorCache::new()),
             unified_partition_type,
             sort_orders,
+            column_stats,
         };
 
         Ok(TableScan {
@@ -699,7 +770,7 @@ mod tests {
         RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
         RESERVED_COL_NAME_POS, RESERVED_COL_NAME_SPEC_ID, RESERVED_FIELD_ID_POS,
     };
-    use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
+    use crate::scan::{FileScanTask, FileScanTaskDeleteFile, TableScan};
     use crate::spec::{
         DataContentType, DataFileFormat, Datum, Literal, MAIN_BRANCH, MappedField, NameMapping,
         NestedField, NullOrder, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot,
@@ -1056,6 +1127,207 @@ mod tests {
         let batch_stream = table.scan().build().unwrap().to_arrow().await.unwrap();
         let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
         assert!(batches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_plan_files_retains_column_stats_only_when_requested() {
+        use crate::spec::{
+            DataFileBuilder, ManifestEntry, ManifestListWriter, ManifestStatus,
+            ManifestWriterBuilder,
+        };
+
+        let fixture = TableTestFixture::new();
+        let snapshot = fixture.table.metadata().current_snapshot().unwrap();
+        let schema = snapshot.schema(fixture.table.metadata()).unwrap();
+        let lower = HashMap::from([(1, Datum::long(100)), (2, Datum::long(200))]);
+        let mut writer = ManifestWriterBuilder::new(
+            fixture
+                .table
+                .file_io()
+                .new_output(format!("{}/metadata/stats.avro", fixture.table_location))
+                .unwrap(),
+            Some(snapshot.snapshot_id()),
+            schema.clone(),
+            fixture
+                .table
+                .metadata()
+                .default_partition_spec()
+                .as_ref()
+                .clone(),
+        )
+        .build_v2_data();
+        writer
+            .add_entry(
+                ManifestEntry::builder()
+                    .status(ManifestStatus::Added)
+                    .data_file(
+                        DataFileBuilder::default()
+                            .partition_spec_id(0)
+                            .content(DataContentType::Data)
+                            .file_path("data.parquet".to_string())
+                            .file_format(DataFileFormat::Parquet)
+                            .file_size_in_bytes(100)
+                            .record_count(3)
+                            .partition(Struct::from_iter([Some(Literal::long(100))]))
+                            .lower_bounds(lower.clone())
+                            .upper_bounds(lower.clone())
+                            .build()
+                            .unwrap(),
+                    )
+                    .build(),
+            )
+            .unwrap();
+        let manifest = writer.write_manifest_file().await.unwrap();
+        let output = fixture
+            .table
+            .file_io()
+            .new_output(snapshot.manifest_list())
+            .unwrap()
+            .writer()
+            .await
+            .unwrap();
+        let mut list = ManifestListWriter::v2(
+            output,
+            snapshot.snapshot_id(),
+            snapshot.parent_snapshot_id(),
+            snapshot.sequence_number(),
+        );
+        list.add_manifests([manifest].into_iter()).unwrap();
+        list.close().await.unwrap();
+
+        let plan = |scan: TableScan| async move {
+            scan.plan_files()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+        };
+
+        let default_tasks = plan(fixture.table.scan().build().unwrap()).await;
+        assert!(!default_tasks.is_empty());
+        assert!(
+            default_tasks
+                .iter()
+                .all(|task| task.file_metrics().is_none())
+        );
+
+        for (scan, expected) in [
+            (fixture.table.scan().include_column_stats(), lower.clone()),
+            (
+                fixture.table.scan().include_column_stats_for(["x"]),
+                HashMap::from([(1, Datum::long(100))]),
+            ),
+            (
+                fixture
+                    .table
+                    .scan()
+                    .include_column_stats_for(["x"])
+                    .include_column_stats(),
+                lower.clone(),
+            ),
+            (
+                fixture
+                    .table
+                    .scan()
+                    .include_column_stats()
+                    .include_column_stats_for(["x"]),
+                HashMap::from([(1, Datum::long(100))]),
+            ),
+        ] {
+            let tasks = plan(scan.build().unwrap()).await;
+            assert!(!tasks.is_empty());
+            for task in tasks {
+                let metrics = task.file_metrics().expect("requested statistics");
+                assert_eq!(metrics.record_count, task.record_count());
+                assert_eq!(metrics.lower_bounds(), &expected);
+                assert_eq!(metrics.upper_bounds(), &expected);
+            }
+        }
+
+        assert!(
+            fixture
+                .table
+                .scan()
+                .include_column_stats_for(["missing"])
+                .build()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn include_column_stats_for_rejects_container_names() {
+        use crate::spec::{ListType, MapType, StructType};
+
+        let leaf = Arc::new(NestedField::optional(
+            3,
+            "a",
+            Type::Primitive(PrimitiveType::Int),
+        ));
+        for (field_type, leaf_name) in [
+            (Type::Struct(StructType::new(vec![leaf.clone()])), "s.a"),
+            (
+                Type::List(ListType::new(Arc::new(NestedField::list_element(
+                    3,
+                    Type::Primitive(PrimitiveType::Int),
+                    false,
+                )))),
+                "s.element",
+            ),
+            (
+                Type::Map(MapType::optional(
+                    4,
+                    Type::Primitive(PrimitiveType::String),
+                    3,
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                "s.value",
+            ),
+        ] {
+            let table = table_with_data_column("s");
+            let schema = Arc::new(
+                Schema::builder()
+                    .with_schema_id(0)
+                    .with_fields([
+                        Arc::new(NestedField::required(
+                            1,
+                            "id",
+                            Type::Primitive(PrimitiveType::Int),
+                        )),
+                        Arc::new(NestedField::optional(2, "s", field_type)),
+                    ])
+                    .build()
+                    .unwrap(),
+            );
+            let mut metadata = table.metadata().clone();
+            metadata.schemas.insert(0, schema);
+            let table = table.with_metadata(Arc::new(metadata));
+            let err = table
+                .scan()
+                .include_column_stats_for(["s"])
+                .build()
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::DataInvalid);
+            assert_eq!(
+                err.message(),
+                "Column s requested for statistics must be primitive"
+            );
+            assert!(
+                table
+                    .scan()
+                    .include_column_stats_for([leaf_name])
+                    .build()
+                    .is_ok()
+            );
+            assert!(
+                table
+                    .scan()
+                    .include_column_stats_for(["s"])
+                    .include_column_stats()
+                    .build()
+                    .is_ok()
+            );
+        }
     }
 
     #[tokio::test]

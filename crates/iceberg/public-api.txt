@@ -79,6 +79,7 @@ pub fn iceberg::arrow::ArrowReaderBuilder::with_range_coalesce_bytes(self, range
 pub fn iceberg::arrow::ArrowReaderBuilder::with_range_fetch_concurrency(self, range_fetch_concurrency: usize) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_row_group_filtering_enabled(self, row_group_filtering_enabled: bool) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_row_selection_enabled(self, row_selection_enabled: bool) -> Self
+pub fn iceberg::arrow::ArrowReaderBuilder::with_runtime_predicate_provider(self, runtime_predicate_provider: alloc::sync::Arc<dyn iceberg::arrow::RuntimePredicateProvider>) -> Self
 pub struct iceberg::arrow::PartitionValueCalculator
 impl iceberg::arrow::PartitionValueCalculator
 pub fn iceberg::arrow::PartitionValueCalculator::calculate(&self, batch: &arrow_array::record_batch::RecordBatch) -> iceberg::Result<arrow_array::array::ArrayRef>
@@ -93,9 +94,22 @@ pub fn iceberg::arrow::RecordBatchPartitionSplitter::split(&self, batch: &arrow_
 pub fn iceberg::arrow::RecordBatchPartitionSplitter::try_new(iceberg_schema: iceberg::spec::SchemaRef, partition_spec: iceberg::spec::PartitionSpecRef, calculator: core::option::Option<iceberg::arrow::PartitionValueCalculator>) -> iceberg::Result<Self>
 pub fn iceberg::arrow::RecordBatchPartitionSplitter::try_new_with_computed_values(iceberg_schema: iceberg::spec::SchemaRef, partition_spec: iceberg::spec::PartitionSpecRef) -> iceberg::Result<Self>
 pub fn iceberg::arrow::RecordBatchPartitionSplitter::try_new_with_precomputed_values(iceberg_schema: iceberg::spec::SchemaRef, partition_spec: iceberg::spec::PartitionSpecRef) -> iceberg::Result<Self>
+pub struct iceberg::arrow::RuntimePredicateSnapshot
+impl iceberg::arrow::RuntimePredicateSnapshot
+pub fn iceberg::arrow::RuntimePredicateSnapshot::generation(&self) -> u64
+pub fn iceberg::arrow::RuntimePredicateSnapshot::into_predicate(self) -> core::option::Option<iceberg::expr::Predicate>
+pub fn iceberg::arrow::RuntimePredicateSnapshot::new(predicate: core::option::Option<iceberg::expr::Predicate>, generation: u64) -> Self
+impl core::fmt::Debug for iceberg::arrow::RuntimePredicateSnapshot
+pub fn iceberg::arrow::RuntimePredicateSnapshot::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg::arrow::ScanMetrics
 impl iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanMetrics::bytes_read(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::runtime_decoder_rebuilds(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::runtime_file_tasks_pruned(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::runtime_predicate_refreshes(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::runtime_predicate_tasks(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::runtime_row_groups_pruned(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::runtime_row_groups_pruned_live(&self) -> u64
 impl core::clone::Clone for iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanMetrics::clone(&self) -> iceberg::scan::ScanMetrics
 impl core::fmt::Debug for iceberg::scan::ScanMetrics
@@ -124,6 +138,10 @@ pub fn iceberg::arrow::ArrowSchemaVisitor::primitive(&mut self, p: &arrow_schema
 pub fn iceberg::arrow::ArrowSchemaVisitor::schema(&mut self, schema: &arrow_schema::schema::Schema, values: alloc::vec::Vec<Self::T>) -> iceberg::Result<Self::U>
 pub fn iceberg::arrow::ArrowSchemaVisitor::struct(&mut self, fields: &arrow_schema::fields::Fields, results: alloc::vec::Vec<Self::T>) -> iceberg::Result<Self::T>
 pub fn iceberg::arrow::ArrowSchemaVisitor::variant(&mut self, field: &arrow_schema::field::FieldRef) -> iceberg::Result<Self::T> where Self: core::marker::Sized
+pub trait iceberg::arrow::RuntimePredicateProvider: core::marker::Send + core::marker::Sync
+pub fn iceberg::arrow::RuntimePredicateProvider::generation(&self) -> u64
+pub fn iceberg::arrow::RuntimePredicateProvider::largest_first_column(&self) -> core::option::Option<alloc::string::String>
+pub fn iceberg::arrow::RuntimePredicateProvider::snapshot(&self) -> iceberg::Result<iceberg::arrow::RuntimePredicateSnapshot>
 pub fn iceberg::arrow::arrow_primitive_to_literal(primitive_array: &arrow_array::array::ArrayRef, ty: &iceberg::spec::Type) -> iceberg::Result<alloc::vec::Vec<core::option::Option<iceberg::spec::Literal>>>
 pub fn iceberg::arrow::arrow_schema_to_schema(schema: &arrow_schema::schema::Schema) -> iceberg::Result<iceberg::spec::Schema>
 pub fn iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(schema: &arrow_schema::schema::Schema) -> iceberg::Result<iceberg::spec::Schema>
@@ -1335,6 +1353,7 @@ pub fn iceberg::scan::FileScanTask::data_file_format(&self) -> iceberg::spec::Da
 pub fn iceberg::scan::FileScanTask::data_file_path(&self) -> &str
 pub fn iceberg::scan::FileScanTask::data_sequence_number(&self) -> core::option::Option<i64>
 pub fn iceberg::scan::FileScanTask::deletes(&self) -> &[iceberg::scan::FileScanTaskDeleteFile]
+pub fn iceberg::scan::FileScanTask::file_metrics(&self) -> core::option::Option<&iceberg::scan::FileScanTaskMetrics>
 pub fn iceberg::scan::FileScanTask::file_size_in_bytes(&self) -> u64
 pub fn iceberg::scan::FileScanTask::first_row_id(&self) -> core::option::Option<i64>
 pub fn iceberg::scan::FileScanTask::key_metadata(&self) -> core::option::Option<&[u8]>
@@ -1361,7 +1380,7 @@ impl core::fmt::Debug for iceberg::scan::FileScanTask
 pub fn iceberg::scan::FileScanTask::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for iceberg::scan::FileScanTask
 impl iceberg::scan::FileScanTask
-pub fn iceberg::scan::FileScanTask::builder() -> FileScanTaskBuilder<((), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), ())>
+pub fn iceberg::scan::FileScanTask::builder() -> FileScanTaskBuilder<((), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), ())>
 impl serde_core::ser::Serialize for iceberg::scan::FileScanTask
 pub fn iceberg::scan::FileScanTask::serialize<S>(&self, serializer: S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error> where S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for iceberg::scan::FileScanTask
@@ -1394,9 +1413,38 @@ impl serde_core::ser::Serialize for iceberg::scan::FileScanTaskDeleteFile
 pub fn iceberg::scan::FileScanTaskDeleteFile::serialize<__S>(&self, __serializer: __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for iceberg::scan::FileScanTaskDeleteFile
 pub fn iceberg::scan::FileScanTaskDeleteFile::deserialize<__D>(__deserializer: __D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+pub struct iceberg::scan::FileScanTaskMetrics
+impl iceberg::scan::FileScanTaskMetrics
+pub fn iceberg::scan::FileScanTaskMetrics::lower_bounds(&self) -> &std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>
+pub fn iceberg::scan::FileScanTaskMetrics::nan_value_counts(&self) -> &std::collections::hash::map::HashMap<i32, u64>
+pub fn iceberg::scan::FileScanTaskMetrics::null_value_counts(&self) -> &std::collections::hash::map::HashMap<i32, u64>
+pub fn iceberg::scan::FileScanTaskMetrics::record_count(&self) -> core::option::Option<u64>
+pub fn iceberg::scan::FileScanTaskMetrics::upper_bounds(&self) -> &std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>
+pub fn iceberg::scan::FileScanTaskMetrics::value_counts(&self) -> &std::collections::hash::map::HashMap<i32, u64>
+impl core::clone::Clone for iceberg::scan::FileScanTaskMetrics
+pub fn iceberg::scan::FileScanTaskMetrics::clone(&self) -> iceberg::scan::FileScanTaskMetrics
+impl core::cmp::PartialEq for iceberg::scan::FileScanTaskMetrics
+pub fn iceberg::scan::FileScanTaskMetrics::eq(&self, other: &iceberg::scan::FileScanTaskMetrics) -> bool
+impl core::default::Default for iceberg::scan::FileScanTaskMetrics
+pub fn iceberg::scan::FileScanTaskMetrics::default() -> iceberg::scan::FileScanTaskMetrics
+impl core::fmt::Debug for iceberg::scan::FileScanTaskMetrics
+pub fn iceberg::scan::FileScanTaskMetrics::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for iceberg::scan::FileScanTaskMetrics
+impl iceberg::scan::FileScanTaskMetrics
+pub fn iceberg::scan::FileScanTaskMetrics::builder() -> FileScanTaskMetricsBuilder<((), (), (), (), (), ())>
+impl serde_core::ser::Serialize for iceberg::scan::FileScanTaskMetrics
+pub fn iceberg::scan::FileScanTaskMetrics::serialize<__S>(&self, __serializer: __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for iceberg::scan::FileScanTaskMetrics
+pub fn iceberg::scan::FileScanTaskMetrics::deserialize<__D>(__deserializer: __D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 pub struct iceberg::scan::ScanMetrics
 impl iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanMetrics::bytes_read(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::runtime_decoder_rebuilds(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::runtime_file_tasks_pruned(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::runtime_predicate_refreshes(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::runtime_predicate_tasks(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::runtime_row_groups_pruned(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::runtime_row_groups_pruned_live(&self) -> u64
 impl core::clone::Clone for iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanMetrics::clone(&self) -> iceberg::scan::ScanMetrics
 impl core::fmt::Debug for iceberg::scan::ScanMetrics
@@ -1416,6 +1464,8 @@ pub fn iceberg::scan::TableScan::fmt(&self, f: &mut core::fmt::Formatter<'_>) ->
 pub struct iceberg::scan::TableScanBuilder<'a>
 impl<'a> iceberg::scan::TableScanBuilder<'a>
 pub fn iceberg::scan::TableScanBuilder<'a>::build(self) -> iceberg::Result<iceberg::scan::TableScan>
+pub fn iceberg::scan::TableScanBuilder<'a>::include_column_stats(self) -> Self
+pub fn iceberg::scan::TableScanBuilder<'a>::include_column_stats_for(self, column_names: impl core::iter::traits::collect::IntoIterator<Item = impl alloc::string::ToString>) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select(self, column_names: impl core::iter::traits::collect::IntoIterator<Item = impl alloc::string::ToString>) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select_all(self) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select_empty(self) -> Self

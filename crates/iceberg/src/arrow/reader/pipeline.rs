@@ -20,34 +20,52 @@
 //! predicates, row-group / row selection, and delete handling into a stream
 //! of transformed Arrow `RecordBatch`es.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use arrow_schema::{DataType, Field};
 use futures::{StreamExt, TryStreamExt};
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, RowFilter, RowSelection,
+};
+use parquet::arrow::push_decoder::{ParquetPushDecoderBuilder, RowGroupSelection};
 use parquet::arrow::{
     PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask, RowNumber,
 };
 use parquet::encryption::decrypt::FileDecryptionProperties;
+use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
+use parquet::file::statistics::Statistics;
+use parquet::schema::types::SchemaDescriptor;
 
+use super::projection::build_field_id_map;
 use super::row_lineage::synthesize_row_id_column;
+use super::runtime_predicate::{
+    RuntimePredicates, check_runtime_predicate_columns, intersect_page_selection, intersect_sorted,
+};
+use super::runtime_stream::{
+    BoundaryRefresh, ResolvedPredicate, RuntimePrunedStream, split_row_selection,
+};
 use super::{
     ArrowFileReader, ArrowReader, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
     apply_name_mapping_to_arrow_schema, find_leaf_by_field_id,
 };
 use crate::arrow::build_partition_constant;
-use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+use crate::arrow::caching_delete_file_loader::{CachingDeleteFileLoader, DeleteLoad};
+use crate::arrow::delete_filter::DeleteFilter;
 use crate::arrow::int96::coerce_int96_timestamps;
-use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
+use crate::arrow::record_batch_transformer::{
+    RecordBatchTransformer, RecordBatchTransformerBuilder,
+};
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::encryption::StandardKeyMetadata;
 use crate::error::{Result, invalid_data};
-use crate::expr::BoundPredicate;
 use crate::expr::visitors::bloom_filter_evaluator::{
     BloomFilterEvaluator, ColumnBloomFilter, collect_bloom_filter_field_ids,
 };
+use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
+use crate::expr::visitors::strict_metrics_evaluator::StrictMetricsEvaluator;
+use crate::expr::{BoundPredicate, PredicateOperator};
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{
     RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_POS,
@@ -55,8 +73,8 @@ use crate::metadata_columns::{
     RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_PARTITION,
     RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, RESERVED_FIELD_ID_SPEC_ID, is_metadata_field,
 };
-use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
-use crate::spec::{Datum, PartitionSpec, Struct};
+use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskMetrics, FileScanTaskStream};
+use crate::spec::{Datum, PartitionSpec, PrimitiveLiteral, PrimitiveType, Struct};
 use crate::{Error, ErrorKind};
 
 impl ArrowReader {
@@ -76,6 +94,9 @@ impl ArrowReader {
             row_selection_enabled: self.row_selection_enabled,
             bloom_filter_enabled: self.bloom_filter_enabled,
             parquet_read_options: self.parquet_read_options,
+            runtime_predicates: self
+                .runtime_predicate_provider
+                .map(|provider| Arc::new(RuntimePredicates::new(provider))),
             scan_metrics: scan_metrics.clone(),
         };
 
@@ -130,17 +151,164 @@ struct FileScanTaskReader {
     row_selection_enabled: bool,
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
+    /// Shared across tasks so each publication is bound once.
+    runtime_predicates: Option<Arc<RuntimePredicates>>,
     scan_metrics: ScanMetrics,
+}
+
+/// A predicate resolved against one file, with its statistics-based row-group selection.
+struct PlannedPredicate {
+    predicate: Arc<BoundPredicate>,
+    field_ids: HashSet<i32>,
+    field_id_map: HashMap<i32, usize>,
+    row_groups: Option<Vec<usize>>,
+    /// Runtime predicates are advisory: a planning or page-pruning failure skips them.
+    advisory: bool,
+    /// False when whole-file statistics prove every row satisfies the predicate, so the
+    /// row filter would only spend time confirming it. Row-group and page pruning still use it.
+    row_filter: bool,
+}
+
+/// Reader state resolved from the Parquet schema, projected columns, and virtual fields.
+struct ResolvedProjection {
+    record_batch_stream_builder: ParquetRecordBatchStreamBuilder<ArrowFileReader>,
+    projection_mask: ProjectionMask,
+    record_batch_transformer: RecordBatchTransformer,
+    live_file_reader: Option<ArrowFileReader>,
+    live_metadata: Option<ArrowReaderMetadata>,
+    use_position_fallback: bool,
+    project_row_id: bool,
+}
+
+/// Context for constructing the batch stream and its underlying decoders.
+struct StreamContext<'a> {
+    task: FileScanTask,
+    projection: ResolvedProjection,
+    selected_row_group_indices: Option<Vec<usize>>,
+    row_selection: Option<RowSelection>,
+    row_filter: Option<RowFilter>,
+    plans: &'a [PlannedPredicate],
+    observed_generation: Option<u64>,
+    runtime_disabled: Arc<AtomicBool>,
 }
 
 impl FileScanTaskReader {
     async fn process(self, task: FileScanTask) -> Result<ArrowRecordBatchStream> {
-        let should_load_page_index = (self.row_selection_enabled && task.predicate().is_some())
+        // Read before the predicate, so a publication in between is looked at again.
+        let observed_generation = self
+            .runtime_predicates
+            .as_ref()
+            .map(|predicates| predicates.generation());
+        let runtime_predicate = self.runtime_predicates.as_ref().and_then(|predicates| {
+            predicates.current(
+                &task.schema_ref(),
+                task.case_sensitive(),
+                task.data_file_path(),
+            )
+        });
+
+        if self.prune_by_runtime_file_metrics(&task, runtime_predicate.as_deref()) {
+            return Ok(Box::pin(futures::stream::empty()));
+        }
+
+        let (delete_load, parquet_file_reader, arrow_metadata) = self
+            .open_parquet_and_start_delete_load(&task, runtime_predicate.is_some())
+            .await?;
+
+        let mut projection =
+            self.resolve_projection_and_schema(&task, parquet_file_reader, arrow_metadata)?;
+
+        let delete_filter = delete_load.await?;
+        let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
+        let mut plans = self.plan_predicates(
+            &task,
+            delete_predicate,
+            runtime_predicate,
+            &projection.record_batch_stream_builder,
+            projection.use_position_fallback,
+        )?;
+
+        let runtime_disabled = Arc::new(AtomicBool::new(false));
+        let row_filter = Self::compile_row_filter(
+            &task,
+            &mut plans,
+            projection.record_batch_stream_builder.parquet_schema(),
+            runtime_disabled.clone(),
+        )?;
+
+        if plans.iter().any(|plan| plan.advisory) {
+            self.scan_metrics.record_runtime_predicate_task();
+        }
+
+        let selected_row_group_indices = self
+            .select_row_groups(&task, &plans, &mut projection.record_batch_stream_builder)
+            .await?;
+
+        let row_selection = self.select_pages_by_index(
+            &task,
+            &plans,
+            projection.record_batch_stream_builder.metadata(),
+            &selected_row_group_indices,
+        )?;
+
+        let row_selection = Self::merge_positional_delete_selection(
+            &task,
+            &delete_filter,
+            projection
+                .record_batch_stream_builder
+                .metadata()
+                .row_groups(),
+            &selected_row_group_indices,
+            row_selection,
+        )?;
+
+        self.build_record_batch_stream(StreamContext {
+            task,
+            projection,
+            selected_row_group_indices,
+            row_selection,
+            row_filter,
+            plans: &plans,
+            observed_generation,
+            runtime_disabled,
+        })
+    }
+
+    /// Rejects the task when whole-file statistics prove no row can match the runtime predicate.
+    fn prune_by_runtime_file_metrics(
+        &self,
+        task: &FileScanTask,
+        runtime_predicate: Option<&BoundPredicate>,
+    ) -> bool {
+        // Reject the task before opening its data file or loading its deletes
+        // when whole-file statistics prove no row can match. The statistics
+        // cover the entire file, so this holds for every byte-range split.
+        if let (Some(predicate), Some(metrics)) = (runtime_predicate, task.file_metrics())
+            && !Self::file_might_match(predicate, metrics, task)
+        {
+            self.scan_metrics.record_runtime_predicate_task();
+            self.scan_metrics.record_runtime_file_task_pruned();
+            return true;
+        }
+        false
+    }
+
+    /// Starts loading delete files and opens the Parquet file with appropriate read options.
+    async fn open_parquet_and_start_delete_load(
+        &self,
+        task: &FileScanTask,
+        has_runtime_predicate: bool,
+    ) -> Result<(DeleteLoad, ArrowFileReader, ArrowReaderMetadata)> {
+        // A task that can adopt a runtime predicate at a row-group boundary needs the page
+        // index then, even when no predicate exists yet at open (a TopK's first file).
+        let may_refresh = self.runtime_predicates.is_some() && self.row_group_filtering_enabled;
+        let should_load_page_index = (self.row_selection_enabled
+            && (task.predicate().is_some() || has_runtime_predicate || may_refresh))
             || !task.deletes().is_empty();
         let mut parquet_read_options = self.parquet_read_options;
         parquet_read_options.preload_page_index = should_load_page_index;
 
-        let delete_filter_rx = self
+        let delete_load = self
             .delete_file_loader
             .load_deletes(task.deletes(), task.schema_ref());
 
@@ -155,6 +323,16 @@ impl FileScanTaskReader {
         )
         .await?;
 
+        Ok((delete_load, parquet_file_reader, arrow_metadata))
+    }
+
+    /// Configures reader metadata, projection masks, and the record-batch transformer for the task.
+    fn resolve_projection_and_schema(
+        &self,
+        task: &FileScanTask,
+        parquet_file_reader: ArrowFileReader,
+        arrow_metadata: ArrowReaderMetadata,
+    ) -> Result<ResolvedProjection> {
         // Check if Parquet file has embedded field IDs
         // Corresponds to Java's ParquetSchemaUtil.hasIds()
         // Reference: parquet/src/main/java/org/apache/iceberg/parquet/ParquetSchemaUtil.java:118
@@ -190,10 +368,21 @@ impl FileScanTaskReader {
 
         let arrow_metadata = Self::configure_arrow_reader_metadata(
             arrow_metadata,
-            &task,
+            task,
             missing_field_ids,
             install_row_number,
         )?;
+
+        // With a runtime predicate provider, a second handle on the open reader
+        // decodes the task by row group, with row-group-local selections.
+        let (parquet_file_reader, live_file_reader) =
+            if self.runtime_predicates.is_some() && self.row_group_filtering_enabled {
+                let (planning, decoding) = parquet_file_reader.into_shared();
+                (planning, Some(decoding))
+            } else {
+                (parquet_file_reader, None)
+            };
+        let live_metadata = live_file_reader.as_ref().map(|_| arrow_metadata.clone());
 
         // Build the stream reader, reusing the already-opened file reader
         let mut record_batch_stream_builder =
@@ -282,23 +471,9 @@ impl FileScanTaskReader {
             task.schema(),
             record_batch_stream_builder.parquet_schema(),
             record_batch_stream_builder.schema(),
-            use_position_fallback, // Whether to use position-based (true) or field-ID-based (false) projection
+            // Whether to use position-based (true) or field-ID-based (false) projection
+            use_position_fallback,
         )?;
-
-        // A metadata-only projection leaves `project_field_ids_without_metadata` empty,
-        // which `get_arrow_projection_mask` maps to "read all columns" (so `COUNT(*)` still
-        // gets a row count). Downgrade that to "read no data columns": `install_row_number`
-        // put the RowNumber virtual column on every metadata-only projection as a row-count
-        // source independent of the data columns, so the count survives with zero data
-        // columns read. `COUNT(*)` (an empty projection) has no RowNumber and keeps reading
-        // all columns to preserve the row count.
-        //
-        // This runs BEFORE the union so any physical metadata leaf is added onto a `none`
-        // base, pruning the read to just that leaf (`union` with an `all` base stays `all`).
-        if project_field_ids_without_metadata.is_empty() && install_row_number {
-            projection_mask =
-                ProjectionMask::none(record_batch_stream_builder.parquet_schema().num_columns());
-        }
 
         // Union in the physical leaves of any metadata columns we will coalesce. Their
         // reserved field ids are not in the task schema, so they can't be requested through
@@ -368,8 +543,8 @@ impl FileScanTaskReader {
                             // nulls the column without reading it, so it needs no such guard.
                             return Err(Error::new(
                                 ErrorKind::FeatureUnsupported,
-                                "Reading a physically-stored _last_updated_sequence_number column \
-                             without an embedded field id is not supported",
+                                "Reading a physically-stored _last_updated_sequence_number \
+                                 column without an embedded field id is not supported",
                             ));
                         } else {
                             // Column absent: derive it from the data sequence number.
@@ -404,8 +579,8 @@ impl FileScanTaskReader {
             if task.first_row_id().is_some() && row_id_present_by_name_only {
                 return Err(Error::new(
                     ErrorKind::FeatureUnsupported,
-                    "Reading a physically-stored _row_id column without an embedded field id \
-                     is not supported",
+                    "Reading a physically-stored _row_id column \
+                     without an embedded field id is not supported",
                 ));
             }
 
@@ -457,20 +632,37 @@ impl FileScanTaskReader {
                 record_batch_transformer_builder.with_partition_constant(constant);
         }
 
-        let mut record_batch_transformer = record_batch_transformer_builder.build();
+        let record_batch_transformer = record_batch_transformer_builder.build();
 
         if let Some(batch_size) = self.batch_size {
             record_batch_stream_builder = record_batch_stream_builder.with_batch_size(batch_size);
         }
 
-        let delete_filter = delete_filter_rx.await.unwrap()?;
-        let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
+        Ok(ResolvedProjection {
+            record_batch_stream_builder,
+            projection_mask,
+            record_batch_transformer,
+            live_file_reader,
+            live_metadata,
+            use_position_fallback,
+            project_row_id,
+        })
+    }
 
+    /// Plans static, equality-delete, and runtime predicates against the file.
+    fn plan_predicates(
+        &self,
+        task: &FileScanTask,
+        delete_predicate: Option<BoundPredicate>,
+        runtime_predicate: Option<Arc<BoundPredicate>>,
+        stream_builder: &ParquetRecordBatchStreamBuilder<ArrowFileReader>,
+        use_position_fallback: bool,
+    ) -> Result<Vec<PlannedPredicate>> {
         // In addition to the optional predicate supplied in the `FileScanTask`,
         // we also have an optional predicate resulting from equality delete files.
         // If both are present, we logical-AND them together to form a single filter
         // predicate that we can pass to the `RecordBatchStreamBuilder`.
-        let final_predicate = match (task.predicate(), delete_predicate) {
+        let planned_predicate = match (task.predicate(), delete_predicate) {
             (None, None) => None,
             (Some(predicate), None) => Some(predicate.clone()),
             (None, Some(ref predicate)) => Some(predicate.clone()),
@@ -479,6 +671,48 @@ impl FileScanTaskReader {
             }
         };
 
+        let mut plans = Vec::with_capacity(2);
+        if let Some(predicate) = planned_predicate {
+            plans.push(self.plan_predicate(
+                Arc::new(predicate),
+                false,
+                stream_builder,
+                task,
+                use_position_fallback,
+            )?);
+        }
+        // Skip the runtime predicate for this file if it does not store its
+        // columns exactly as the table types them, or if it cannot be planned.
+        if let Some(predicate) = runtime_predicate {
+            let planned = check_runtime_predicate_columns(
+                &predicate,
+                stream_builder.parquet_schema(),
+                stream_builder.schema(),
+                task.schema(),
+                use_position_fallback,
+            )
+            .and_then(|()| {
+                self.plan_predicate(predicate, true, stream_builder, task, use_position_fallback)
+            });
+            match planned {
+                Ok(plan) => plans.push(plan),
+                Err(error) => tracing::debug!(
+                    "Skipping runtime predicate for {}: {error}",
+                    task.data_file_path()
+                ),
+            }
+        }
+
+        Ok(plans)
+    }
+
+    /// Evaluates byte ranges, predicate bounds, and bloom filters to select candidate row groups.
+    async fn select_row_groups(
+        &self,
+        task: &FileScanTask,
+        plans: &[PlannedPredicate],
+        stream_builder: &mut ParquetRecordBatchStreamBuilder<ArrowFileReader>,
+    ) -> Result<Option<Vec<usize>>> {
         // There are three possible sources for potential lists of selected RowGroup indices,
         // and two for `RowSelection`s.
         // Selected RowGroup index lists can come from three sources:
@@ -495,133 +729,307 @@ impl FileScanTaskReader {
         // since the only implemented method of applying positional deletes is
         // by using a `RowSelection`.
         let mut selected_row_group_indices = None;
-        let mut row_selection = None;
 
         // Filter row groups based on byte range from task.start and task.length.
         // If both start and length are 0, read the entire file (backwards compatibility).
         if task.start() != 0 || task.length() != 0 {
             let byte_range_filtered_row_groups = ArrowReader::filter_row_groups_by_byte_range(
-                record_batch_stream_builder.metadata(),
+                stream_builder.metadata(),
                 task.start(),
                 task.length(),
             )?;
             selected_row_group_indices = Some(byte_range_filtered_row_groups);
         }
 
-        if let Some(predicate) = final_predicate {
-            let (iceberg_field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
-                record_batch_stream_builder.parquet_schema(),
-                record_batch_stream_builder.schema(),
-                &predicate,
-                use_position_fallback,
-            )?;
+        // Count the candidate groups the runtime predicate removed beyond the
+        // task byte range and the planned and equality-delete predicates.
+        if let Some(runtime_groups) = plans
+            .iter()
+            .find(|plan| plan.advisory)
+            .and_then(|plan| plan.row_groups.as_ref())
+        {
+            let without_runtime = match plans.iter().find(|plan| !plan.advisory) {
+                Some(planned) => planned.row_groups.clone().unwrap_or_default(),
+                None => (0..stream_builder.metadata().num_row_groups()).collect(),
+            };
+            let candidates = |groups: &[usize]| match &selected_row_group_indices {
+                Some(selected) => intersect_sorted(groups, selected).len(),
+                None => groups.len(),
+            };
+            let with_runtime = intersect_sorted(&without_runtime, runtime_groups);
+            self.scan_metrics.record_runtime_row_groups_pruned(
+                candidates(&without_runtime).saturating_sub(candidates(&with_runtime)),
+            );
+        }
 
-            let row_filter = ArrowReader::get_row_filter(
-                &predicate,
-                record_batch_stream_builder.parquet_schema(),
-                &iceberg_field_ids,
-                &field_id_map,
-            )?;
-            record_batch_stream_builder = record_batch_stream_builder.with_row_filter(row_filter);
-
-            if self.row_group_filtering_enabled {
-                let predicate_filtered_row_groups = ArrowReader::get_selected_row_group_indices(
-                    &predicate,
-                    record_batch_stream_builder.metadata(),
-                    &field_id_map,
-                    task.schema(),
-                )?;
-
+        for plan in plans {
+            if let Some(predicate_filtered_row_groups) = &plan.row_groups {
                 // Merge predicate-based filtering with byte range filtering (if present)
                 // by taking the intersection of both filters
                 selected_row_group_indices = match selected_row_group_indices {
-                    Some(byte_range_filtered) => {
-                        // Keep only row groups that are in both filters
-                        let intersection: Vec<usize> = byte_range_filtered
-                            .into_iter()
-                            .filter(|idx| predicate_filtered_row_groups.contains(idx))
-                            .collect();
-                        Some(intersection)
-                    }
-                    None => Some(predicate_filtered_row_groups),
+                    // Keep only row groups that are in both filters
+                    Some(byte_range_filtered) => Some(intersect_sorted(
+                        &byte_range_filtered,
+                        predicate_filtered_row_groups,
+                    )),
+                    None => Some(predicate_filtered_row_groups.clone()),
                 };
-            }
-
-            if self.bloom_filter_enabled {
-                let all_rgs;
-                let candidate_rgs = match &selected_row_group_indices {
-                    Some(indices) => indices.as_slice(),
-                    None => {
-                        all_rgs = (0..record_batch_stream_builder.metadata().num_row_groups())
-                            .collect::<Vec<_>>();
-                        &all_rgs
-                    }
-                };
-
-                let bloom_filtered = Self::filter_row_groups_by_bloom_filter(
-                    &predicate,
-                    &mut record_batch_stream_builder,
-                    candidate_rgs,
-                    &field_id_map,
-                )
-                .await?;
-
-                if bloom_filtered.len() < candidate_rgs.len() {
-                    selected_row_group_indices = Some(bloom_filtered);
-                }
-            }
-
-            if self.row_selection_enabled {
-                row_selection = ArrowReader::get_row_selection_for_filter_predicate(
-                    &predicate,
-                    record_batch_stream_builder.metadata(),
-                    &selected_row_group_indices,
-                    &field_id_map,
-                    task.schema(),
-                )?;
             }
         }
 
-        let positional_delete_indexes = delete_filter.get_delete_vector(&task);
+        if self.bloom_filter_enabled && !plans.is_empty() {
+            let all_rgs;
+            let candidate_rgs = match &selected_row_group_indices {
+                Some(indices) => indices.as_slice(),
+                None => {
+                    all_rgs = (0..stream_builder.metadata().num_row_groups()).collect::<Vec<_>>();
+                    &all_rgs
+                }
+            };
+
+            let bloom_filtered =
+                Self::filter_row_groups_by_bloom_filter(plans, stream_builder, candidate_rgs)
+                    .await?;
+
+            if bloom_filtered.len() < candidate_rgs.len() {
+                selected_row_group_indices = Some(bloom_filtered);
+            }
+        }
+
+        Ok(selected_row_group_indices)
+    }
+
+    /// Evaluates page indexes against planned predicates to prune pages within selected row groups.
+    fn select_pages_by_index(
+        &self,
+        task: &FileScanTask,
+        plans: &[PlannedPredicate],
+        metadata: &Arc<ParquetMetaData>,
+        selected_row_group_indices: &Option<Vec<usize>>,
+    ) -> Result<Option<RowSelection>> {
+        let mut row_selection = None;
+        if self.row_selection_enabled {
+            for plan in plans {
+                let selection = ArrowReader::get_row_selection_for_filter_predicate(
+                    &plan.predicate,
+                    metadata,
+                    selected_row_group_indices,
+                    &plan.field_id_map,
+                    task.schema(),
+                );
+                row_selection = intersect_page_selection(
+                    row_selection,
+                    selection,
+                    plan.advisory,
+                    task.data_file_path(),
+                )?;
+            }
+        }
+        Ok(row_selection)
+    }
+
+    /// Compiles active planned predicates into an Arrow RowFilter.
+    fn compile_row_filter(
+        task: &FileScanTask,
+        plans: &mut Vec<PlannedPredicate>,
+        parquet_schema: &SchemaDescriptor,
+        runtime_disabled: Arc<AtomicBool>,
+    ) -> Result<Option<RowFilter>> {
+        // The planned and runtime predicates form one Arrow predicate, so
+        // columns they share are decoded once and neither runs on the other's
+        // survivors.
+        let arrow_predicate = {
+            // Scoped so the builder borrow does not live across later awaits.
+            let row_filter_predicate = |plans: &[PlannedPredicate]| {
+                let predicates: Vec<_> = plans
+                    .iter()
+                    .filter(|plan| plan.row_filter)
+                    .map(|plan| {
+                        (
+                            plan.predicate.as_ref(),
+                            &plan.field_ids,
+                            &plan.field_id_map,
+                            plan.advisory,
+                        )
+                    })
+                    .collect();
+                ArrowReader::get_arrow_predicate(
+                    &predicates,
+                    parquet_schema,
+                    runtime_disabled.clone(),
+                )
+            };
+            if !plans.iter().any(|plan| plan.row_filter) {
+                None
+            } else {
+                match row_filter_predicate(plans) {
+                    Ok(arrow_predicate) => Some(arrow_predicate),
+                    Err(error) if plans.last().is_some_and(|plan| plan.advisory) => {
+                        tracing::debug!(
+                            "Skipping runtime predicate for {}: {error}",
+                            task.data_file_path()
+                        );
+                        plans.pop();
+                        if !plans.iter().any(|plan| plan.row_filter) {
+                            None
+                        } else {
+                            Some(row_filter_predicate(plans)?)
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        };
+
+        Ok(arrow_predicate.map(|arrow_predicate| RowFilter::new(vec![arrow_predicate])))
+    }
+
+    /// Merges positional delete row selections with the predicate row selection.
+    fn merge_positional_delete_selection(
+        task: &FileScanTask,
+        delete_filter: &DeleteFilter,
+        row_groups: &[RowGroupMetaData],
+        selected_row_group_indices: &Option<Vec<usize>>,
+        row_selection: Option<RowSelection>,
+    ) -> Result<Option<RowSelection>> {
+        let positional_delete_indexes = delete_filter.get_delete_vector(task);
 
         if let Some(positional_delete_indexes) = positional_delete_indexes {
             let delete_row_selection = {
                 let positional_delete_indexes = positional_delete_indexes.lock().unwrap();
 
                 ArrowReader::build_deletes_row_selection(
-                    record_batch_stream_builder.metadata().row_groups(),
-                    &selected_row_group_indices,
+                    row_groups,
+                    selected_row_group_indices,
                     &positional_delete_indexes,
                 )
             }?;
 
             // merge the row selection from the delete files with the row selection
             // from the filter predicate, if there is one from the filter predicate
-            row_selection = match row_selection {
+            Ok(match row_selection {
                 None => Some(delete_row_selection),
                 Some(filter_row_selection) => {
                     Some(filter_row_selection.intersection(&delete_row_selection))
                 }
-            };
+            })
+        } else {
+            Ok(row_selection)
         }
+    }
 
-        if let Some(row_selection) = row_selection {
-            record_batch_stream_builder =
-                record_batch_stream_builder.with_row_selection(row_selection);
-        }
+    /// Builds the final Arrow record-batch stream using a push decoder or standard reader.
+    fn build_record_batch_stream(self, cx: StreamContext<'_>) -> Result<ArrowRecordBatchStream> {
+        let StreamContext {
+            task,
+            projection,
+            selected_row_group_indices,
+            row_selection,
+            row_filter,
+            plans,
+            observed_generation,
+            runtime_disabled,
+        } = cx;
 
-        if let Some(selected_row_group_indices) = selected_row_group_indices {
-            record_batch_stream_builder =
-                record_batch_stream_builder.with_row_groups(selected_row_group_indices);
-        }
+        let first_row_id = task.first_row_id();
+        let project_row_id = projection.project_row_id;
+        let mut record_batch_transformer = projection.record_batch_transformer;
 
         // Build the batch stream and send all the RecordBatches that it generates
         // to the requester. When `_row_id` is projected, synthesize it over the raw parquet
         // batches (using the reader-produced `_pos` position) before the transformer, which
         // then passes it through as a virtual field.
-        let first_row_id = task.first_row_id();
-        let record_batch_stream = record_batch_stream_builder.build()?.map(move |batch| {
-            let mut batch = batch.map_err(|err| -> Error { err.into() })?;
+        let raw_stream: ArrowRecordBatchStream = if let Some(live_file_reader) =
+            projection.live_file_reader
+        {
+            let metadata = projection
+                .live_metadata
+                .expect("metadata retained for live-capable task");
+            let row_groups = selected_row_group_indices
+                .unwrap_or_else(|| (0..metadata.metadata().num_row_groups()).collect());
+            if row_groups.is_empty() {
+                // No group can match; an empty selection list must not mean "all".
+                Box::pin(futures::stream::empty())
+            } else {
+                let mut selections =
+                    split_row_selection(metadata.metadata(), &row_groups, row_selection);
+                // A bound that tightens toward large values prunes the rest of the file once
+                // its largest row groups are read; a file sorted by the column is otherwise
+                // read from its smallest values up and nothing is pruned.
+                if let Some(name) = self
+                    .runtime_predicates
+                    .as_ref()
+                    .and_then(|predicates| predicates.largest_first_column())
+                    && let Some(field) = if task.case_sensitive() {
+                        task.schema().field_by_name(&name)
+                    } else {
+                        task.schema().field_by_name_case_insensitive(&name)
+                    }
+                    && let Ok(Some(columns)) =
+                        build_field_id_map(metadata.metadata().file_metadata().schema_descr())
+                    && let Some(&column) = columns.get(&field.id)
+                {
+                    order_by_descending_maximum(&mut selections, metadata.metadata(), column);
+                }
+                let mut builder = ParquetPushDecoderBuilder::new_with_metadata(metadata.clone())
+                    .with_projection(projection.projection_mask)
+                    .with_row_group_selections(selections.clone());
+                if let Some(batch_size) = self.batch_size {
+                    builder = builder.with_batch_size(batch_size);
+                }
+                if let Some(row_filter) = row_filter {
+                    builder = builder.with_row_filter(row_filter);
+                }
+                let resolve = |plan: &PlannedPredicate| ResolvedPredicate {
+                    predicate: plan.predicate.clone(),
+                    field_ids: plan.field_ids.clone(),
+                    field_id_map: plan.field_id_map.clone(),
+                };
+                let refresh = BoundaryRefresh {
+                    predicates: self
+                        .runtime_predicates
+                        .clone()
+                        .expect("provider configured for live-capable task"),
+                    seen_generation: observed_generation.unwrap_or_default(),
+                    runtime_disabled,
+                    planned: plans
+                        .iter()
+                        .find(|plan| !plan.advisory && plan.row_filter)
+                        .map(resolve),
+                    runtime: plans.iter().find(|plan| plan.advisory).map(resolve),
+                    row_selection_enabled: self.row_selection_enabled,
+                    task,
+                    use_position_fallback: projection.use_position_fallback,
+                    metrics: self.scan_metrics.clone(),
+                };
+                RuntimePrunedStream::new(
+                    builder.build()?,
+                    live_file_reader,
+                    metadata,
+                    selections,
+                    refresh,
+                )
+                .into_stream()
+            }
+        } else {
+            let mut record_batch_stream_builder = projection.record_batch_stream_builder;
+            if let Some(row_selection) = row_selection {
+                record_batch_stream_builder =
+                    record_batch_stream_builder.with_row_selection(row_selection);
+            }
+            if let Some(row_groups) = selected_row_group_indices {
+                record_batch_stream_builder =
+                    record_batch_stream_builder.with_row_groups(row_groups);
+            }
+            if let Some(row_filter) = row_filter {
+                record_batch_stream_builder =
+                    record_batch_stream_builder.with_row_filter(row_filter);
+            }
+            Box::pin(record_batch_stream_builder.build()?.map_err(Error::from))
+        };
+
+        let record_batch_stream = raw_stream.map(move |batch| {
+            let mut batch = batch?;
             if project_row_id {
                 batch = synthesize_row_id_column(batch, first_row_id)?;
             }
@@ -697,22 +1105,257 @@ impl FileScanTaskReader {
         })
     }
 
-    /// Reads bloom filters for relevant columns and evaluates the predicate
-    /// against them to filter out row groups that definitely don't match.
-    async fn filter_row_groups_by_bloom_filter(
+    /// Validates only bounds used by this predicate. Statistics for a dropped
+    /// or promoted, unrelated field cannot invalidate pruning of another field.
+    fn file_bounds_match_predicate(
         predicate: &BoundPredicate,
+        metrics: &FileScanTaskMetrics,
+    ) -> bool {
+        let reference = match predicate {
+            BoundPredicate::AlwaysTrue | BoundPredicate::AlwaysFalse => return true,
+            BoundPredicate::And(expression) | BoundPredicate::Or(expression) => {
+                return expression
+                    .inputs()
+                    .iter()
+                    .all(|input| Self::file_bounds_match_predicate(input, metrics));
+            }
+            BoundPredicate::Not(expression) => {
+                return Self::file_bounds_match_predicate(expression.inputs()[0], metrics);
+            }
+            BoundPredicate::Unary(expression) => expression.term(),
+            BoundPredicate::Binary(expression) => expression.term(),
+            BoundPredicate::Set(expression) => expression.term(),
+        };
+        let field = reference.field();
+        metrics
+            .lower_bounds()
+            .get(&field.id)
+            .iter()
+            .chain(metrics.upper_bounds().get(&field.id).iter())
+            .all(|bound| field.field_type.as_primitive_type() == Some(bound.data_type()))
+    }
+
+    /// Whether a file's whole-file statistics allow a row to match `predicate`.
+    /// Statistics whose type does not match the task schema, for example after
+    /// a column was promoted, and evaluation errors keep the file.
+    fn file_might_match(
+        predicate: &BoundPredicate,
+        metrics: &FileScanTaskMetrics,
+        task: &FileScanTask,
+    ) -> bool {
+        let bounds_match_schema = Self::file_bounds_match_predicate(predicate, metrics);
+        if !bounds_match_schema {
+            return true;
+        }
+        InclusiveMetricsEvaluator::eval_metrics(predicate, metrics.into(), false).unwrap_or_else(
+            |error| {
+                tracing::debug!(
+                    "Skipping runtime file pruning for {}: {error}",
+                    task.data_file_path()
+                );
+                true
+            },
+        )
+    }
+
+    /// Checks whether floating-point comparisons for Binary and Set predicates
+    /// can safely skip Arrow row filtering when strict metrics prove all rows match.
+    ///
+    /// Iceberg literal comparisons and Arrow row kernels can differ for NaNs.
+    /// NaNs and signed zero conservatively retain row filtering. The shortcut is safe only when:
+    /// - `nan_value_counts` is present and == 0 (guaranteeing no NaNs exist in the file);
+    /// - No predicate literal is NaN (any payload or sign);
+    /// - No predicate literal is ±0.0, AND lower and upper bounds are both present and the
+    ///   interval excludes 0.0 (lower > 0 or upper < 0), so signed-zero ordering cannot matter.
+    fn float_predicate_semantics_match<'a>(
+        field_id: i32,
+        literals: impl Iterator<Item = &'a Datum>,
+        metrics: &FileScanTaskMetrics,
+    ) -> bool {
+        if metrics.nan_value_counts().get(&field_id) != Some(&0) {
+            return false;
+        }
+
+        for literal in literals {
+            if literal.is_nan() {
+                return false;
+            }
+            match literal.literal() {
+                PrimitiveLiteral::Float(val) if val.0 == 0.0_f32 => return false,
+                PrimitiveLiteral::Double(val) if val.0 == 0.0_f64 => return false,
+                _ => {}
+            }
+        }
+
+        let (Some(lower), Some(upper)) = (
+            metrics.lower_bounds().get(&field_id),
+            metrics.upper_bounds().get(&field_id),
+        ) else {
+            return false;
+        };
+
+        match (lower.literal(), upper.literal()) {
+            (PrimitiveLiteral::Float(lower_val), PrimitiveLiteral::Float(upper_val)) => {
+                lower_val.0 > 0.0_f32 || upper_val.0 < 0.0_f32
+            }
+            (PrimitiveLiteral::Double(lower_val), PrimitiveLiteral::Double(upper_val)) => {
+                lower_val.0 > 0.0_f64 || upper_val.0 < 0.0_f64
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether whole-file statistics prove that every row of the file satisfies `predicate`,
+    /// so its row filter would only confirm it. Statistics whose type does not match the task
+    /// schema, and evaluation errors, answer no, which only costs the row filter.
+    /// Floating-point binary and set predicates keep their row filters unless provably safe:
+    /// strict inequalities use `Datum` total order, while equality and membership use
+    /// `PrimitiveLiteral` (NaN payloads equal). Both can disagree with Arrow kernels on NaN
+    /// and signed zero. String and binary comparisons also keep their row filters:
+    /// Iceberg bounds may be truncated and are used only for inclusive pruning.
+    fn file_always_matches(predicate: &BoundPredicate, metrics: &FileScanTaskMetrics) -> bool {
+        let bounds_match_schema = Self::file_bounds_match_predicate(predicate, metrics);
+        // Iceberg's strict evaluator treats null as matching negative equality
+        // and membership predicates. Arrow's row kernels return null instead,
+        // which the row filter drops. Keep those filters unless their columns
+        // are explicitly known to contain no nulls, including inside OR trees.
+        fn row_filter_semantics_match(
+            predicate: &BoundPredicate,
+            metrics: &FileScanTaskMetrics,
+        ) -> bool {
+            match predicate {
+                BoundPredicate::And(expression) | BoundPredicate::Or(expression) => expression
+                    .inputs()
+                    .iter()
+                    .all(|input| row_filter_semantics_match(input, metrics)),
+                BoundPredicate::Not(_) => false,
+                BoundPredicate::Binary(expression) => {
+                    if expression.term().field().field_type.is_floating_type()
+                        && !FileScanTaskReader::float_predicate_semantics_match(
+                            expression.term().field().id,
+                            std::iter::once(expression.literal()),
+                            metrics,
+                        )
+                    {
+                        return false;
+                    }
+                    if matches!(
+                        expression.term().field().field_type.as_primitive_type(),
+                        Some(
+                            PrimitiveType::String | PrimitiveType::Binary | PrimitiveType::Fixed(_)
+                        )
+                    ) {
+                        return false;
+                    }
+                    if expression.op() == PredicateOperator::NotEq {
+                        metrics
+                            .null_value_counts()
+                            .get(&expression.term().field().id)
+                            == Some(&0)
+                    } else {
+                        true
+                    }
+                }
+                BoundPredicate::Set(expression) => {
+                    if expression.term().field().field_type.is_floating_type()
+                        && !FileScanTaskReader::float_predicate_semantics_match(
+                            expression.term().field().id,
+                            expression.literals().iter(),
+                            metrics,
+                        )
+                    {
+                        return false;
+                    }
+                    if matches!(
+                        expression.term().field().field_type.as_primitive_type(),
+                        Some(
+                            PrimitiveType::String | PrimitiveType::Binary | PrimitiveType::Fixed(_)
+                        )
+                    ) {
+                        return false;
+                    }
+                    if expression.op() == PredicateOperator::NotIn {
+                        metrics
+                            .null_value_counts()
+                            .get(&expression.term().field().id)
+                            == Some(&0)
+                    } else {
+                        true
+                    }
+                }
+                _ => true,
+            }
+        }
+        bounds_match_schema
+            && row_filter_semantics_match(predicate, metrics)
+            && StrictMetricsEvaluator::eval_metrics(predicate, metrics.into()).unwrap_or(false)
+    }
+
+    /// Resolves `predicate` against the file and plans its row-group selection.
+    fn plan_predicate(
+        &self,
+        predicate: Arc<BoundPredicate>,
+        advisory: bool,
+        builder: &ParquetRecordBatchStreamBuilder<ArrowFileReader>,
+        task: &FileScanTask,
+        use_position_fallback: bool,
+    ) -> Result<PlannedPredicate> {
+        let (iceberg_field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
+            builder.parquet_schema(),
+            builder.schema(),
+            &predicate,
+            use_position_fallback,
+        )?;
+        let row_groups = if self.row_group_filtering_enabled {
+            Some(ArrowReader::get_selected_row_group_indices(
+                &predicate,
+                builder.metadata(),
+                &field_id_map,
+                task.schema(),
+            )?)
+        } else {
+            None
+        };
+        if self.bloom_filter_enabled {
+            collect_bloom_filter_field_ids(&predicate)?;
+        }
+        // This proof applies equally to planned filters, equality-delete
+        // predicates and advisory runtime bounds. Keep the group/page plan,
+        // but avoid decoding predicate-only columns just to confirm every row.
+        let row_filter = !task
+            .file_metrics()
+            .is_some_and(|metrics| Self::file_always_matches(&predicate, metrics));
+        Ok(PlannedPredicate {
+            predicate,
+            field_ids: iceberg_field_ids,
+            field_id_map,
+            row_groups,
+            advisory,
+            row_filter,
+        })
+    }
+
+    /// Reads bloom filters for relevant columns and evaluates each predicate
+    /// against them to filter out row groups that definitely don't match. A
+    /// column's filter is read at most once per row group, even when several
+    /// predicates use it.
+    async fn filter_row_groups_by_bloom_filter(
+        plans: &[PlannedPredicate],
         builder: &mut ParquetRecordBatchStreamBuilder<ArrowFileReader>,
         candidate_row_groups: &[usize],
-        field_id_map: &HashMap<i32, usize>,
     ) -> Result<Vec<usize>> {
         // Only collect field IDs from eq/in predicates — the only types
         // bloom filters can help with. Skip columns not in the parquet schema.
-        let bloom_filter_field_ids: Vec<i32> = collect_bloom_filter_field_ids(predicate)?
-            .into_iter()
-            .filter(|id| field_id_map.contains_key(id))
-            .collect();
+        let mut bloom_filter_field_ids = Vec::with_capacity(plans.len());
+        for plan in plans {
+            let field_ids: Vec<i32> = collect_bloom_filter_field_ids(&plan.predicate)?
+                .into_iter()
+                .filter(|id| plan.field_id_map.contains_key(id))
+                .collect();
+            bloom_filter_field_ids.push(field_ids);
+        }
 
-        if bloom_filter_field_ids.is_empty() {
+        if bloom_filter_field_ids.iter().all(Vec::is_empty) {
             return Ok(candidate_row_groups.to_vec());
         }
 
@@ -720,53 +1363,81 @@ impl FileScanTaskReader {
 
         for &rg_idx in candidate_row_groups {
             let mut bloom_filters: HashMap<i32, ColumnBloomFilter> = HashMap::new();
+            let mut attempted: HashSet<i32> = HashSet::new();
+            let mut might_match = true;
 
-            for &field_id in &bloom_filter_field_ids {
-                let col_idx = field_id_map[&field_id];
-                let col_meta = builder.metadata().row_group(rg_idx).column(col_idx);
-
-                // Only attempt to load if this column chunk actually has a bloom filter
-                if col_meta.bloom_filter_offset().is_none() {
+            for (plan, field_ids) in plans.iter().zip(&bloom_filter_field_ids) {
+                if field_ids.is_empty() {
                     continue;
                 }
-
-                let physical_type = col_meta.column_type();
-                let type_length = col_meta.column_descr().type_length();
-
-                match builder
-                    .get_row_group_column_bloom_filter(rg_idx, col_idx)
-                    .await
-                {
-                    Ok(Some(sbbf)) => {
-                        bloom_filters.insert(
-                            field_id,
-                            ColumnBloomFilter::new(sbbf, physical_type, type_length),
-                        );
+                for &field_id in field_ids {
+                    if !attempted.insert(field_id) {
+                        continue;
                     }
-                    Ok(None) => {}
+                    let col_idx = plan.field_id_map[&field_id];
+                    let col_meta = builder.metadata().row_group(rg_idx).column(col_idx);
+
+                    // Only attempt to load if this column chunk actually has a bloom filter
+                    if col_meta.bloom_filter_offset().is_none() {
+                        continue;
+                    }
+
+                    let physical_type = col_meta.column_type();
+                    let type_length = col_meta.column_descr().type_length();
+
+                    match builder
+                        .get_row_group_column_bloom_filter(rg_idx, col_idx)
+                        .await
+                    {
+                        Ok(Some(sbbf)) => {
+                            bloom_filters.insert(
+                                field_id,
+                                ColumnBloomFilter::new(sbbf, physical_type, type_length),
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            // Left absent from the map, so the evaluator treats the column
+                            // as might-match and the row group survives.
+                            tracing::debug!(
+                                "Bloom filter for field {field_id} in row group {rg_idx} could not be read: {e}"
+                            );
+                        }
+                    }
+                }
+
+                match BloomFilterEvaluator::eval(&plan.predicate, &bloom_filters) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // Row group pruned by bloom filter
+                        might_match = false;
+                        break;
+                    }
                     Err(e) => {
-                        // Left absent from the map, so the evaluator treats the column
-                        // as might-match and the row group survives.
                         tracing::debug!(
-                            "Bloom filter for field {field_id} in row group {rg_idx} could not be read: {e}"
+                            "Bloom filter evaluation failed for row group {rg_idx}, including it: {e}"
                         );
                     }
                 }
             }
 
-            match BloomFilterEvaluator::eval(predicate, &bloom_filters) {
-                Ok(true) => result.push(rg_idx),
-                Ok(false) => { /* Row group pruned by bloom filter */ }
-                Err(e) => {
-                    tracing::debug!(
-                        "Bloom filter evaluation failed for row group {rg_idx}, including it: {e}"
-                    );
-                    result.push(rg_idx);
-                }
+            if might_match {
+                result.push(rg_idx);
             }
         }
 
         Ok(result)
+    }
+}
+
+/// Whether a Parquet error wraps a retryable storage error. `ArrowFileReader` reports storage
+/// failures as an external [`Error`], so a retryable read stays retryable through Parquet.
+pub(crate) fn parquet_error_is_retryable(error: &parquet::errors::ParquetError) -> bool {
+    match error {
+        parquet::errors::ParquetError::External(source) => {
+            source.downcast_ref::<Error>().is_some_and(Error::retryable)
+        }
+        _ => false,
     }
 }
 
@@ -812,7 +1483,9 @@ impl ArrowReader {
         let arrow_metadata = ArrowReaderMetadata::load_async(&mut reader, arrow_reader_options)
             .await
             .map_err(|e| {
-                Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata").with_source(e)
+                Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata")
+                    .with_retryable(parquet_error_is_retryable(&e))
+                    .with_source(e)
             })?;
 
         Ok((reader, arrow_metadata))
@@ -847,6 +1520,28 @@ impl ArrowReader {
     }
 }
 
+/// Stably orders row-group selections by the descending maximum statistic of an integer
+/// `column` (dates are stored as int32). Groups without such a statistic keep their order
+/// after the ranked ones.
+fn order_by_descending_maximum(
+    selections: &mut [RowGroupSelection],
+    metadata: &ParquetMetaData,
+    column: usize,
+) {
+    let maximum = |selection: &RowGroupSelection| -> Option<i64> {
+        let group = metadata.row_groups().get(selection.row_group_index())?;
+        match group.columns().get(column)?.statistics()? {
+            Statistics::Int32(stats) => stats.max_opt().map(|value| i64::from(*value)),
+            Statistics::Int64(stats) => stats.max_opt().copied(),
+            _ => None,
+        }
+    };
+    selections.sort_by_key(|selection| {
+        let maximum = maximum(selection);
+        (maximum.is_none(), std::cmp::Reverse(maximum))
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -866,13 +1561,574 @@ mod tests {
     use crate::Runtime;
     use crate::arrow::ArrowReaderBuilder;
     use crate::arrow::test_utils::write_encrypted_parquet;
+    use crate::expr::{Bind, Reference};
     use crate::io::FileIO;
     use crate::metadata_columns::{
         RESERVED_COL_NAME_POS, RESERVED_COL_NAME_ROW_ID, RESERVED_FIELD_ID_FILE,
         RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID,
     };
-    use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
-    use crate::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, SchemaRef, Type};
+    use crate::scan::{
+        FileScanTask, FileScanTaskDeleteFile, FileScanTaskMetrics, FileScanTaskStream,
+    };
+    use crate::spec::{DataFileFormat, Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type};
+
+    #[test]
+    fn file_always_matches_keeps_floating_point_comparisons() {
+        for (field_type, nan, negative_zero, positive_zero, one) in [
+            (
+                PrimitiveType::Float,
+                Datum::float(f32::NAN),
+                Datum::float(-0.0_f32),
+                Datum::float(0.0_f32),
+                Datum::float(1.0_f32),
+            ),
+            (
+                PrimitiveType::Double,
+                Datum::double(f64::NAN),
+                Datum::double(-0.0),
+                Datum::double(0.0),
+                Datum::double(1.0),
+            ),
+        ] {
+            let schema = Arc::new(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::optional(1, "key", Type::Primitive(field_type)).into(),
+                    ])
+                    .build()
+                    .unwrap(),
+            );
+            for nan_count in [1, 2] {
+                let bounds = if nan_count == 2 {
+                    HashMap::new()
+                } else {
+                    HashMap::from([(1, negative_zero.clone())])
+                };
+                let metrics = FileScanTaskMetrics::builder()
+                    .with_record_count(Some(2))
+                    .with_value_counts(HashMap::from([(1, 2)]))
+                    .with_null_value_counts(HashMap::from([(1, 0)]))
+                    .with_nan_value_counts(HashMap::from([(1, nan_count)]))
+                    .with_lower_bounds(bounds.clone())
+                    .with_upper_bounds(bounds)
+                    .build();
+                for predicate in [
+                    Reference::new("key").not_equal_to(nan.clone()),
+                    Reference::new("key").is_not_in([nan.clone(), one.clone()]),
+                ] {
+                    let predicate = predicate.bind(schema.clone(), false).unwrap();
+                    assert!(
+                        super::StrictMetricsEvaluator::eval_metrics(&predicate, (&metrics).into())
+                            .unwrap()
+                    );
+                    assert!(!super::FileScanTaskReader::file_always_matches(
+                        &predicate, &metrics
+                    ));
+                }
+            }
+            let metrics = FileScanTaskMetrics::builder()
+                .with_record_count(Some(2))
+                .with_value_counts(HashMap::from([(1, 2)]))
+                .with_null_value_counts(HashMap::from([(1, 0)]))
+                .with_nan_value_counts(HashMap::from([(1, 0)]))
+                .with_lower_bounds(HashMap::from([(1, negative_zero.clone())]))
+                .with_upper_bounds(HashMap::from([(1, negative_zero)]))
+                .build();
+            for predicate in [
+                Reference::new("key").equal_to(positive_zero.clone()),
+                Reference::new("key").is_in([positive_zero, nan]),
+            ] {
+                let predicate = predicate.bind(schema.clone(), false).unwrap();
+                assert!(
+                    !super::StrictMetricsEvaluator::eval_metrics(&predicate, (&metrics).into())
+                        .unwrap()
+                );
+                assert!(!super::FileScanTaskReader::file_always_matches(
+                    &predicate, &metrics
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn file_always_matches_allows_safe_floating_point_comparisons() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "key", Type::Primitive(PrimitiveType::Float)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        // Safe baseline: no NaNs, no nulls, positive bounds [2.0, 5.0], predicate > 1.0.
+        let safe_metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_nan_value_counts(HashMap::from([(1, 0)]))
+            .with_lower_bounds(HashMap::from([(1, Datum::float(2.0_f32))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::float(5.0_f32))]))
+            .build();
+        let safe_predicate = Reference::new("key")
+            .greater_than(Datum::float(1.0_f32))
+            .bind(schema.clone(), false)
+            .unwrap();
+        assert!(
+            super::StrictMetricsEvaluator::eval_metrics(&safe_predicate, (&safe_metrics).into(),)
+                .unwrap()
+        );
+        assert!(super::FileScanTaskReader::file_always_matches(
+            &safe_predicate,
+            &safe_metrics,
+        ));
+
+        // Unsafe variation: nan_count > 0.
+        let nan_metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_nan_value_counts(HashMap::from([(1, 1)]))
+            .with_lower_bounds(HashMap::from([(1, Datum::float(2.0_f32))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::float(5.0_f32))]))
+            .build();
+        assert!(!super::FileScanTaskReader::file_always_matches(
+            &safe_predicate,
+            &nan_metrics,
+        ));
+
+        // Unsafe variation: nan_count missing.
+        let missing_nan_metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_nan_value_counts(HashMap::new())
+            .with_lower_bounds(HashMap::from([(1, Datum::float(2.0_f32))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::float(5.0_f32))]))
+            .build();
+        assert!(!super::FileScanTaskReader::file_always_matches(
+            &safe_predicate,
+            &missing_nan_metrics,
+        ));
+
+        // Unsafe variation: NaN literal.
+        let nan_pred = Reference::new("key")
+            .greater_than(Datum::float(f32::NAN))
+            .bind(schema.clone(), false)
+            .unwrap();
+        assert!(!super::FileScanTaskReader::file_always_matches(
+            &nan_pred,
+            &safe_metrics,
+        ));
+
+        // Unsafe variation: ±0 literal.
+        for zero_literal in [0.0_f32, -0.0_f32] {
+            let zero_pred = Reference::new("key")
+                .greater_than(Datum::float(zero_literal))
+                .bind(schema.clone(), false)
+                .unwrap();
+            assert!(!super::FileScanTaskReader::file_always_matches(
+                &zero_pred,
+                &safe_metrics,
+            ));
+        }
+
+        // Unsafe variation: bounds straddling 0.
+        let straddling_metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_nan_value_counts(HashMap::from([(1, 0)]))
+            .with_lower_bounds(HashMap::from([(1, Datum::float(-1.0_f32))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::float(5.0_f32))]))
+            .build();
+        let straddling_pred = Reference::new("key")
+            .not_equal_to(Datum::float(10.0_f32))
+            .bind(schema.clone(), false)
+            .unwrap();
+        assert!(
+            super::StrictMetricsEvaluator::eval_metrics(
+                &straddling_pred,
+                (&straddling_metrics).into(),
+            )
+            .unwrap()
+        );
+        assert!(!super::FileScanTaskReader::file_always_matches(
+            &straddling_pred,
+            &straddling_metrics,
+        ));
+
+        // Unsafe variation: bounds missing.
+        let missing_bounds_metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_nan_value_counts(HashMap::from([(1, 0)]))
+            .with_lower_bounds(HashMap::new())
+            .with_upper_bounds(HashMap::new())
+            .build();
+        assert!(!super::FileScanTaskReader::file_always_matches(
+            &safe_predicate,
+            &missing_bounds_metrics,
+        ));
+
+        // Unsafe variation: NotEq with nulls.
+        let null_metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 1)]))
+            .with_nan_value_counts(HashMap::from([(1, 0)]))
+            .with_lower_bounds(HashMap::from([(1, Datum::float(2.0_f32))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::float(5.0_f32))]))
+            .build();
+        let not_eq_pred = Reference::new("key")
+            .not_equal_to(Datum::float(1.0_f32))
+            .bind(schema.clone(), false)
+            .unwrap();
+        assert!(
+            super::StrictMetricsEvaluator::eval_metrics(&not_eq_pred, (&null_metrics).into(),)
+                .unwrap()
+        );
+        assert!(!super::FileScanTaskReader::file_always_matches(
+            &not_eq_pred,
+            &null_metrics,
+        ));
+        assert!(super::FileScanTaskReader::file_always_matches(
+            &not_eq_pred,
+            &safe_metrics,
+        ));
+
+        // Safe Set predicate: IS IN [2.0, 3.0] where bounds are [2.0, 2.0].
+        let single_val_metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_nan_value_counts(HashMap::from([(1, 0)]))
+            .with_lower_bounds(HashMap::from([(1, Datum::float(2.0_f32))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::float(2.0_f32))]))
+            .build();
+        let in_pred = Reference::new("key")
+            .is_in([Datum::float(2.0_f32), Datum::float(3.0_f32)])
+            .bind(schema.clone(), false)
+            .unwrap();
+        assert!(super::FileScanTaskReader::file_always_matches(
+            &in_pred,
+            &single_val_metrics,
+        ));
+
+        // Unsafe Set predicate with 0.0 literal.
+        let in_zero_pred = Reference::new("key")
+            .is_in([Datum::float(0.0_f32), Datum::float(2.0_f32)])
+            .bind(schema.clone(), false)
+            .unwrap();
+        assert!(!super::FileScanTaskReader::file_always_matches(
+            &in_zero_pred,
+            &single_val_metrics,
+        ));
+
+        // Double precision safe case: bounds [2.0, 5.0], predicate > 1.0.
+        let double_schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "key", Type::Primitive(PrimitiveType::Double)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let double_metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_nan_value_counts(HashMap::from([(1, 0)]))
+            .with_lower_bounds(HashMap::from([(1, Datum::double(2.0_f64))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::double(5.0_f64))]))
+            .build();
+        let double_pred = Reference::new("key")
+            .greater_than(Datum::double(1.0_f64))
+            .bind(double_schema, false)
+            .unwrap();
+        assert!(super::FileScanTaskReader::file_always_matches(
+            &double_pred,
+            &double_metrics,
+        ));
+    }
+
+    #[test]
+    fn file_always_matches_keeps_string_and_binary_comparisons() {
+        for (field_type, value, other) in [
+            (
+                PrimitiveType::String,
+                Datum::string("prefix"),
+                Datum::string("z"),
+            ),
+            (
+                PrimitiveType::Binary,
+                Datum::binary(b"prefix".iter().copied()),
+                Datum::binary(b"z".iter().copied()),
+            ),
+        ] {
+            let schema = Arc::new(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::optional(1, "key", Type::Primitive(field_type)).into(),
+                    ])
+                    .build()
+                    .unwrap(),
+            );
+            let metrics = FileScanTaskMetrics::builder()
+                .with_record_count(Some(2))
+                .with_value_counts(HashMap::from([(1, 2)]))
+                .with_null_value_counts(HashMap::from([(1, 0)]))
+                .with_nan_value_counts(HashMap::new())
+                .with_lower_bounds(HashMap::from([(1, value.clone())]))
+                .with_upper_bounds(HashMap::from([(1, value.clone())]))
+                .build();
+            for predicate in [
+                Reference::new("key").equal_to(value.clone()),
+                Reference::new("key").not_equal_to(other.clone()),
+                Reference::new("key").less_than(other.clone()),
+                Reference::new("key").less_than_or_equal_to(value.clone()),
+                Reference::new("key").greater_than_or_equal_to(value.clone()),
+                Reference::new("key").is_in([value.clone(), other.clone()]),
+                Reference::new("key").is_not_in([other.clone()]),
+                Reference::new("key")
+                    .equal_to(value.clone())
+                    .and(Reference::new("key").is_not_null()),
+                Reference::new("key")
+                    .equal_to(value.clone())
+                    .or(Reference::new("key").is_null()),
+            ] {
+                let predicate = predicate.bind(schema.clone(), false).unwrap();
+                assert!(
+                    super::StrictMetricsEvaluator::eval_metrics(&predicate, (&metrics).into())
+                        .unwrap()
+                );
+                assert!(!super::FileScanTaskReader::file_always_matches(
+                    &predicate, &metrics
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn file_always_matches_rejects_nan_payloads_and_signs() {
+        let float_payloads =
+            (0..23)
+                .map(|bit| 1_u32 << bit)
+                .chain([0x003f_ffff, 0x0040_0001, 0x007f_ffff]);
+        let double_payloads = (0..52).map(|bit| 1_u64 << bit).chain([
+            0x0007_ffff_ffff_ffff,
+            0x0008_0000_0000_0001,
+            0x000f_ffff_ffff_ffff,
+        ]);
+        let float_nans = float_payloads.flat_map(|payload| {
+            [0, 0x8000_0000].map(|sign| Datum::float(f32::from_bits(sign | 0x7f80_0000 | payload)))
+        });
+        let double_nans = double_payloads.flat_map(|payload| {
+            [0, 0x8000_0000_0000_0000]
+                .map(|sign| Datum::double(f64::from_bits(sign | 0x7ff0_0000_0000_0000 | payload)))
+        });
+        for (field_type, one, nans) in [
+            (
+                PrimitiveType::Float,
+                Datum::float(1.0_f32),
+                float_nans.collect::<Vec<_>>(),
+            ),
+            (
+                PrimitiveType::Double,
+                Datum::double(1.0),
+                double_nans.collect::<Vec<_>>(),
+            ),
+        ] {
+            let schema = Arc::new(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::optional(1, "key", Type::Primitive(field_type)).into(),
+                    ])
+                    .build()
+                    .unwrap(),
+            );
+            let metrics = FileScanTaskMetrics::builder()
+                .with_record_count(Some(2))
+                .with_value_counts(HashMap::from([(1, 2)]))
+                .with_null_value_counts(HashMap::from([(1, 0)]))
+                .with_nan_value_counts(HashMap::from([(1, 0)]))
+                .with_lower_bounds(HashMap::from([(1, one.clone())]))
+                .with_upper_bounds(HashMap::from([(1, one)]))
+                .build();
+            for nan in nans {
+                assert!(nan.is_nan());
+                for predicate in [
+                    Reference::new("key").equal_to(nan.clone()),
+                    Reference::new("key").not_equal_to(nan.clone()),
+                    Reference::new("key").less_than(nan.clone()),
+                    Reference::new("key").less_than_or_equal_to(nan.clone()),
+                    Reference::new("key").greater_than(nan.clone()),
+                    Reference::new("key").greater_than_or_equal_to(nan.clone()),
+                    Reference::new("key").is_in([nan.clone()]),
+                    Reference::new("key").is_not_in([nan]),
+                ] {
+                    let predicate = predicate.bind(schema.clone(), false).unwrap();
+                    assert!(!super::FileScanTaskReader::file_always_matches(
+                        &predicate, &metrics
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn file_always_matches_rejects_promoted_negative_predicate_bounds() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "key", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_lower_bounds(HashMap::from([(1, Datum::int(2))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::int(3))]))
+            .build();
+        for predicate in [
+            Reference::new("key").not_equal_to(Datum::long(1)),
+            Reference::new("key").is_not_in([Datum::long(1)]),
+        ] {
+            let predicate = predicate.bind(schema.clone(), false).unwrap();
+            assert!(
+                super::StrictMetricsEvaluator::eval_metrics(&predicate, (&metrics).into()).unwrap()
+            );
+            assert!(!super::FileScanTaskReader::file_always_matches(
+                &predicate, &metrics
+            ));
+        }
+    }
+
+    #[test]
+    fn truncated_binary_bounds_remain_inclusive_and_keep_row_filter() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "key", Type::Primitive(PrimitiveType::Binary)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_lower_bounds(HashMap::from([(1, Datum::binary(*b"abcdefghijklmnop"))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::binary(*b"abcdefghijklmnoq"))]))
+            .build();
+        for predicate in [
+            Reference::new("key").equal_to(Datum::binary(*b"abcdefghijklmnop-first")),
+            Reference::new("key").is_in([Datum::binary(*b"abcdefghijklmnop-last")]),
+            Reference::new("key").greater_than_or_equal_to(Datum::binary(*b"abcdefghijklmnop")),
+            Reference::new("key").less_than_or_equal_to(Datum::binary(*b"abcdefghijklmnoq")),
+        ] {
+            let predicate = predicate.bind(schema.clone(), false).unwrap();
+            assert!(
+                super::InclusiveMetricsEvaluator::eval_metrics(
+                    &predicate,
+                    (&metrics).into(),
+                    false
+                )
+                .unwrap()
+            );
+            assert!(!super::FileScanTaskReader::file_always_matches(
+                &predicate, &metrics
+            ));
+        }
+        let outside = Reference::new("key")
+            .equal_to(Datum::binary(*b"z-outside"))
+            .bind(schema, false)
+            .unwrap();
+        assert!(
+            !super::InclusiveMetricsEvaluator::eval_metrics(&outside, (&metrics).into(), false)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn truncated_string_bounds_remain_inclusive_and_keep_row_filter() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "key", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        // Actual values differ after the first sixteen characters. The lower bound is
+        // truncated down and the upper bound rounded up, so neither is an exact value.
+        let metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_nan_value_counts(HashMap::new())
+            .with_lower_bounds(HashMap::from([(1, Datum::string("abcdefghijklmnop"))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::string("abcdefghijklmnoq"))]))
+            .build();
+        for predicate in [
+            Reference::new("key").equal_to(Datum::string("abcdefghijklmnop-first")),
+            Reference::new("key").is_in([Datum::string("abcdefghijklmnop-last")]),
+            Reference::new("key").greater_than_or_equal_to(Datum::string("abcdefghijklmnop")),
+            Reference::new("key").less_than_or_equal_to(Datum::string("abcdefghijklmnoq")),
+        ] {
+            let predicate = predicate.bind(schema.clone(), false).unwrap();
+            assert!(
+                super::InclusiveMetricsEvaluator::eval_metrics(
+                    &predicate,
+                    (&metrics).into(),
+                    false
+                )
+                .unwrap()
+            );
+            assert!(!super::FileScanTaskReader::file_always_matches(
+                &predicate, &metrics
+            ));
+        }
+        let outside = Reference::new("key")
+            .equal_to(Datum::string("z-outside"))
+            .bind(schema, false)
+            .unwrap();
+        assert!(
+            !super::InclusiveMetricsEvaluator::eval_metrics(&outside, (&metrics).into(), false)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn file_always_matches_preserves_integer_not_eq() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "key", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let predicate = Reference::new("key")
+            .not_equal_to(Datum::int(1))
+            .bind(schema, false)
+            .unwrap();
+        let metrics = FileScanTaskMetrics::builder()
+            .with_record_count(Some(2))
+            .with_value_counts(HashMap::from([(1, 2)]))
+            .with_null_value_counts(HashMap::from([(1, 0)]))
+            .with_nan_value_counts(HashMap::new())
+            .with_lower_bounds(HashMap::from([(1, Datum::int(2))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::int(3))]))
+            .build();
+        assert!(super::FileScanTaskReader::file_always_matches(
+            &predicate, &metrics
+        ));
+    }
 
     // INT96 encoding: [nanos_low_u32, nanos_high_u32, julian_day_u32]
     // Julian day 2_440_588 = Unix epoch (1970-01-01)
@@ -3779,21 +5035,21 @@ mod tests {
     async fn test_empty_projection_preserves_row_count() {
         let tmp_dir = TempDir::new().unwrap();
         let dir = tmp_dir.path().to_str().unwrap();
-        let file_path = write_plain_parquet(dir, "empty_projection.parquet", vec![], vec![]);
-        let schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(1)
-                .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                ])
-                .build()
-                .unwrap(),
-        );
-        let task = metadata_projection_task(file_path, schema, vec![]);
-        let (batches, _) = scan_task(task).await;
+        let file_path =
+            write_parquet_with_wide_column(dir, "empty_projection.parquet", vec![], vec![]);
+        let schema = id_and_wide_schema();
+        let task = metadata_projection_task(file_path.clone(), schema.clone(), vec![]);
+        let (batches, count_bytes) = scan_task(task).await;
 
         // A bare COUNT(*)-style empty projection must still report the row count.
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3);
+        assert!(batches.iter().all(|batch| batch.num_columns() == 0));
+        let (_, projected_bytes) =
+            scan_task(metadata_projection_task(file_path, schema, vec![1, 2])).await;
+        assert!(
+            count_bytes < projected_bytes,
+            "empty projection must not decode data columns: count={count_bytes}, projected={projected_bytes}"
+        );
     }
 }

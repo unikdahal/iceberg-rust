@@ -488,28 +488,22 @@ impl BoundPredicateVisitor for RowGroupMetricsEvaluator<'_> {
             return ROW_GROUP_MIGHT_MATCH;
         };
 
-        if let Some(lower_bound) = get_parquet_stat_min_as_datum(&primitive_type, stats)? {
-            if lower_bound.is_nan() {
-                // NaN indicates unreliable bounds. See the InclusiveMetricsEvaluator docs for more.
-                return ROW_GROUP_MIGHT_MATCH;
-            }
-
-            if !literals.iter().any(|datum| datum.ge(&lower_bound)) {
-                // if all values are less than lower bound, rows cannot match.
-                return ROW_GROUP_CANT_MATCH;
-            }
+        let lower_bound = get_parquet_stat_min_as_datum(&primitive_type, stats)?;
+        let upper_bound = get_parquet_stat_max_as_datum(&primitive_type, stats)?;
+        if lower_bound.as_ref().is_some_and(Datum::is_nan)
+            || upper_bound.as_ref().is_some_and(Datum::is_nan)
+        {
+            // NaN indicates unreliable bounds. See the InclusiveMetricsEvaluator docs for more.
+            return ROW_GROUP_MIGHT_MATCH;
         }
 
-        if let Some(upper_bound) = get_parquet_stat_max_as_datum(&primitive_type, stats)? {
-            if upper_bound.is_nan() {
-                // NaN indicates unreliable bounds. See the InclusiveMetricsEvaluator docs for more.
-                return ROW_GROUP_MIGHT_MATCH;
-            }
-
-            if !literals.iter().any(|datum| datum.le(&upper_bound)) {
-                // if all values are greater than upper bound, rows cannot match.
-                return ROW_GROUP_CANT_MATCH;
-            }
+        // A literal must lie within both bounds at once: a set with one value below the lower
+        // bound and another above the upper bound cannot match this row group.
+        if !literals.iter().any(|datum| {
+            lower_bound.as_ref().is_none_or(|lower| datum.ge(lower))
+                && upper_bound.as_ref().is_none_or(|upper| datum.le(upper))
+        }) {
+            return ROW_GROUP_CANT_MATCH;
         }
 
         ROW_GROUP_MIGHT_MATCH
@@ -546,6 +540,41 @@ mod tests {
     use crate::Result;
     use crate::expr::{Bind, Reference};
     use crate::spec::{Datum, NestedField, PrimitiveType, Schema, Type};
+
+    #[test]
+    fn test_row_group_in_with_literals_on_both_sides_of_the_bounds() -> Result<()> {
+        let row_group = create_row_group_metadata(
+            50,
+            50,
+            Some(Statistics::float(
+                Some(30.0),
+                Some(79.0),
+                None,
+                Some(0),
+                false,
+            )),
+            50,
+            None,
+        )?;
+        let (schema, field_id_map) = build_iceberg_schema_and_field_map()?;
+        let cases = [
+            (vec![29.0_f32, 80.0], false),
+            (vec![29.0_f32, 50.0, 80.0], true),
+        ];
+        for (values, expected) in cases {
+            let filter = Reference::new("col_float")
+                .is_in(values.into_iter().map(Datum::float))
+                .bind(schema.clone(), false)?;
+            let actual = RowGroupMetricsEvaluator::eval(
+                &filter,
+                &row_group,
+                &field_id_map,
+                schema.as_ref(),
+            )?;
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
 
     #[test]
     fn eval_matches_no_rows_for_empty_row_group() -> Result<()> {
