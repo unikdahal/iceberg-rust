@@ -27,3 +27,40 @@ pub(crate) mod rewrite_not;
 pub(crate) mod row_group_metrics_evaluator;
 pub(crate) mod strict_metrics_evaluator;
 pub(crate) mod strict_projection;
+
+use std::collections::HashMap;
+
+use crate::spec::{DataFile, Datum};
+
+/// Borrowed whole-file column statistics, keyed by Iceberg field ID.
+///
+/// The statistics evaluator only reads these maps, so callers that hold them
+/// outside a [`DataFile`] can be evaluated without building one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FileMetrics<'a> {
+    /// Number of records in the file, when known.
+    pub(crate) record_count: Option<u64>,
+    /// Number of values, including nulls and NaNs.
+    pub(crate) value_counts: &'a HashMap<i32, u64>,
+    /// Number of null values.
+    pub(crate) null_value_counts: &'a HashMap<i32, u64>,
+    /// Number of NaN values.
+    pub(crate) nan_value_counts: &'a HashMap<i32, u64>,
+    /// Inclusive lower bounds.
+    pub(crate) lower_bounds: &'a HashMap<i32, Datum>,
+    /// Inclusive upper bounds.
+    pub(crate) upper_bounds: &'a HashMap<i32, Datum>,
+}
+
+impl<'a> From<&'a DataFile> for FileMetrics<'a> {
+    fn from(data_file: &'a DataFile) -> Self {
+        Self {
+            record_count: Some(data_file.record_count),
+            value_counts: &data_file.value_counts,
+            null_value_counts: &data_file.null_value_counts,
+            nan_value_counts: &data_file.nan_value_counts,
+            lower_bounds: &data_file.lower_bounds,
+            upper_bounds: &data_file.upper_bounds,
+        }
+    }
+}
