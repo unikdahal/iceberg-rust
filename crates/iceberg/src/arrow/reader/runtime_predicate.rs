@@ -25,6 +25,7 @@ use parquet::schema::types::SchemaDescriptor;
 
 use super::ArrowReader;
 use crate::arrow::record_batch_transformer::column_needs_type_promotion;
+use crate::arrow::scan_metrics::{RuntimeFallback, ScanMetrics};
 use crate::arrow::type_to_arrow_type;
 use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::spec::{PrimitiveType, Schema, SchemaRef};
@@ -73,20 +74,81 @@ impl RuntimePredicateSnapshot {
 /// * Generations increase monotonically on every change, are never reused,
 ///   and become visible only after their predicate.
 /// * Provider, snapshot, binding, planning and page-pruning failures are
-///   advisory: the reader skips the runtime predicate and does not retry them.
-///   A runtime row-evaluation error disables runtime restriction for the rest
-///   of that task, preserving its planned and equality-delete row filters and
-///   selections already applied. Planned-filter, delete-filter and decoding
-///   errors remain fatal.
-/// * Floating-point comparison and set predicates are currently skipped:
-///   the statistics evaluators and Arrow row filters do not agree on every
-///   NaN and signed-zero comparison. Floating-point null and NaN tests are
-///   supported.
+///   advisory: the reader skips the runtime predicate, does not retry them
+///   and counts them by reason in `ScanMetrics`. Planned-filter,
+///   delete-filter and decoding errors remain fatal.
+/// * A runtime row-evaluation error stops runtime row evaluation and
+///   publication refreshes for the rest of that task. Row groups and pages
+///   already excluded by statistics stay excluded: the statistics proved that
+///   none of their rows match a published predicate, so the first rule makes
+///   skipping them safe. The planned filter and deletes still apply, so the
+///   task returns every row that passes them and the runtime predicate, and
+///   no row that fails them.
+///
+/// # Refresh
+///
+/// The reader checks `generation()` when each data-file task starts and, with
+/// row-group filtering enabled, at each later row-group boundary, and takes a
+/// snapshot only when the generation changed. A newer predicate can replace
+/// the task's current one for the row groups not yet started; the row group
+/// being decoded finishes under the predicate it started with. A `None`
+/// snapshot, or a refresh the reader declines, leaves the current predicate in
+/// force.
+///
+/// # Support
+///
+/// Comparisons, null and NaN tests, `IN`, `STARTS WITH` and their negations,
+/// combined with AND, OR and NOT, on primitive columns that the data file
+/// stores with their table type or a promotion the reader compares
+/// losslessly. A predicate that references a column the file lacks or stores
+/// with another promoted type is skipped for that file, and one on a nested
+/// column is skipped because row filters cannot evaluate it.
+/// Floating-point columns support only null and NaN tests: a publication
+/// with a floating-point comparison or set is skipped as a whole, because the
+/// statistics evaluators and Arrow row filters do not agree on every NaN and
+/// signed-zero comparison.
+///
+/// Each layer skips only data it proves cannot match:
+///
+/// | Layer | Applies when |
+/// |---|---|
+/// | Whole file, from manifest statistics | the task retains them, see `TableScanBuilder::include_column_stats` |
+/// | Row groups, from column statistics | row-group filtering is enabled |
+/// | Row groups, from bloom filters (`=` and `IN`) | bloom filtering is enabled |
+/// | Pages, from the page index | row selection is enabled |
+/// | Rows, by an Arrow row filter | always |
 ///
 /// Pass a provider to `ArrowReaderBuilder::with_runtime_predicate_provider`.
 /// This is the reader layer only: `TableScan::to_arrow` does not accept a
-/// provider yet, so engines that plan through `TableScan` need that wiring as
-/// a follow-up.
+/// provider yet, so engines that plan through `TableScan` read its planned
+/// tasks themselves:
+///
+/// ```no_run
+/// use std::sync::Arc;
+///
+/// use futures::TryStreamExt;
+/// use iceberg::arrow::{ArrowReaderBuilder, RuntimePredicateProvider};
+/// use iceberg::table::Table;
+/// use iceberg::{Result, Runtime};
+///
+/// async fn read(table: &Table, provider: Arc<dyn RuntimePredicateProvider>) -> Result<()> {
+///     // Retained statistics let the reader reject a whole file before opening it.
+///     let scan = table.scan().include_column_stats_for(["id"]).build()?;
+///     let tasks = scan.plan_files().await?;
+///     let reader = ArrowReaderBuilder::new(table.file_io().clone(), Runtime::current())
+///         .with_runtime_predicate_provider(provider)
+///         .build();
+///     let result = reader.read(tasks)?;
+///     let metrics = result.metrics().clone();
+///     let batches: Vec<_> = result.stream().try_collect().await?;
+///     println!(
+///         "{} batches, {} files pruned",
+///         batches.len(),
+///         metrics.runtime_file_tasks_pruned()
+///     );
+///     Ok(())
+/// }
+/// ```
 ///
 /// # Example
 ///
@@ -148,10 +210,11 @@ pub trait RuntimePredicateProvider: Send + Sync {
     /// Supplies a best-effort hint to visit row groups by descending maximum.
     ///
     /// This applies only with row-group filtering enabled and embedded field
-    /// IDs mapping the named column. Only physical INT32/INT64 statistics are
-    /// ranked; unsupported or missing statistics keep their relative file
-    /// order after ranked groups. A missing field ID or column leaves file
-    /// order unchanged. The default is no hint; read order is unspecified.
+    /// IDs mapping the named column. Only physical INT32/INT64 statistics of
+    /// signed columns are ranked; unsupported or missing statistics keep their
+    /// relative file order after ranked groups. A missing field ID, column or
+    /// signed sort order leaves file order unchanged. The default is no hint;
+    /// read order is unspecified.
     fn largest_first_column(&self) -> Option<String> {
         None
     }
@@ -164,6 +227,7 @@ pub trait RuntimePredicateProvider: Send + Sync {
 pub(super) struct RuntimePredicates {
     provider: Arc<dyn RuntimePredicateProvider>,
     cached: RwLock<Option<CachedPredicate>>,
+    metrics: ScanMetrics,
 }
 
 struct CachedPredicate {
@@ -187,7 +251,14 @@ impl RuntimePredicates {
         Self {
             provider,
             cached: RwLock::new(None),
+            metrics: ScanMetrics::new(),
         }
+    }
+
+    /// Counts the publications this cache skips in `metrics`.
+    pub(super) fn with_metrics(mut self, metrics: ScanMetrics) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Returns the provider's current generation, for a cheap change check.
@@ -237,6 +308,7 @@ impl RuntimePredicates {
             .map_or(generation, |cached| generation.max(cached.generation));
         let (generation, predicate) = match self.provider.snapshot() {
             Ok(snapshot) if snapshot.generation() < generation => {
+                self.metrics.record_runtime_fallback(RuntimeFallback::Stale);
                 tracing::debug!("Skipping stale runtime predicate for {data_file_path}");
                 (generation, None)
             }
@@ -247,20 +319,25 @@ impl RuntimePredicates {
                     .map(|predicate| {
                         let bound = predicate
                             .rewrite_not()
-                            .bind(schema.clone(), case_sensitive)?;
-                        check_runtime_predicate_semantics(&bound)?;
-                        Ok::<_, Error>(bound)
+                            .bind(schema.clone(), case_sensitive)
+                            .map_err(|error| (RuntimeFallback::Bind, error))?;
+                        check_runtime_predicate_semantics(&bound)
+                            .map_err(|error| (RuntimeFallback::Unsupported, error))?;
+                        Ok::<_, (RuntimeFallback, Error)>(bound)
                     })
                     .transpose();
                 match bound {
                     Ok(bound) => (generation, bound.map(Arc::new)),
-                    Err(error) => {
+                    Err((reason, error)) => {
+                        self.metrics.record_runtime_fallback(reason);
                         tracing::debug!("Skipping runtime predicate for {data_file_path}: {error}");
                         (generation, None)
                     }
                 }
             }
             Err(error) => {
+                self.metrics
+                    .record_runtime_fallback(RuntimeFallback::Snapshot);
                 tracing::debug!("Skipping runtime predicate for {data_file_path}: {error}");
                 (generation, None)
             }
@@ -642,6 +719,80 @@ mod tests {
     #[test]
     fn concurrent_runtime_predicate_failure_is_cached_until_next_generation() {
         concurrent_refresh(true, false);
+    }
+
+    #[test]
+    fn runtime_predicate_fallbacks_count_each_rejected_publication_once() {
+        struct Provider {
+            generation: AtomicU64,
+            published: Mutex<Option<(Predicate, u64)>>,
+        }
+        impl RuntimePredicateProvider for Provider {
+            fn generation(&self) -> u64 {
+                self.generation.load(Ordering::Acquire)
+            }
+
+            fn snapshot(&self) -> Result<RuntimePredicateSnapshot> {
+                let (predicate, generation) = self
+                    .published
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .ok_or_else(|| Error::new(ErrorKind::Unexpected, "snapshot failed"))?;
+                Ok(RuntimePredicateSnapshot::new(Some(predicate), generation))
+            }
+        }
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::required(2, "v", Type::Primitive(PrimitiveType::Double)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let provider = Arc::new(Provider {
+            generation: AtomicU64::new(0),
+            published: Mutex::new(None),
+        });
+        let metrics = ScanMetrics::new();
+        let predicates = RuntimePredicates::new(provider.clone());
+        let predicates = predicates.with_metrics(metrics.clone());
+        let unbound = Reference::new("missing").is_null();
+        let float = Reference::new("v").greater_than(Datum::double(0.0));
+        let valid = Reference::new("id").greater_than(Datum::long(0));
+        // Counters: snapshot, bind, stale and unsupported.
+        let cases = [
+            (None, 1, [1, 0, 0, 0]),
+            (Some((unbound, 2)), 2, [1, 1, 0, 0]),
+            (Some((float, 3)), 3, [1, 1, 0, 1]),
+            // Older than the generation already observed.
+            (Some((valid.clone(), 3)), 4, [1, 1, 1, 1]),
+        ];
+        for (published, generation, expected) in cases {
+            *provider.published.lock().unwrap() = published;
+            provider.generation.store(generation, Ordering::Release);
+            for path in ["first.parquet", "second.parquet"] {
+                assert!(predicates.current(&schema, false, path).is_none());
+            }
+            let fallbacks = [
+                metrics.runtime_snapshot_fallbacks(),
+                metrics.runtime_bind_fallbacks(),
+                metrics.runtime_stale_fallbacks(),
+                metrics.runtime_unsupported_fallbacks(),
+            ];
+            assert_eq!(fallbacks, expected);
+        }
+
+        *provider.published.lock().unwrap() = Some((valid, 5));
+        provider.generation.store(5, Ordering::Release);
+        assert!(
+            predicates
+                .current(&schema, false, "valid.parquet")
+                .is_some()
+        );
+        assert_eq!(metrics.runtime_stale_fallbacks(), 1);
+        assert_eq!(metrics.runtime_planning_fallbacks(), 0);
     }
 
     #[test]

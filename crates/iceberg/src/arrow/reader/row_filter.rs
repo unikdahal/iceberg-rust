@@ -260,7 +260,20 @@ fn combine_predicates(
         }
         let mandatory_mask = mask.clone();
         for (evaluate, _) in &mut runtime {
-            match evaluate(batch.clone()).and_then(|next| and_kleene(&mask, &next)) {
+            let next = evaluate(batch.clone());
+            #[cfg(test)]
+            let next = next.and_then(|next| {
+                if super::runtime_stream::test_support::take_row_evaluation_failure(
+                    &runtime_disabled,
+                ) {
+                    Err(arrow_schema::ArrowError::ComputeError(
+                        "injected runtime row-evaluation error".into(),
+                    ))
+                } else {
+                    Ok(next)
+                }
+            });
+            match next.and_then(|next| and_kleene(&mask, &next)) {
                 Ok(next) => mask = next,
                 Err(error) => {
                     runtime_disabled.store(true, Ordering::Relaxed);

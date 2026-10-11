@@ -42,6 +42,7 @@ use parquet::file::metadata::ParquetMetaData;
 use super::runtime_predicate::{RuntimePredicates, check_runtime_predicate_columns};
 use super::{ArrowFileReader, ArrowReader};
 use crate::arrow::ScanMetrics;
+use crate::arrow::scan_metrics::RuntimeFallback;
 use crate::expr::BoundPredicate;
 use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
 use crate::scan::{ArrowRecordBatchStream, FileScanTask};
@@ -189,9 +190,29 @@ impl RuntimePrunedStream {
             .count();
         self.selections.drain(..started);
 
+        let parquet_metadata = self.metadata.metadata();
+        if let Err(error) = check_runtime_predicate_columns(
+            &predicate,
+            parquet_metadata.file_metadata().schema_descr(),
+            self.metadata.schema(),
+            self.refresh.task.schema(),
+            self.refresh.use_position_fallback,
+        ) {
+            self.refresh
+                .metrics
+                .record_runtime_fallback(RuntimeFallback::Unsupported);
+            tracing::debug!(
+                "Skipping live runtime predicate for {}: {error}",
+                self.refresh.task.data_file_path()
+            );
+            return Ok(());
+        }
         let (runtime, selections) = match self.restrict_remaining(predicate) {
             Ok(restricted) => restricted,
             Err(error) => {
+                self.refresh
+                    .metrics
+                    .record_runtime_fallback(RuntimeFallback::Planning);
                 tracing::debug!(
                     "Skipping live runtime predicate for {}: {error}",
                     self.refresh.task.data_file_path()
@@ -225,7 +246,8 @@ impl RuntimePrunedStream {
     /// Returns the remaining selections narrowed by `predicate`: row groups
     /// whose statistics cannot match are dropped, and the page selections of
     /// the rest are intersected with the predicate's page selections. An error
-    /// makes the predicate unusable for this file.
+    /// makes the predicate unusable for this file. The caller must have
+    /// checked the predicate's columns with `check_runtime_predicate_columns`.
     fn restrict_remaining(
         &self,
         predicate: Arc<BoundPredicate>,
@@ -236,13 +258,6 @@ impl RuntimePrunedStream {
         }
         let parquet_metadata = self.metadata.metadata();
         let task = &self.refresh.task;
-        check_runtime_predicate_columns(
-            &predicate,
-            parquet_metadata.file_metadata().schema_descr(),
-            self.metadata.schema(),
-            task.schema(),
-            self.refresh.use_position_fallback,
-        )?;
         let (field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
             parquet_metadata.file_metadata().schema_descr(),
             self.metadata.schema(),
@@ -304,10 +319,15 @@ impl RuntimePrunedStream {
                         .collect();
                 }
                 Ok(None) => {}
-                Err(error) => tracing::debug!(
-                    "Skipping live page pruning for {}: {error}",
-                    task.data_file_path()
-                ),
+                Err(error) => {
+                    self.refresh
+                        .metrics
+                        .record_runtime_fallback(RuntimeFallback::Planning);
+                    tracing::debug!(
+                        "Skipping live page pruning for {}: {error}",
+                        task.data_file_path()
+                    );
+                }
             }
         }
         Ok((
@@ -350,6 +370,9 @@ impl RuntimePrunedStream {
         ) {
             Ok(predicate) => Some(RowFilter::new(vec![predicate])),
             Err(error) => {
+                self.refresh
+                    .metrics
+                    .record_runtime_fallback(RuntimeFallback::Planning);
                 tracing::debug!(
                     "Skipping live row filter for {}: {error}",
                     self.refresh.task.data_file_path()
@@ -471,6 +494,7 @@ pub(super) mod test_support {
     pub(in crate::arrow::reader) enum Stage {
         IntoBuilder = 1,
         Build = 2,
+        RowEvaluation = 3,
     }
 
     #[derive(Default)]
@@ -527,6 +551,37 @@ pub(super) mod test_support {
                 .compare_exchange(stage as u8, 0, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         }
+    }
+
+    /// Takes an injected `stage` failure for the task reading `path`.
+    pub(in crate::arrow::reader) fn take_task_failure(path: &str, stage: Stage) -> bool {
+        registry()
+            .lock()
+            .unwrap()
+            .get(path)
+            .and_then(Weak::upgrade)
+            .is_some_and(|probe| probe.take_failure(stage))
+    }
+
+    /// Takes an injected row-evaluation failure for the task whose runtime
+    /// row evaluation `disabled` controls.
+    pub(in crate::arrow::reader) fn take_row_evaluation_failure(
+        disabled: &Arc<AtomicBool>,
+    ) -> bool {
+        registry()
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(Weak::upgrade)
+            .any(|probe| {
+                probe
+                    .disabled
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|task| Arc::ptr_eq(task, disabled))
+                    && probe.take_failure(Stage::RowEvaluation)
+            })
     }
 
     pub(super) fn find(path: &str, disabled: Arc<AtomicBool>) -> Option<Arc<Probe>> {

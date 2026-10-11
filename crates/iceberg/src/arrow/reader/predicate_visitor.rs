@@ -25,8 +25,8 @@ use std::sync::Arc;
 use arrow_arith::boolean::{and, and_kleene, is_not_null, is_null, not, or, or_kleene};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    Date32Type, Float32Type, Float64Type, Int32Type, Int64Type, Time64MicrosecondType,
-    TimestampMicrosecondType, TimestampNanosecondType,
+    Date32Type, Decimal128Type, Float32Type, Float64Type, Int32Type, Int64Type,
+    Time64MicrosecondType, TimestampMicrosecondType, TimestampNanosecondType,
 };
 use arrow_array::{Array, ArrayRef, BooleanArray, Datum as ArrowDatum, RecordBatch, Scalar};
 use arrow_buffer::BooleanBuffer;
@@ -676,6 +676,10 @@ enum InSet {
     Utf8(FnvHashSet<String>),
     LargeUtf8(FnvHashSet<String>),
     Utf8View(FnvHashSet<String>),
+    /// Decimals of exactly this type, keyed by unscaled value.
+    Decimal128(FnvHashSet<i128>, DataType),
+    /// Binary, large binary, binary view or fixed-size binary values of exactly this type.
+    Bytes(FnvHashSet<Vec<u8>>, DataType),
 }
 
 impl InSet {
@@ -722,6 +726,30 @@ impl InSet {
             }
             DataType::Time64(TimeUnit::Microsecond) => {
                 collect!(Time64Microsecond, Time64MicrosecondType)
+            }
+            // Other decimal widths arrive as Decimal128 only when
+            // `promote_column_for_literal` widens them to the literals' type.
+            DataType::Decimal128(..) => collect!(Decimal128, Decimal128Type, column_type.clone()),
+            DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::FixedSizeBinary(_) => {
+                let mut set = FnvHashSet::default();
+                for literal in literals {
+                    let literal = try_cast_literal(literal, column_type)?;
+                    let (array, _) = literal.get();
+                    if array.is_null(0) {
+                        return Ok(None);
+                    }
+                    let value = match column_type {
+                        DataType::Binary => array.as_binary::<i32>().value(0),
+                        DataType::LargeBinary => array.as_binary::<i64>().value(0),
+                        DataType::BinaryView => array.as_binary_view().value(0),
+                        _ => array.as_fixed_size_binary().value(0),
+                    };
+                    set.insert(value.to_vec());
+                }
+                Ok(Some(Self::Bytes(set, column_type.clone())))
             }
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
                 let mut set = FnvHashSet::default();
@@ -822,6 +850,24 @@ impl InSet {
                     .map(|value| value.map(|value| set.contains(value)))
                     .collect(),
             ),
+            (Self::Decimal128(set, data_type), _) if data_type == column.data_type() => Some(
+                column
+                    .as_primitive::<Decimal128Type>()
+                    .iter()
+                    .map(|value| value.map(|value| set.contains(&value)))
+                    .collect(),
+            ),
+            (Self::Bytes(set, data_type), _) if data_type == column.data_type() => {
+                let contains = |value: Option<&[u8]>| value.map(|value| set.contains(value));
+                Some(match data_type {
+                    DataType::Binary => column.as_binary::<i32>().iter().map(contains).collect(),
+                    DataType::LargeBinary => {
+                        column.as_binary::<i64>().iter().map(contains).collect()
+                    }
+                    DataType::BinaryView => column.as_binary_view().iter().map(contains).collect(),
+                    _ => column.as_fixed_size_binary().iter().map(contains).collect(),
+                })
+            }
             _ => None,
         }
     }
@@ -1107,13 +1153,24 @@ mod tests {
         );
         // Types without a hash path keep the comparison kernels.
         assert!(InSet::build(&DataType::Float64, &longs).unwrap().is_none());
+        for (data_type, literal) in [
+            (DataType::Binary, Datum::binary(*b"key")),
+            (DataType::LargeBinary, Datum::binary(*b"key")),
+            (DataType::BinaryView, Datum::binary(*b"key")),
+            (DataType::FixedSizeBinary(3), Datum::fixed(*b"key")),
+            (DataType::Decimal128(38, 2), Datum::long(1)),
+        ] {
+            let literals = [get_arrow_datum(&literal).unwrap()];
+            let set = InSet::build(&data_type, &literals).unwrap();
+            assert!(set.is_some(), "{data_type}");
+        }
     }
 
     #[test]
     fn membership_predicates_match_kernels_for_small_and_large_sets() {
         use arrow_array::{
-            ArrayRef, Int32Array, Int64Array, StringArray, Time64MicrosecondArray,
-            TimestampMicrosecondArray, TimestampNanosecondArray,
+            ArrayRef, Decimal128Array, FixedSizeBinaryArray, Int32Array, Int64Array, StringArray,
+            Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
         };
         use arrow_cast::cast;
         use fnv::FnvHashSet;
@@ -1141,6 +1198,35 @@ mod tests {
         let longs: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(19), Some(-1)]));
         let narrowed: ArrayRef =
             Arc::new(Int32Array::from(vec![Some(1), None, Some(19), Some(-1)]));
+        let binaries = cast(&strings, &DataType::Binary).unwrap();
+        let binary_keys: Vec<_> = (0..20)
+            .map(|value| Datum::binary(format!("key-{value}-冰").into_bytes()))
+            .collect();
+        let uuid = |value: u128| Some(uuid::Uuid::from_u128(value).into_bytes());
+        let uuids: ArrayRef = Arc::new(
+            FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                [uuid(1), None, uuid(19), uuid(u128::MAX)].into_iter(),
+                16,
+            )
+            .unwrap(),
+        );
+        let fixed: ArrayRef = Arc::new(
+            FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                [Some(b"k001"), None, Some(b"k019"), Some(b"zzzz")].into_iter(),
+                4,
+            )
+            .unwrap(),
+        );
+        let decimals = |scale: i8, values: Vec<Option<i128>>| -> ArrayRef {
+            Arc::new(
+                Decimal128Array::from(values)
+                    .with_precision_and_scale(10, scale)
+                    .unwrap(),
+            )
+        };
+        let decimal_keys: Vec<_> = (0..20)
+            .map(|value| Datum::decimal_from_str(format!("{value}.25")).unwrap())
+            .collect();
         let cases = [
             (longs, (0..20).map(Datum::long).collect::<Vec<_>>()),
             (
@@ -1210,6 +1296,37 @@ mod tests {
                     .map(|value| Datum::string(format!("key-{value}-冰")))
                     .collect(),
             ),
+            (
+                cast(&binaries, &DataType::LargeBinary).unwrap(),
+                binary_keys.clone(),
+            ),
+            (
+                cast(&binaries, &DataType::BinaryView).unwrap(),
+                binary_keys.clone(),
+            ),
+            (binaries, binary_keys),
+            (
+                uuids,
+                (0..20)
+                    .map(|value| Datum::uuid(uuid::Uuid::from_u128(value)))
+                    .collect(),
+            ),
+            (
+                fixed,
+                (0..20)
+                    .map(|value| Datum::fixed(format!("k{value:03}").into_bytes()))
+                    .collect(),
+            ),
+            // The column widens to the literals' precision.
+            (
+                decimals(2, vec![Some(125), None, Some(1925), Some(-1)]),
+                decimal_keys.clone(),
+            ),
+            // The literals rescale to the column's scale.
+            (
+                decimals(3, vec![Some(1250), None, Some(19250), Some(-1)]),
+                decimal_keys,
+            ),
         ];
         for (column, literals) in cases {
             for count in [5, 20] {
@@ -1247,6 +1364,92 @@ mod tests {
                     }
                     assert!(expected.is_null(1));
                 }
+            }
+        }
+    }
+
+    /// Times `NOT IN` over binary, fixed-size binary and decimal keys, as
+    /// large equality deletes compile it, by hash lookup and by one comparison
+    /// pass per key, and checks that both agree. Run with
+    /// `cargo test -p iceberg --release runtime_performance_ -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing test run explicitly by fork CI"]
+    fn runtime_performance_in_set_membership() {
+        use std::time::Instant;
+
+        use arrow_array::{ArrayRef, BinaryArray, Decimal128Array, FixedSizeBinaryArray};
+        use fnv::FnvHashSet;
+
+        use super::{InSet, and, neq, try_cast_literal};
+        use crate::arrow::get_arrow_datum;
+        use crate::spec::Datum;
+
+        const ROWS: i64 = 2048;
+        let parquet_schema = SchemaDescriptor::new(Arc::new(
+            parse_message_type("message schema { optional binary value = 1; }").unwrap(),
+        ));
+        let column_map = HashMap::from([(1, 0)]);
+        let column_indices = vec![0];
+        let converter = PredicateConverter {
+            parquet_schema: &parquet_schema,
+            column_map: &column_map,
+            column_indices: &column_indices,
+        };
+        // Row `r` holds `r` and the keys are even, so every other row is deleted.
+        let bytes = |value: i64| format!("{value:016}").into_bytes();
+        let binary: ArrayRef = Arc::new(BinaryArray::from_iter_values((0..ROWS).map(bytes)));
+        let fixed = FixedSizeBinaryArray::try_from_iter((0..ROWS).map(bytes));
+        let fixed: ArrayRef = Arc::new(fixed.unwrap());
+        let decimal = Decimal128Array::from_iter_values((0..ROWS).map(i128::from));
+        let decimal: ArrayRef = Arc::new(decimal.with_precision_and_scale(38, 2).unwrap());
+        for keys in [10_000, 100_000] {
+            let even = (0..keys).map(|key| key * 2);
+            let binary_keys = even.clone().map(|key| Datum::binary(bytes(key))).collect();
+            let fixed_keys = even.clone().map(|key| Datum::fixed(bytes(key))).collect();
+            let decimal_keys = even
+                .map(|key| format!("{}.{:02}", key / 100, key % 100))
+                .map(|key| Datum::decimal_from_str(key).unwrap())
+                .collect();
+            let cases: [(&str, ArrayRef, Vec<Datum>); 3] = [
+                ("binary", binary.clone(), binary_keys),
+                ("fixed[16]", fixed.clone(), fixed_keys),
+                ("decimal(38, 2)", decimal.clone(), decimal_keys),
+            ];
+            for (name, column, literals) in cases {
+                let literals: FnvHashSet<_> = literals.into_iter().collect();
+                let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                    "value",
+                    column.data_type().clone(),
+                    false,
+                )]));
+                let batch = RecordBatch::try_new(schema, vec![column.clone()]).unwrap();
+                let arrow_literals: Vec<_> = literals
+                    .iter()
+                    .map(|literal| get_arrow_datum(literal).unwrap())
+                    .collect();
+                let set = InSet::build(column.data_type(), &arrow_literals).unwrap();
+                assert!(set.is_some(), "{name} must use hash membership");
+
+                let start = Instant::now();
+                let mut predicate = converter.build_set_predicate(0, &literals, true).unwrap();
+                let hashed = predicate(batch).unwrap();
+                let hashed_time = start.elapsed();
+
+                let start = Instant::now();
+                let mut compared = constant_bool_array(true, column.len());
+                for literal in &literals {
+                    let literal = get_arrow_datum(literal).unwrap();
+                    let literal = try_cast_literal(&literal, column.data_type()).unwrap();
+                    compared = and(&compared, &neq(&column, literal.as_ref()).unwrap()).unwrap();
+                }
+                let compared_time = start.elapsed();
+
+                assert_eq!(hashed, compared);
+                assert_eq!(hashed.true_count(), ROWS as usize / 2);
+                println!(
+                    "R3 in_set {name}: {keys} keys, {ROWS} rows: hash {hashed_time:?}, \
+                     per-key comparisons {compared_time:?}"
+                );
             }
         }
     }

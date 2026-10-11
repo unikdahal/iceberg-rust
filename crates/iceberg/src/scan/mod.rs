@@ -100,6 +100,41 @@ fn collect_scan_field_ids(
         .collect()
 }
 
+fn resolve_column_stats(
+    request: &ColumnStatsRequest,
+    schema: &Schema,
+    case_sensitive: bool,
+) -> Result<Option<Arc<ColumnStatsSelection>>> {
+    Ok(match request {
+        ColumnStatsRequest::None => None,
+        ColumnStatsRequest::All => Some(Arc::new(ColumnStatsSelection::All)),
+        ColumnStatsRequest::Columns(names) => {
+            let ids = names
+                .iter()
+                .map(|name| {
+                    let id = resolve_field_id(schema, name, case_sensitive).ok_or_else(|| {
+                        invalid_data!(
+                            "Column {name} requested for statistics not found in table. Schema: {schema}"
+                        )
+                    })?;
+                    if !schema
+                        .field_by_id(id)
+                        .expect("resolved field")
+                        .field_type
+                        .is_primitive()
+                    {
+                        return Err(invalid_data!(
+                            "Column {name} requested for statistics must be primitive"
+                        ));
+                    }
+                    Ok(id)
+                })
+                .collect::<Result<_>>()?;
+            Some(Arc::new(ColumnStatsSelection::Fields(ids)))
+        }
+    })
+}
+
 fn bind_scan_predicate(
     schema: &SchemaRef,
     predicate: Option<&Predicate>,
@@ -333,6 +368,11 @@ impl<'a> TableScanBuilder<'a> {
                 .clone(),
             None => {
                 let Some(current_snapshot_id) = self.table.metadata().current_snapshot() else {
+                    resolve_column_stats(
+                        &self.column_stats,
+                        self.table.metadata().current_schema(),
+                        self.case_sensitive,
+                    )?;
                     return Ok(TableScan {
                         batch_size: self.batch_size,
                         column_names: self.column_names,
@@ -363,35 +403,7 @@ impl<'a> TableScanBuilder<'a> {
             .default_name_mapping()?
             .map(Arc::new);
         let unified_partition_type = projected_partition_type(self.table, &schema, &field_ids)?;
-        let column_stats = match &self.column_stats {
-            ColumnStatsRequest::None => None,
-            ColumnStatsRequest::All => Some(Arc::new(ColumnStatsSelection::All)),
-            ColumnStatsRequest::Columns(names) => {
-                let ids = names
-                    .iter()
-                    .map(|name| {
-                        let id = resolve_field_id(&schema, name, self.case_sensitive)
-                            .ok_or_else(|| {
-                                invalid_data!(
-                                    "Column {name} requested for statistics not found in table. Schema: {schema}"
-                                )
-                            })?;
-                        if !schema
-                            .field_by_id(id)
-                            .expect("resolved field")
-                            .field_type
-                            .is_primitive()
-                        {
-                            return Err(invalid_data!(
-                                "Column {name} requested for statistics must be primitive"
-                            ));
-                        }
-                        Ok(id)
-                    })
-                    .collect::<Result<_>>()?;
-                Some(Arc::new(ColumnStatsSelection::Fields(ids)))
-            }
-        };
+        let column_stats = resolve_column_stats(&self.column_stats, &schema, self.case_sensitive)?;
 
         // Precompute the table's sort orders once, keyed by id, so each manifest-file
         // context carries only this narrow map instead of the full table metadata.
@@ -1127,6 +1139,18 @@ mod tests {
         let batch_stream = table.scan().build().unwrap().to_arrow().await.unwrap();
         let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
         assert!(batches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn include_column_stats_for_validates_columns_of_empty_table() {
+        let table = TableTestFixture::new_empty().table;
+        let err = table
+            .scan()
+            .include_column_stats_for(["missing"])
+            .build()
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(table.scan().include_column_stats_for(["x"]).build().is_ok());
     }
 
     #[tokio::test]

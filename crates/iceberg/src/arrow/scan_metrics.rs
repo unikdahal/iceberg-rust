@@ -49,6 +49,23 @@ impl<F: FileRead> FileRead for CountingFileRead<F> {
     }
 }
 
+/// Why the reader skipped a runtime predicate, or part of it.
+#[derive(Clone, Copy)]
+pub(crate) enum RuntimeFallback {
+    /// The provider failed to return a snapshot.
+    Snapshot,
+    /// The predicate did not bind to the scanned schema.
+    Bind,
+    /// The snapshot was older than a generation the reader already saw.
+    Stale,
+    /// The predicate needs a type or column the reader cannot prune on.
+    Unsupported,
+    /// Row-group, page-index or row-filter planning failed.
+    Planning,
+    /// Evaluating the predicate on decoded rows failed.
+    RowEvaluation,
+}
+
 /// Metrics collected during an Iceberg scan.
 #[derive(Clone, Debug)]
 pub struct ScanMetrics {
@@ -59,6 +76,12 @@ pub struct ScanMetrics {
     runtime_predicate_refreshes: Arc<AtomicU64>,
     runtime_row_groups_pruned_live: Arc<AtomicU64>,
     runtime_decoder_rebuilds: Arc<AtomicU64>,
+    runtime_snapshot_fallbacks: Arc<AtomicU64>,
+    runtime_bind_fallbacks: Arc<AtomicU64>,
+    runtime_stale_fallbacks: Arc<AtomicU64>,
+    runtime_unsupported_fallbacks: Arc<AtomicU64>,
+    runtime_planning_fallbacks: Arc<AtomicU64>,
+    runtime_row_evaluation_fallbacks: Arc<AtomicU64>,
 }
 
 impl ScanMetrics {
@@ -71,6 +94,12 @@ impl ScanMetrics {
             runtime_predicate_refreshes: Arc::new(AtomicU64::new(0)),
             runtime_row_groups_pruned_live: Arc::new(AtomicU64::new(0)),
             runtime_decoder_rebuilds: Arc::new(AtomicU64::new(0)),
+            runtime_snapshot_fallbacks: Arc::new(AtomicU64::new(0)),
+            runtime_bind_fallbacks: Arc::new(AtomicU64::new(0)),
+            runtime_stale_fallbacks: Arc::new(AtomicU64::new(0)),
+            runtime_unsupported_fallbacks: Arc::new(AtomicU64::new(0)),
+            runtime_planning_fallbacks: Arc::new(AtomicU64::new(0)),
+            runtime_row_evaluation_fallbacks: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -99,11 +128,24 @@ impl ScanMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_runtime_fallback(&self, reason: RuntimeFallback) {
+        let counter = match reason {
+            RuntimeFallback::Snapshot => &self.runtime_snapshot_fallbacks,
+            RuntimeFallback::Bind => &self.runtime_bind_fallbacks,
+            RuntimeFallback::Stale => &self.runtime_stale_fallbacks,
+            RuntimeFallback::Unsupported => &self.runtime_unsupported_fallbacks,
+            RuntimeFallback::Planning => &self.runtime_planning_fallbacks,
+            RuntimeFallback::RowEvaluation => &self.runtime_row_evaluation_fallbacks,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn bytes_read_counter(&self) -> &Arc<AtomicU64> {
         &self.bytes_read
     }
 
-    /// Total bytes read from storage during this scan, including data files and delete files.
+    /// Total bytes requested from storage during this scan, including data files and delete
+    /// files. Each read is counted when it is issued, so failed reads are included.
     pub fn bytes_read(&self) -> u64 {
         self.bytes_read.load(Ordering::Relaxed)
     }
@@ -143,6 +185,47 @@ impl ScanMetrics {
     /// groups follow it.
     pub fn runtime_decoder_rebuilds(&self) -> u64 {
         self.runtime_decoder_rebuilds.load(Ordering::Relaxed)
+    }
+
+    /// Runtime predicate snapshots the provider failed to return. Each failed
+    /// snapshot counts once, however many tasks skip its predicate.
+    pub fn runtime_snapshot_fallbacks(&self) -> u64 {
+        self.runtime_snapshot_fallbacks.load(Ordering::Relaxed)
+    }
+
+    /// Runtime predicates that failed to bind to the scanned schema. Each
+    /// failed binding counts once, however many tasks skip it.
+    pub fn runtime_bind_fallbacks(&self) -> u64 {
+        self.runtime_bind_fallbacks.load(Ordering::Relaxed)
+    }
+
+    /// Runtime predicate snapshots ignored because they were older than a
+    /// generation the reader had already seen.
+    pub fn runtime_stale_fallbacks(&self) -> u64 {
+        self.runtime_stale_fallbacks.load(Ordering::Relaxed)
+    }
+
+    /// Runtime predicates skipped as unsupported: once per binding for a
+    /// floating-point comparison or set, and once per task or refresh for a
+    /// data file that lacks a referenced column or stores it with an
+    /// unsupported type.
+    pub fn runtime_unsupported_fallbacks(&self) -> u64 {
+        self.runtime_unsupported_fallbacks.load(Ordering::Relaxed)
+    }
+
+    /// Runtime planning failures. A row-group statistics or row filter
+    /// failure skips the runtime predicate for that task or refresh; a
+    /// page-index failure skips only its page pruning.
+    pub fn runtime_planning_fallbacks(&self) -> u64 {
+        self.runtime_planning_fallbacks.load(Ordering::Relaxed)
+    }
+
+    /// Tasks that stopped evaluating the runtime predicate on rows after an
+    /// evaluation error. Counted when the task's batches are fully read or
+    /// the stream is dropped.
+    pub fn runtime_row_evaluation_fallbacks(&self) -> u64 {
+        self.runtime_row_evaluation_fallbacks
+            .load(Ordering::Relaxed)
     }
 }
 

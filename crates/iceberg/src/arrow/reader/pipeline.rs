@@ -22,7 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arrow_schema::{DataType, Field};
 use futures::{StreamExt, TryStreamExt};
@@ -33,6 +33,7 @@ use parquet::arrow::push_decoder::{ParquetPushDecoderBuilder, RowGroupSelection}
 use parquet::arrow::{
     PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask, RowNumber,
 };
+use parquet::basic::SortOrder;
 use parquet::encryption::decrypt::FileDecryptionProperties;
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
@@ -57,7 +58,7 @@ use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::record_batch_transformer::{
     RecordBatchTransformer, RecordBatchTransformerBuilder,
 };
-use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
+use crate::arrow::scan_metrics::{CountingFileRead, RuntimeFallback, ScanMetrics, ScanResult};
 use crate::encryption::StandardKeyMetadata;
 use crate::error::{Result, invalid_data};
 use crate::expr::visitors::bloom_filter_evaluator::{
@@ -83,6 +84,10 @@ impl ArrowReader {
     pub fn read(self, tasks: FileScanTaskStream) -> Result<ScanResult> {
         let concurrency_limit_data_files = self.concurrency_limit_data_files;
         let scan_metrics = ScanMetrics::new();
+        let runtime_predicates = self.runtime_predicate_provider.map(|provider| {
+            let predicates = RuntimePredicates::new(provider);
+            Arc::new(predicates.with_metrics(scan_metrics.clone()))
+        });
 
         let task_reader = FileScanTaskReader {
             batch_size: self.batch_size,
@@ -94,9 +99,7 @@ impl ArrowReader {
             row_selection_enabled: self.row_selection_enabled,
             bloom_filter_enabled: self.bloom_filter_enabled,
             parquet_read_options: self.parquet_read_options,
-            runtime_predicates: self
-                .runtime_predicate_provider
-                .map(|provider| Arc::new(RuntimePredicates::new(provider))),
+            runtime_predicates,
             scan_metrics: scan_metrics.clone(),
         };
 
@@ -192,6 +195,22 @@ struct StreamContext<'a> {
     runtime_disabled: Arc<AtomicBool>,
 }
 
+/// Counts a task's runtime row-evaluation failure when its stream is dropped,
+/// because the failure can occur while decoding a row group that emits no batch.
+struct RowEvaluationFallback {
+    disabled: Arc<AtomicBool>,
+    metrics: ScanMetrics,
+}
+
+impl Drop for RowEvaluationFallback {
+    fn drop(&mut self) {
+        if self.disabled.load(Ordering::Relaxed) {
+            self.metrics
+                .record_runtime_fallback(RuntimeFallback::RowEvaluation);
+        }
+    }
+}
+
 impl FileScanTaskReader {
     async fn process(self, task: FileScanTask) -> Result<ArrowRecordBatchStream> {
         // Read before the predicate, so a publication in between is looked at again.
@@ -234,13 +253,10 @@ impl FileScanTaskReader {
             &mut plans,
             projection.record_batch_stream_builder.parquet_schema(),
             runtime_disabled.clone(),
+            &self.scan_metrics,
         )?;
 
-        if plans.iter().any(|plan| plan.advisory) {
-            self.scan_metrics.record_runtime_predicate_task();
-        }
-
-        let selected_row_group_indices = self
+        let (selected_row_group_indices, runtime_row_groups_pruned) = self
             .select_row_groups(&task, &plans, &mut projection.record_batch_stream_builder)
             .await?;
 
@@ -262,7 +278,8 @@ impl FileScanTaskReader {
             row_selection,
         )?;
 
-        self.build_record_batch_stream(StreamContext {
+        let scan_metrics = self.scan_metrics.clone();
+        let stream = self.build_record_batch_stream(StreamContext {
             task,
             projection,
             selected_row_group_indices,
@@ -271,7 +288,13 @@ impl FileScanTaskReader {
             plans: &plans,
             observed_generation,
             runtime_disabled,
-        })
+        })?;
+        // Runtime pruning takes effect only once the decoder that applies it is built.
+        if plans.iter().any(|plan| plan.advisory) {
+            scan_metrics.record_runtime_predicate_task();
+            scan_metrics.record_runtime_row_groups_pruned(runtime_row_groups_pruned);
+        }
+        Ok(stream)
     }
 
     /// Rejects the task when whole-file statistics prove no row can match the runtime predicate.
@@ -691,15 +714,20 @@ impl FileScanTaskReader {
                 task.schema(),
                 use_position_fallback,
             )
+            .map_err(|error| (RuntimeFallback::Unsupported, error))
             .and_then(|()| {
                 self.plan_predicate(predicate, true, stream_builder, task, use_position_fallback)
+                    .map_err(|error| (RuntimeFallback::Planning, error))
             });
             match planned {
                 Ok(plan) => plans.push(plan),
-                Err(error) => tracing::debug!(
-                    "Skipping runtime predicate for {}: {error}",
-                    task.data_file_path()
-                ),
+                Err((reason, error)) => {
+                    self.scan_metrics.record_runtime_fallback(reason);
+                    tracing::debug!(
+                        "Skipping runtime predicate for {}: {error}",
+                        task.data_file_path()
+                    );
+                }
             }
         }
 
@@ -707,12 +735,13 @@ impl FileScanTaskReader {
     }
 
     /// Evaluates byte ranges, predicate bounds, and bloom filters to select candidate row groups.
+    /// Also returns how many candidate groups only the runtime predicate removed.
     async fn select_row_groups(
         &self,
         task: &FileScanTask,
         plans: &[PlannedPredicate],
         stream_builder: &mut ParquetRecordBatchStreamBuilder<ArrowFileReader>,
-    ) -> Result<Option<Vec<usize>>> {
+    ) -> Result<(Option<Vec<usize>>, usize)> {
         // There are three possible sources for potential lists of selected RowGroup indices,
         // and two for `RowSelection`s.
         // Selected RowGroup index lists can come from three sources:
@@ -743,6 +772,7 @@ impl FileScanTaskReader {
 
         // Count the candidate groups the runtime predicate removed beyond the
         // task byte range and the planned and equality-delete predicates.
+        let mut runtime_row_groups_pruned = 0;
         if let Some(runtime_groups) = plans
             .iter()
             .find(|plan| plan.advisory)
@@ -757,9 +787,8 @@ impl FileScanTaskReader {
                 None => groups.len(),
             };
             let with_runtime = intersect_sorted(&without_runtime, runtime_groups);
-            self.scan_metrics.record_runtime_row_groups_pruned(
-                candidates(&without_runtime).saturating_sub(candidates(&with_runtime)),
-            );
+            runtime_row_groups_pruned =
+                candidates(&without_runtime).saturating_sub(candidates(&with_runtime));
         }
 
         for plan in plans {
@@ -796,7 +825,7 @@ impl FileScanTaskReader {
             }
         }
 
-        Ok(selected_row_group_indices)
+        Ok((selected_row_group_indices, runtime_row_groups_pruned))
     }
 
     /// Evaluates page indexes against planned predicates to prune pages within selected row groups.
@@ -817,6 +846,10 @@ impl FileScanTaskReader {
                     &plan.field_id_map,
                     task.schema(),
                 );
+                if plan.advisory && selection.is_err() {
+                    self.scan_metrics
+                        .record_runtime_fallback(RuntimeFallback::Planning);
+                }
                 row_selection = intersect_page_selection(
                     row_selection,
                     selection,
@@ -834,6 +867,7 @@ impl FileScanTaskReader {
         plans: &mut Vec<PlannedPredicate>,
         parquet_schema: &SchemaDescriptor,
         runtime_disabled: Arc<AtomicBool>,
+        scan_metrics: &ScanMetrics,
     ) -> Result<Option<RowFilter>> {
         // The planned and runtime predicates form one Arrow predicate, so
         // columns they share are decoded once and neither runs on the other's
@@ -865,6 +899,7 @@ impl FileScanTaskReader {
                 match row_filter_predicate(plans) {
                     Ok(arrow_predicate) => Some(arrow_predicate),
                     Err(error) if plans.last().is_some_and(|plan| plan.advisory) => {
+                        scan_metrics.record_runtime_fallback(RuntimeFallback::Planning);
                         tracing::debug!(
                             "Skipping runtime predicate for {}: {error}",
                             task.data_file_path()
@@ -934,6 +969,14 @@ impl FileScanTaskReader {
         let first_row_id = task.first_row_id();
         let project_row_id = projection.project_row_id;
         let mut record_batch_transformer = projection.record_batch_transformer;
+        let row_evaluation = if self.runtime_predicates.is_some() {
+            Some(RowEvaluationFallback {
+                disabled: runtime_disabled.clone(),
+                metrics: self.scan_metrics.clone(),
+            })
+        } else {
+            None
+        };
 
         // Build the batch stream and send all the RecordBatches that it generates
         // to the requester. When `_row_id` is projected, synthesize it over the raw parquet
@@ -1002,6 +1045,14 @@ impl FileScanTaskReader {
                     use_position_fallback: projection.use_position_fallback,
                     metrics: self.scan_metrics.clone(),
                 };
+                #[cfg(test)]
+                if super::runtime_stream::test_support::take_task_failure(
+                    refresh.task.data_file_path(),
+                    super::runtime_stream::test_support::Stage::Build,
+                ) {
+                    // Conflicting plans exercise parquet's actual build error.
+                    builder = builder.with_row_groups(vec![0]);
+                }
                 RuntimePrunedStream::new(
                     builder.build()?,
                     live_file_reader,
@@ -1029,6 +1080,8 @@ impl FileScanTaskReader {
         };
 
         let record_batch_stream = raw_stream.map(move |batch| {
+            // Dropped with the stream.
+            let _ = &row_evaluation;
             let mut batch = batch?;
             if project_row_id {
                 batch = synthesize_row_id_column(batch, first_row_id)?;
@@ -1520,14 +1573,24 @@ impl ArrowReader {
     }
 }
 
-/// Stably orders row-group selections by the descending maximum statistic of an integer
-/// `column` (dates are stored as int32). Groups without such a statistic keep their order
-/// after the ranked ones.
+/// Stably orders row-group selections by the descending maximum statistic of a signed
+/// integer `column` (dates are stored as int32). Groups without such a statistic keep their
+/// order after the ranked ones.
 fn order_by_descending_maximum(
     selections: &mut [RowGroupSelection],
     metadata: &ParquetMetaData,
     column: usize,
 ) {
+    // Unsigned integers are stored as signed physical values, so their
+    // statistics would rank in the wrong order.
+    let schema = metadata.file_metadata().schema_descr();
+    if schema
+        .columns()
+        .get(column)
+        .is_none_or(|descriptor| descriptor.sort_order() != SortOrder::SIGNED)
+    {
+        return;
+    }
     let maximum = |selection: &RowGroupSelection| -> Option<i64> {
         let group = metadata.row_groups().get(selection.row_group_index())?;
         match group.columns().get(column)?.statistics()? {
@@ -5051,5 +5114,55 @@ mod tests {
             count_bytes < projected_bytes,
             "empty projection must not decode data columns: count={count_bytes}, projected={projected_bytes}"
         );
+    }
+
+    #[test]
+    fn largest_first_order_skips_unsigned_integer_statistics() {
+        use arrow_array::UInt32Array;
+        use parquet::arrow::push_decoder::RowGroupSelection;
+        use parquet::file::metadata::ParquetMetaDataReader;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("unsigned.parquet");
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("signed", DataType::Int32, false),
+            Field::new("unsigned", DataType::UInt32, false),
+        ]));
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1))
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            File::create(&path).unwrap(),
+            schema.clone(),
+            Some(properties),
+        )
+        .unwrap();
+        // Read as a signed value, the first group's unsigned maximum is negative.
+        for (signed, unsigned) in [(1, 3_000_000_000), (2, 1)] {
+            let batch = RecordBatch::try_new(schema.clone(), vec![
+                Arc::new(Int32Array::from(vec![signed])),
+                Arc::new(UInt32Array::from(vec![unsigned])),
+            ])
+            .unwrap();
+            writer.write(&batch).unwrap();
+            writer.flush().unwrap();
+        }
+        writer.close().unwrap();
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&File::open(&path).unwrap())
+            .unwrap();
+        assert_eq!(metadata.num_row_groups(), 2);
+        let order = |column| {
+            let mut selections: Vec<_> = (0..2)
+                .map(|index| RowGroupSelection::new(index, None))
+                .collect();
+            super::order_by_descending_maximum(&mut selections, &metadata, column);
+            selections
+                .iter()
+                .map(RowGroupSelection::row_group_index)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(0), vec![1, 0]);
+        assert_eq!(order(1), vec![0, 1]);
     }
 }

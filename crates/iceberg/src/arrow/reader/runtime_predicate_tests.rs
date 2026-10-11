@@ -2366,6 +2366,46 @@ async fn runtime_predicate_failed_advisory_refresh_counts_no_rebuild() {
     assert_eq!(metrics.runtime_decoder_rebuilds(), 1);
 }
 
+#[tokio::test]
+async fn runtime_predicate_live_fallbacks_count_bind_and_unsupported_publications() {
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "live-fallbacks.parquet");
+    let schema: SchemaRef = Arc::new(
+        Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "payload", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(3, "added", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let provider = Arc::new(ChangingRuntimePredicate::new(None, 0));
+    let (mut stream, metrics) = start_runtime_scan(
+        scan_task(path, schema, None),
+        Some(provider.clone()),
+        false,
+        true,
+        4,
+    );
+    let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
+    // `missing` does not bind, and the file does not store `added`.
+    provider.publish(Some(Reference::new("missing").equal_to(Datum::int(100))), 1);
+    batches.push(stream.try_next().await.unwrap().unwrap());
+    provider.publish(Some(Reference::new("added").equal_to(Datum::int(5))), 2);
+    batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+    let expected = vec![0, 1, 2, 3, 100, 101, 102, 103, 200, 201, 202, 203];
+    assert_eq!(ids(&batches), expected);
+    let fallbacks = [
+        metrics.runtime_bind_fallbacks(),
+        metrics.runtime_unsupported_fallbacks(),
+        metrics.runtime_planning_fallbacks(),
+        metrics.runtime_decoder_rebuilds(),
+    ];
+    assert_eq!(fallbacks, [1, 1, 0, 0]);
+}
+
 /// Writes `groups` four-row groups of `(id, k)` with one page per row, where
 /// `k` cycles 0..4 inside every group.
 fn write_cycling_groups(path: &str, groups: i32) {
@@ -2967,6 +3007,181 @@ async fn live_refresh_rebuild_build_failure_metrics() {
         "with_row_group_selections cannot be combined",
     )
     .await;
+}
+
+#[tokio::test]
+async fn runtime_row_evaluation_error_keeps_statistics_pruning() {
+    use std::collections::HashSet;
+
+    use super::runtime_stream::test_support::{Probe, Stage};
+
+    // Statistics remove group 2 and every page with `k < 2`. Only row
+    // evaluation can remove `excluded`.
+    let excluded = 30000 + 2 * LINEAGE_PAGE_ROWS + 5;
+    let matches_runtime = |id: i32| {
+        (id % 10000) / LINEAGE_PAGE_ROWS >= 2 && !(20000..30000).contains(&id) && id != excluded
+    };
+    let outside_group_2 = Reference::new("id")
+        .less_than(Datum::int(20000))
+        .or(Reference::new("id").greater_than(Datum::int(29999)));
+    let predicate = Reference::new("k")
+        .greater_than_or_equal_to(Datum::int(2))
+        .and(outside_group_2)
+        .and(Reference::new("id").not_equal_to(Datum::int(excluded)));
+    for live in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().to_str().unwrap();
+        let path = format!("{dir}/row-evaluation.parquet");
+        write_lineage_groups(&path, false);
+        let probe = Probe::register(&path);
+        let planned = Reference::new("k").not_equal_to(Datum::int(3));
+        let task = patch_task(
+            lineage_task(&path, Some(planned)),
+            serde_json::json!({
+                "deletes": lineage_deletes(&path, dir),
+            }),
+        );
+        let (mandatory, _) = execute(task.clone(), None).await;
+        let mandatory = lineage_rows(&mandatory);
+        let provider = Arc::new(ChangingRuntimePredicate::new(
+            (!live).then(|| predicate.clone()),
+            0,
+        ));
+        let (mut stream, metrics) =
+            start_runtime_scan(task, Some(provider.clone()), true, true, 128);
+        let mut batches = vec![stream.try_next().await.unwrap().unwrap()];
+        probe.fail_at(Stage::RowEvaluation);
+        if live {
+            provider.publish(Some(predicate.clone()), 1);
+        }
+        batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+        let rows = lineage_rows(&batches);
+
+        // Groups and pages pruned by statistics stay pruned, and rows decoded
+        // after the failure skip runtime evaluation.
+        let expected: Vec<_> = mandatory
+            .iter()
+            .copied()
+            .filter(|(id, _, _)| {
+                (live && id / 10000 == 0)
+                    || (id / 10000 != 2 && (id % 10000) / LINEAGE_PAGE_ROWS >= 2)
+            })
+            .collect();
+        assert_eq!(rows, expected);
+        let output: HashSet<_> = rows.iter().collect();
+        let all_mandatory: HashSet<_> = mandatory.iter().collect();
+        let matching: HashSet<_> = mandatory
+            .iter()
+            .filter(|(id, _, _)| matches_runtime(*id))
+            .collect();
+        assert!(matching.is_subset(&output) && output.is_subset(&all_mandatory));
+        assert_eq!(metrics.runtime_row_evaluation_fallbacks(), 1);
+    }
+}
+
+#[tokio::test]
+async fn task_start_runtime_metrics_wait_for_decoder_build() {
+    use super::runtime_stream::test_support::{Probe, Stage};
+
+    let temp = TempDir::new().unwrap();
+    let path = write_three_row_group_file(temp.path().to_str().unwrap(), "task-start.parquet");
+    let probe = Probe::register(&path);
+    let provider = Arc::new(FixedRuntimePredicate::new(
+        Reference::new("id").greater_than_or_equal_to(Datum::int(200)),
+    ));
+    for (fail, expected) in [(true, [0, 0, 0, 0, 0, 0]), (false, [1, 0, 0, 0, 0, 2])] {
+        if fail {
+            probe.fail_at(Stage::Build);
+        }
+        let (mut stream, metrics) = start_runtime_scan(
+            scan_task(path.clone(), iceberg_schema(), None),
+            Some(provider.clone()),
+            true,
+            true,
+            4,
+        );
+        match stream.try_next().await {
+            Err(error) => {
+                assert!(fail, "{error}");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("with_row_group_selections cannot be combined"),
+                    "{error}"
+                );
+            }
+            Ok(batch) => assert_eq!(ids(&[batch.unwrap()]), vec![200, 201, 202, 203]),
+        }
+        assert_eq!(refresh_metric_counts(&metrics), expected);
+    }
+}
+
+#[tokio::test]
+async fn runtime_fallback_metrics_count_unsupported_and_planning_failures() {
+    use arrow_array::StructArray;
+
+    let temp = TempDir::new().unwrap();
+    let path = format!("{}/fallbacks.parquet", temp.path().to_str().unwrap());
+    let x = field("x", DataType::Int32, 4);
+    let s = StructArray::from(vec![(
+        Arc::new(x.clone()),
+        Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+    )]);
+    write_delete(
+        &path,
+        vec![
+            field("id", DataType::Int32, 1),
+            field("s", DataType::Struct(vec![x].into()), 3),
+        ],
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(s)],
+    );
+    let schema: SchemaRef = Arc::new(
+        Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(
+                    3,
+                    "s",
+                    Type::Struct(crate::spec::StructType::new(vec![
+                        NestedField::required(4, "x", Type::Primitive(PrimitiveType::Int)).into(),
+                    ])),
+                )
+                .into(),
+                NestedField::optional(5, "added", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap(),
+    );
+    // `added` is not stored in the file, and the reader cannot build row
+    // filters on the nested `s.x`.
+    for (predicate, expected) in [
+        (
+            Reference::new("added").greater_than_or_equal_to(Datum::int(5)),
+            [1, 0, 0],
+        ),
+        (
+            Reference::new("s.x").greater_than_or_equal_to(Datum::int(2)),
+            [0, 1, 0],
+        ),
+    ] {
+        let task = scan_task_with_deletes_and_projection(
+            path.clone(),
+            Arc::clone(&schema),
+            None,
+            vec![],
+            vec![1],
+        );
+        let provider = Arc::new(FixedRuntimePredicate::new(predicate.clone()));
+        let (batches, metrics) = execute(task, Some(provider)).await;
+        assert_eq!(ids(&batches), vec![1, 2]);
+        let fallbacks = [
+            metrics.runtime_unsupported_fallbacks(),
+            metrics.runtime_planning_fallbacks(),
+            metrics.runtime_row_evaluation_fallbacks(),
+        ];
+        assert_eq!(fallbacks, expected, "{predicate}");
+    }
 }
 
 const LINEAGE_PAGE_ROWS: i32 = 1024;
