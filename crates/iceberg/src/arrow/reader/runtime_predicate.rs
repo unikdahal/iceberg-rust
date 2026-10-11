@@ -1,0 +1,1023 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Execution-time predicates published to the Arrow reader.
+
+use std::sync::{Arc, RwLock};
+
+use arrow_schema::SchemaRef as ArrowSchemaRef;
+use parquet::arrow::arrow_reader::RowSelection;
+use parquet::schema::types::SchemaDescriptor;
+
+use super::ArrowReader;
+use crate::arrow::record_batch_transformer::column_needs_type_promotion;
+use crate::arrow::scan_metrics::{RuntimeFallback, ScanMetrics};
+use crate::arrow::type_to_arrow_type;
+use crate::expr::{Bind, BoundPredicate, Predicate};
+use crate::spec::{PrimitiveType, Schema, SchemaRef};
+use crate::{Error, ErrorKind, Result};
+
+/// An immutable view of a runtime predicate at one point in execution.
+#[derive(Debug)]
+pub struct RuntimePredicateSnapshot {
+    predicate: Option<Predicate>,
+    generation: u64,
+}
+
+impl RuntimePredicateSnapshot {
+    /// Creates a runtime predicate snapshot. A `None` predicate adds no
+    /// restriction to tasks that start with it. It does not undo pruning
+    /// already applied.
+    pub fn new(predicate: Option<Predicate>, generation: u64) -> Self {
+        Self {
+            predicate,
+            generation,
+        }
+    }
+
+    /// Returns the publication generation this predicate belongs to.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Consumes the snapshot, returning its predicate without cloning it.
+    pub fn into_predicate(self) -> Option<Predicate> {
+        self.predicate
+    }
+}
+
+/// Supplies execution-time predicates, such as a completed join build's key
+/// range or a TopK/MIN/MAX bound, to the Arrow reader.
+///
+/// Contract:
+/// * Data skipped under a published predicate must never be required by a
+///   later publication. Once published, a predicate stays safe to combine with
+///   the planned predicate for every row read after it, including by tasks still
+///   using that generation. A later publication may therefore tighten it, but
+///   not loosen it. The one exception is `None`, which stops runtime pruning
+///   for tasks that start afterwards. It does not revoke predicates already
+///   captured by earlier tasks or restore data they skipped.
+/// * Generations increase monotonically on every change, are never reused,
+///   and become visible only after their predicate.
+/// * Provider, snapshot, binding, planning and page-pruning failures are
+///   advisory: the reader skips the runtime predicate, does not retry them
+///   and counts them by reason in `ScanMetrics`. Planned-filter,
+///   delete-filter and decoding errors remain fatal.
+/// * A runtime row-evaluation error stops runtime row evaluation and
+///   publication refreshes for the rest of that task. Row groups and pages
+///   already excluded by statistics stay excluded: the statistics proved that
+///   none of their rows match a published predicate, so the first rule makes
+///   skipping them safe. The planned filter and deletes still apply, so the
+///   task returns every row that passes them and the runtime predicate, and
+///   no row that fails them.
+///
+/// # Refresh
+///
+/// The reader checks `generation()` when each data-file task starts and, with
+/// row-group filtering enabled, at each later row-group boundary, and takes a
+/// snapshot only when the generation changed. A newer predicate can replace
+/// the task's current one for the row groups not yet started; the row group
+/// being decoded finishes under the predicate it started with. A `None`
+/// snapshot, or a refresh the reader declines, leaves the current predicate in
+/// force.
+///
+/// # Support
+///
+/// Comparisons, null and NaN tests, `IN`, `STARTS WITH` and their negations,
+/// combined with AND, OR and NOT, on primitive columns that the data file
+/// stores with their table type or a promotion the reader compares
+/// losslessly. A predicate that references a column the file lacks or stores
+/// with another promoted type is skipped for that file, and one on a nested
+/// column is skipped because row filters cannot evaluate it.
+/// Floating-point columns support only null and NaN tests: a publication
+/// with a floating-point comparison or set is skipped as a whole, because the
+/// statistics evaluators and Arrow row filters do not agree on every NaN and
+/// signed-zero comparison.
+///
+/// Each layer skips only data it proves cannot match:
+///
+/// | Layer | Applies when |
+/// |---|---|
+/// | Whole file, from manifest statistics | the task retains them, see `TableScanBuilder::include_column_stats` |
+/// | Row groups, from column statistics | row-group filtering is enabled |
+/// | Row groups, from bloom filters (`=` and `IN`) | bloom filtering is enabled |
+/// | Pages, from the page index | row selection is enabled |
+/// | Rows, by an Arrow row filter | always |
+///
+/// Pass a provider to `ArrowReaderBuilder::with_runtime_predicate_provider`.
+/// This is the reader layer only: `TableScan::to_arrow` does not accept a
+/// provider yet, so engines that plan through `TableScan` read its planned
+/// tasks themselves:
+///
+/// ```no_run
+/// use std::sync::Arc;
+///
+/// use futures::TryStreamExt;
+/// use iceberg::arrow::{ArrowReaderBuilder, RuntimePredicateProvider};
+/// use iceberg::table::Table;
+/// use iceberg::{Result, Runtime};
+///
+/// async fn read(table: &Table, provider: Arc<dyn RuntimePredicateProvider>) -> Result<()> {
+///     // Retained statistics let the reader reject a whole file before opening it.
+///     let scan = table.scan().include_column_stats_for(["id"]).build()?;
+///     let tasks = scan.plan_files().await?;
+///     let reader = ArrowReaderBuilder::new(table.file_io().clone(), Runtime::current())
+///         .with_runtime_predicate_provider(provider)
+///         .build();
+///     let result = reader.read(tasks)?;
+///     let metrics = result.metrics().clone();
+///     let batches: Vec<_> = result.stream().try_collect().await?;
+///     println!(
+///         "{} batches, {} files pruned",
+///         batches.len(),
+///         metrics.runtime_file_tasks_pruned()
+///     );
+///     Ok(())
+/// }
+/// ```
+///
+/// # Example
+///
+/// A provider that publishes an upper bound on `id`. The predicate and its
+/// generation change together under a lock, and the cheap generation is
+/// stored last so it is never visible before its predicate.
+///
+/// ```
+/// use std::sync::Mutex;
+/// use std::sync::atomic::{AtomicU64, Ordering};
+///
+/// use iceberg::Result;
+/// use iceberg::arrow::{RuntimePredicateProvider, RuntimePredicateSnapshot};
+/// use iceberg::expr::{Predicate, Reference};
+/// use iceberg::spec::Datum;
+///
+/// struct UpperBound {
+///     published: Mutex<(u64, Option<Predicate>)>,
+///     generation: AtomicU64,
+/// }
+///
+/// impl UpperBound {
+///     /// Publishes a bound that must be no looser than the previous one.
+///     fn publish(&self, bound: i64) {
+///         let mut published = self.published.lock().unwrap();
+///         let generation = published.0 + 1;
+///         let predicate = Reference::new("id").less_than_or_equal_to(Datum::long(bound));
+///         *published = (generation, Some(predicate));
+///         self.generation.store(generation, Ordering::Release);
+///     }
+/// }
+///
+/// impl RuntimePredicateProvider for UpperBound {
+///     fn generation(&self) -> u64 {
+///         self.generation.load(Ordering::Acquire)
+///     }
+///
+///     fn snapshot(&self) -> Result<RuntimePredicateSnapshot> {
+///         let (generation, predicate) = self.published.lock().unwrap().clone();
+///         Ok(RuntimePredicateSnapshot::new(predicate, generation))
+///     }
+/// }
+/// ```
+pub trait RuntimePredicateProvider: Send + Sync {
+    /// Returns the current publication generation. Called at task start and,
+    /// with row-group filtering enabled, at row-group boundaries before further
+    /// fetch/decode attempts. Keep it cheap, for example an atomic acquire load.
+    fn generation(&self) -> u64;
+
+    /// Returns the current runtime predicate snapshot. The predicate and
+    /// generation must be a self-consistent pair, and the generation must not
+    /// be older than one `generation()` has already returned; the reader
+    /// ignores an older snapshot.
+    ///
+    /// Implementations should use in-memory, non-blocking work because refresh
+    /// serializes data-file tasks while taking the snapshot and binding it.
+    fn snapshot(&self) -> Result<RuntimePredicateSnapshot>;
+
+    /// Supplies a best-effort hint to visit row groups by descending maximum.
+    ///
+    /// This applies only with row-group filtering enabled and embedded field
+    /// IDs mapping the named column. Only physical INT32/INT64 statistics of
+    /// signed columns are ranked; unsupported or missing statistics keep their
+    /// relative file order after ranked groups. A missing field ID, column or
+    /// signed sort order leaves file order unchanged. The default is no hint;
+    /// read order is unspecified.
+    fn largest_first_column(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Retains one bound predicate across a scan's tasks, keyed by generation,
+/// schema and case policy. A different schema or case policy replaces the
+/// binding; bindings for multiple schemas are not retained simultaneously.
+/// Failures are cached as `None` for that key.
+pub(super) struct RuntimePredicates {
+    provider: Arc<dyn RuntimePredicateProvider>,
+    cached: RwLock<Option<CachedPredicate>>,
+    metrics: ScanMetrics,
+}
+
+struct CachedPredicate {
+    generation: u64,
+    schema: SchemaRef,
+    case_sensitive: bool,
+    predicate: Option<Arc<BoundPredicate>>,
+}
+
+impl CachedPredicate {
+    fn matches(&self, generation: u64, schema: &SchemaRef, case_sensitive: bool) -> bool {
+        // A snapshot can observe a publication newer than the cheap check.
+        self.generation >= generation
+            && self.case_sensitive == case_sensitive
+            && (Arc::ptr_eq(&self.schema, schema) || *self.schema == **schema)
+    }
+}
+
+impl RuntimePredicates {
+    pub(super) fn new(provider: Arc<dyn RuntimePredicateProvider>) -> Self {
+        Self {
+            provider,
+            cached: RwLock::new(None),
+            metrics: ScanMetrics::new(),
+        }
+    }
+
+    /// Counts the publications this cache skips in `metrics`.
+    pub(super) fn with_metrics(mut self, metrics: ScanMetrics) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Returns the provider's current generation, for a cheap change check.
+    pub(super) fn generation(&self) -> u64 {
+        self.provider.generation()
+    }
+
+    /// See [`RuntimePredicateProvider::largest_first_column`].
+    pub(super) fn largest_first_column(&self) -> Option<String> {
+        self.provider.largest_first_column()
+    }
+
+    /// Returns the current predicate bound to `schema`, with NOT pushed to the
+    /// leaves because statistics evaluators cannot negate a "might match".
+    pub(super) fn current(
+        &self,
+        schema: &SchemaRef,
+        case_sensitive: bool,
+        data_file_path: &str,
+    ) -> Option<Arc<BoundPredicate>> {
+        // Stable publications are shared reads: parallel data-file tasks must
+        // not serialize merely to clone the same immutable bound predicate.
+        let generation = self.provider.generation();
+        if let Some(cached) = self.cached.read().unwrap().as_ref()
+            && cached.matches(generation, schema, case_sensitive)
+        {
+            return cached.predicate.clone();
+        }
+
+        // Hold the write lock for the whole refresh so concurrent misses wait for it
+        // instead of repeating the snapshot and binding, and a slow refresh
+        // cannot overwrite a newer one. Read the generation after locking so
+        // waiters reuse a completed refresh, including a failed one.
+        let mut cache = self.cached.write().unwrap();
+        let generation = self.provider.generation();
+        if let Some(cached) = cache.as_ref()
+            && cached.matches(generation, schema, case_sensitive)
+        {
+            return cached.predicate.clone();
+        }
+
+        // Never replace a newer cached generation, even if the binding context
+        // changes or the provider returns an outdated snapshot. Such a snapshot
+        // is advisory and is cached as a failure at the observed generation.
+        let generation = cache
+            .as_ref()
+            .map_or(generation, |cached| generation.max(cached.generation));
+        let (generation, predicate) = match self.provider.snapshot() {
+            Ok(snapshot) if snapshot.generation() < generation => {
+                self.metrics.record_runtime_fallback(RuntimeFallback::Stale);
+                tracing::debug!("Skipping stale runtime predicate for {data_file_path}");
+                (generation, None)
+            }
+            Ok(snapshot) => {
+                let generation = snapshot.generation();
+                let bound = snapshot
+                    .into_predicate()
+                    .map(|predicate| {
+                        let bound = predicate
+                            .rewrite_not()
+                            .bind(schema.clone(), case_sensitive)
+                            .map_err(|error| (RuntimeFallback::Bind, error))?;
+                        check_runtime_predicate_semantics(&bound)
+                            .map_err(|error| (RuntimeFallback::Unsupported, error))?;
+                        Ok::<_, (RuntimeFallback, Error)>(bound)
+                    })
+                    .transpose();
+                match bound {
+                    Ok(bound) => (generation, bound.map(Arc::new)),
+                    Err((reason, error)) => {
+                        self.metrics.record_runtime_fallback(reason);
+                        tracing::debug!("Skipping runtime predicate for {data_file_path}: {error}");
+                        (generation, None)
+                    }
+                }
+            }
+            Err(error) => {
+                self.metrics
+                    .record_runtime_fallback(RuntimeFallback::Snapshot);
+                tracing::debug!("Skipping runtime predicate for {data_file_path}: {error}");
+                (generation, None)
+            }
+        };
+        // An equivalent publication keeps the bound predicate already in force, so
+        // tasks and boundaries can recognize it without replanning.
+        let predicate = predicate.map(|predicate| {
+            cache
+                .as_ref()
+                .filter(|cached| {
+                    cached.case_sensitive == case_sensitive
+                        && (Arc::ptr_eq(&cached.schema, schema) || *cached.schema == **schema)
+                })
+                .and_then(|cached| cached.predicate.clone())
+                .filter(|existing| *existing == predicate)
+                .unwrap_or(predicate)
+        });
+        let result = predicate.clone();
+        *cache = Some(CachedPredicate {
+            generation,
+            schema: schema.clone(),
+            case_sensitive,
+            predicate,
+        });
+        result
+    }
+}
+
+/// Statistics and row filtering must agree before any data can be skipped.
+/// Floating-point equality in the statistics evaluators treats every NaN
+/// payload as one value, while Arrow compares bit patterns. Parquet's
+/// floating-point bounds also exclude NaNs that an Arrow ordering predicate may
+/// match.
+fn check_runtime_predicate_semantics(predicate: &BoundPredicate) -> Result<()> {
+    let reference = match predicate {
+        BoundPredicate::And(expression) | BoundPredicate::Or(expression) => {
+            for input in expression.inputs() {
+                check_runtime_predicate_semantics(input)?;
+            }
+            return Ok(());
+        }
+        BoundPredicate::Not(expression) => {
+            return check_runtime_predicate_semantics(expression.inputs()[0]);
+        }
+        BoundPredicate::Binary(expression) => expression.term(),
+        BoundPredicate::Set(expression) => expression.term(),
+        _ => return Ok(()),
+    };
+    if matches!(
+        reference.field().field_type.as_primitive_type(),
+        Some(PrimitiveType::Float | PrimitiveType::Double)
+    ) {
+        return Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Runtime floating-point comparisons do not have consistent pruning semantics",
+        ));
+    }
+    Ok(())
+}
+
+/// Fails if `predicate` references a column the file lacks (its default is
+/// invisible to physical filters) or stores with an unsupported promoted type.
+/// Signed INT32 to LONG is lossless in statistics, pages and row evaluation.
+pub(super) fn check_runtime_predicate_columns(
+    predicate: &BoundPredicate,
+    parquet_schema: &SchemaDescriptor,
+    arrow_schema: &ArrowSchemaRef,
+    table_schema: &Schema,
+    use_position_fallback: bool,
+) -> Result<()> {
+    let (field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
+        parquet_schema,
+        arrow_schema,
+        predicate,
+        use_position_fallback,
+    )?;
+    // Arrow and Parquet use the same leaf-column order, including for nested
+    // fields. Resolve by column index so name mapping and position fallback
+    // follow the same field resolution as predicate planning.
+    let mut source_fields = Vec::new();
+    arrow_schema.fields().filter_leaves(|_, field| {
+        source_fields.push(field.clone());
+        false
+    });
+    for field_id in field_ids {
+        let unusable = |reason: &str| {
+            Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!("Runtime predicate field {field_id} {reason}"),
+            )
+        };
+        let column = *field_id_map
+            .get(&field_id)
+            .ok_or_else(|| unusable("is not stored in this file"))?;
+        let field = table_schema
+            .field_by_id(field_id)
+            .ok_or_else(|| unusable("is not in the table schema"))?;
+        field
+            .field_type
+            .as_primitive_type()
+            .ok_or_else(|| unusable("is not a primitive column"))?;
+        let source_field = source_fields
+            .get(column)
+            .ok_or_else(|| unusable("has no Arrow leaf column"))?;
+        let target_type = type_to_arrow_type(&field.field_type)?;
+        let signed_int_to_long = source_field.data_type() == &arrow_schema::DataType::Int32
+            && target_type == arrow_schema::DataType::Int64
+            && parquet_schema.column(column).converted_type()
+                != parquet::basic::ConvertedType::UINT_32
+            && !parquet_schema
+                .column(column)
+                .logical_type_ref()
+                .is_some_and(|logical| {
+                    matches!(logical, parquet::basic::LogicalType::Integer(integer)
+                    if !integer.is_signed)
+                });
+        if column_needs_type_promotion(source_field.data_type(), &target_type)
+            && !signed_int_to_long
+        {
+            return Err(unusable("is stored with a promoted physical type"));
+        }
+    }
+    Ok(())
+}
+
+/// Intersects two ascending row-group index lists in linear time.
+pub(super) fn intersect_sorted(left: &[usize], right: &[usize]) -> Vec<usize> {
+    let (mut left, mut right) = (left.iter().peekable(), right.iter().peekable());
+    let mut intersection = Vec::new();
+    while let (Some(&&l), Some(&&r)) = (left.peek(), right.peek()) {
+        match l.cmp(&r) {
+            std::cmp::Ordering::Less => {
+                left.next();
+            }
+            std::cmp::Ordering::Greater => {
+                right.next();
+            }
+            std::cmp::Ordering::Equal => {
+                intersection.push(l);
+                left.next();
+                right.next();
+            }
+        }
+    }
+    intersection
+}
+
+/// Intersects a predicate's page-index selection with `current`, where `None`
+/// selects every row. An advisory predicate's failure leaves `current` as is.
+pub(super) fn intersect_page_selection(
+    current: Option<RowSelection>,
+    selection: Result<Option<RowSelection>>,
+    advisory: bool,
+    data_file_path: &str,
+) -> Result<Option<RowSelection>> {
+    let selection = match selection {
+        Ok(selection) => selection,
+        Err(error) if advisory => {
+            tracing::debug!("Skipping runtime page pruning for {data_file_path}: {error}");
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(match (current, selection) {
+        (Some(current), Some(selection)) => Some(current.intersection(&selection)),
+        (current, selection) => current.or(selection),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::sync::{Barrier, Mutex, OnceLock, Weak};
+    use std::time::Duration;
+
+    use super::*;
+    use crate::expr::Reference;
+    use crate::spec::{Datum, NestedField, PrimitiveType, Type};
+
+    /// Holds the first snapshot open so concurrent callers overlap a refresh.
+    struct GatedProvider {
+        generation: AtomicU64,
+        snapshots: AtomicU64,
+        started: Sender<()>,
+        release: Mutex<Receiver<()>>,
+        fail_first_generation: bool,
+        predicates: OnceLock<Weak<RuntimePredicates>>,
+    }
+
+    impl RuntimePredicateProvider for GatedProvider {
+        fn generation(&self) -> u64 {
+            self.generation.load(Ordering::Acquire)
+        }
+
+        fn snapshot(&self) -> Result<RuntimePredicateSnapshot> {
+            let generation = self.generation();
+            let first = self.snapshots.fetch_add(1, Ordering::Relaxed) == 0;
+            self.started.send(()).unwrap();
+            if first {
+                // The cache stays locked for the whole refresh, so concurrent
+                // misses wait for this snapshot instead of starting their own.
+                let predicates = self.predicates.get().unwrap().upgrade().unwrap();
+                assert!(predicates.cached.try_read().is_err());
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            }
+            if self.fail_first_generation && generation == 1 {
+                return Err(Error::new(ErrorKind::Unexpected, "snapshot failed"));
+            }
+            Ok(RuntimePredicateSnapshot::new(
+                Some(
+                    Reference::new("id")
+                        .greater_than_or_equal_to(Datum::long((generation * 100) as i64)),
+                ),
+                generation,
+            ))
+        }
+    }
+
+    fn concurrent_refresh(fail_first_generation: bool, publish_during_snapshot: bool) {
+        const CALLERS: usize = 8;
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let provider = Arc::new(GatedProvider {
+            generation: AtomicU64::new(1),
+            snapshots: AtomicU64::new(0),
+            started: started_tx,
+            release: Mutex::new(release_rx),
+            fail_first_generation,
+            predicates: OnceLock::new(),
+        });
+        let predicates = Arc::new(RuntimePredicates::new(provider.clone()));
+        provider
+            .predicates
+            .set(Arc::downgrade(&predicates))
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(CALLERS + 1));
+        let callers: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let predicates = predicates.clone();
+                let schema = schema.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    predicates.current(&schema, false, "concurrent.parquet")
+                })
+            })
+            .collect();
+        barrier.wait();
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        if publish_during_snapshot {
+            provider.generation.store(2, Ordering::Release);
+        }
+        release_tx.send(()).unwrap();
+        let results: Vec<_> = callers.into_iter().map(|t| t.join().unwrap()).collect();
+
+        let current = predicates.current(&schema, false, "later.parquet");
+        let expected_generation = if publish_during_snapshot { 2 } else { 1 };
+        assert_eq!(
+            predicates
+                .cached
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .generation,
+            expected_generation
+        );
+        assert_eq!(
+            provider.snapshots.load(Ordering::Relaxed),
+            expected_generation,
+            "one snapshot and binding attempt per generation"
+        );
+        if fail_first_generation {
+            assert!(results.iter().all(Option::is_none));
+            assert!(current.is_none());
+            // A failed generation is retained, but does not suppress a later
+            // successful publication.
+            provider.generation.store(2, Ordering::Release);
+            let recovered = predicates
+                .current(&schema, false, "recovered.parquet")
+                .unwrap();
+            assert!(Arc::ptr_eq(
+                &recovered,
+                &predicates
+                    .current(&schema, false, "reused.parquet")
+                    .unwrap()
+            ));
+            assert_eq!(provider.snapshots.load(Ordering::Relaxed), 2);
+        } else {
+            let current = current.unwrap();
+            // A caller may sample generation 1 before publication and then
+            // acquire the read lock after the first refresh. Reusing that
+            // still-safe bound is valid; scheduling decides which waiters
+            // observe generation 2. Every caller must reuse one of the two
+            // bindings, rather than binding an equivalent predicate again.
+            let original = results.iter().find_map(|result| {
+                let bound = result.as_ref().unwrap();
+                (!Arc::ptr_eq(bound, &current)).then_some(bound)
+            });
+            if publish_during_snapshot {
+                let original = original.expect("the gated snapshot captures generation 1");
+                let expected = Reference::new("id")
+                    .greater_than_or_equal_to(Datum::long(100))
+                    .bind(schema.clone(), false)
+                    .unwrap();
+                assert_eq!(original.as_ref(), &expected);
+                assert!(results.iter().all(|result| {
+                    let bound = result.as_ref().unwrap();
+                    Arc::ptr_eq(bound, original) || Arc::ptr_eq(bound, &current)
+                }));
+            } else {
+                assert!(original.is_none());
+            }
+            assert!(Arc::ptr_eq(
+                &current,
+                &predicates
+                    .current(&schema, false, "reused.parquet")
+                    .unwrap()
+            ));
+        }
+    }
+
+    #[test]
+    fn intersect_sorted_keeps_common_indices_in_order() {
+        assert_eq!(
+            intersect_sorted(&[0, 2, 3, 7, 9], &[1, 2, 3, 8, 9, 10]),
+            vec![2, 3, 9]
+        );
+        assert_eq!(intersect_sorted(&[1, 2], &[]), Vec::<usize>::new());
+        assert_eq!(intersect_sorted(&[], &[1, 2]), Vec::<usize>::new());
+        assert_eq!(intersect_sorted(&[4, 5], &[4, 5]), vec![4, 5]);
+        assert_eq!(intersect_sorted(&[0, 1], &[2, 3]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn concurrent_runtime_predicate_refresh_snapshots_and_binds_once() {
+        concurrent_refresh(false, false);
+    }
+
+    #[test]
+    fn runtime_predicate_cache_hits_allow_concurrent_readers() {
+        struct Provider(AtomicU64);
+        impl RuntimePredicateProvider for Provider {
+            fn generation(&self) -> u64 {
+                1
+            }
+
+            fn snapshot(&self) -> Result<RuntimePredicateSnapshot> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(RuntimePredicateSnapshot::new(
+                    Some(Reference::new("id").greater_than(Datum::long(0))),
+                    1,
+                ))
+            }
+        }
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let provider = Arc::new(Provider(AtomicU64::new(0)));
+        let predicates = RuntimePredicates::new(provider.clone());
+        let expected = predicates.current(&schema, true, "first.parquet").unwrap();
+        std::thread::scope(|scope| {
+            // A cache hit needs no exclusive access even while another task is
+            // reading the cached publication.
+            let cache_reader = predicates.cached.read().unwrap();
+            let (completed_tx, completed_rx) = mpsc::channel();
+            let predicates = &predicates;
+            let schema = &schema;
+            let expected = &expected;
+            scope.spawn(move || {
+                let current = predicates
+                    .current(schema, true, "parallel.parquet")
+                    .unwrap();
+                completed_tx.send(Arc::ptr_eq(&current, expected)).unwrap();
+            });
+            assert!(completed_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+            drop(cache_reader);
+        });
+        assert_eq!(provider.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn concurrent_runtime_predicate_publication_does_not_regress_cache() {
+        concurrent_refresh(false, true);
+    }
+
+    #[test]
+    fn concurrent_runtime_predicate_failure_is_cached_until_next_generation() {
+        concurrent_refresh(true, false);
+    }
+
+    #[test]
+    fn runtime_predicate_fallbacks_count_each_rejected_publication_once() {
+        struct Provider {
+            generation: AtomicU64,
+            published: Mutex<Option<(Predicate, u64)>>,
+        }
+        impl RuntimePredicateProvider for Provider {
+            fn generation(&self) -> u64 {
+                self.generation.load(Ordering::Acquire)
+            }
+
+            fn snapshot(&self) -> Result<RuntimePredicateSnapshot> {
+                let (predicate, generation) = self
+                    .published
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .ok_or_else(|| Error::new(ErrorKind::Unexpected, "snapshot failed"))?;
+                Ok(RuntimePredicateSnapshot::new(Some(predicate), generation))
+            }
+        }
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::required(2, "v", Type::Primitive(PrimitiveType::Double)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let provider = Arc::new(Provider {
+            generation: AtomicU64::new(0),
+            published: Mutex::new(None),
+        });
+        let metrics = ScanMetrics::new();
+        let predicates = RuntimePredicates::new(provider.clone());
+        let predicates = predicates.with_metrics(metrics.clone());
+        let unbound = Reference::new("missing").is_null();
+        let float = Reference::new("v").greater_than(Datum::double(0.0));
+        let valid = Reference::new("id").greater_than(Datum::long(0));
+        // Counters: snapshot, bind, stale and unsupported.
+        let cases = [
+            (None, 1, [1, 0, 0, 0]),
+            (Some((unbound, 2)), 2, [1, 1, 0, 0]),
+            (Some((float, 3)), 3, [1, 1, 0, 1]),
+            // Older than the generation already observed.
+            (Some((valid.clone(), 3)), 4, [1, 1, 1, 1]),
+        ];
+        for (published, generation, expected) in cases {
+            *provider.published.lock().unwrap() = published;
+            provider.generation.store(generation, Ordering::Release);
+            for path in ["first.parquet", "second.parquet"] {
+                assert!(predicates.current(&schema, false, path).is_none());
+            }
+            let fallbacks = [
+                metrics.runtime_snapshot_fallbacks(),
+                metrics.runtime_bind_fallbacks(),
+                metrics.runtime_stale_fallbacks(),
+                metrics.runtime_unsupported_fallbacks(),
+            ];
+            assert_eq!(fallbacks, expected);
+        }
+
+        *provider.published.lock().unwrap() = Some((valid, 5));
+        provider.generation.store(5, Ordering::Release);
+        assert!(
+            predicates
+                .current(&schema, false, "valid.parquet")
+                .is_some()
+        );
+        assert_eq!(metrics.runtime_stale_fallbacks(), 1);
+        assert_eq!(metrics.runtime_planning_fallbacks(), 0);
+    }
+
+    #[test]
+    fn runtime_predicate_stale_snapshot_is_cached_without_regression() {
+        struct Provider {
+            generation: AtomicU64,
+            snapshot_generation: AtomicU64,
+            snapshots: AtomicU64,
+        }
+        impl RuntimePredicateProvider for Provider {
+            fn generation(&self) -> u64 {
+                self.generation.load(Ordering::Acquire)
+            }
+
+            fn snapshot(&self) -> Result<RuntimePredicateSnapshot> {
+                self.snapshots.fetch_add(1, Ordering::Relaxed);
+                Ok(RuntimePredicateSnapshot::new(
+                    Some(Reference::new("id").greater_than(Datum::long(0))),
+                    self.snapshot_generation.load(Ordering::Acquire),
+                ))
+            }
+        }
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let provider = Arc::new(Provider {
+            generation: AtomicU64::new(1),
+            snapshot_generation: AtomicU64::new(2),
+            snapshots: AtomicU64::new(0),
+        });
+        let predicates = RuntimePredicates::new(provider.clone());
+        let bound = predicates.current(&schema, false, "ahead.parquet").unwrap();
+        // Snapshot publication can precede the cheap generation publication.
+        assert!(Arc::ptr_eq(
+            &bound,
+            &predicates
+                .current(&schema, false, "reused.parquet")
+                .unwrap()
+        ));
+        assert_eq!(provider.snapshots.load(Ordering::Relaxed), 1);
+
+        // Rebinding under another case policy must not lower the high-water
+        // generation even if a provider supplies an outdated snapshot.
+        provider.snapshot_generation.store(1, Ordering::Release);
+        assert!(predicates.current(&schema, true, "stale.parquet").is_none());
+        assert_eq!(
+            predicates
+                .cached
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .generation,
+            2
+        );
+        assert!(
+            predicates
+                .current(&schema, true, "cached-failure.parquet")
+                .is_none()
+        );
+        assert_eq!(provider.snapshots.load(Ordering::Relaxed), 2);
+
+        // A stale snapshot following a newer cheap check is also a cached
+        // failure, rather than work to retry for every data-file task.
+        provider.generation.store(3, Ordering::Release);
+        assert!(predicates.current(&schema, true, "newer.parquet").is_none());
+        assert!(
+            predicates
+                .current(&schema, true, "no-storm.parquet")
+                .is_none()
+        );
+        assert_eq!(provider.snapshots.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            predicates
+                .cached
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .generation,
+            3
+        );
+    }
+
+    #[test]
+    #[ignore = "timing test run explicitly by fork CI"]
+    fn runtime_performance_concurrent_cache_miss() {
+        use std::time::Instant;
+
+        struct Provider {
+            predicate: Predicate,
+            snapshots: AtomicU64,
+        }
+        impl RuntimePredicateProvider for Provider {
+            fn generation(&self) -> u64 {
+                1
+            }
+
+            fn snapshot(&self) -> Result<RuntimePredicateSnapshot> {
+                self.snapshots.fetch_add(1, Ordering::Relaxed);
+                Ok(RuntimePredicateSnapshot::new(
+                    Some(self.predicate.clone()),
+                    1,
+                ))
+            }
+        }
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        for callers in [1, 8, 32, 128] {
+            let mut samples = Vec::new();
+            for _ in 0..5 {
+                let provider = Arc::new(Provider {
+                    predicate: Reference::new("id").is_in((0..10_000).map(Datum::long)),
+                    snapshots: AtomicU64::new(0),
+                });
+                let predicates = RuntimePredicates::new(provider.clone());
+                let barrier = Barrier::new(callers + 1);
+                std::thread::scope(|scope| {
+                    let threads: Vec<_> = (0..callers)
+                        .map(|_| {
+                            scope.spawn(|| {
+                                barrier.wait();
+                                let started = Instant::now();
+                                let bound = predicates.current(&schema, false, "timing.parquet");
+                                (started.elapsed(), bound.unwrap())
+                            })
+                        })
+                        .collect();
+                    barrier.wait();
+                    let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+                    assert!(
+                        results
+                            .iter()
+                            .all(|(_, bound)| Arc::ptr_eq(bound, &results[0].1))
+                    );
+                    let max = results.iter().map(|(time, _)| *time).max().unwrap();
+                    samples.push(max.as_secs_f64() * 1000.0);
+                });
+                assert_eq!(provider.snapshots.load(Ordering::Relaxed), 1);
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "R3 cache callers={callers} keys=10000 median_max_ms={:.3} snapshots=1",
+                samples[2],
+            );
+        }
+    }
+
+    #[test]
+    fn equivalent_publication_reuses_binding_without_reusing_generation() {
+        struct Provider(AtomicU64);
+        impl RuntimePredicateProvider for Provider {
+            fn generation(&self) -> u64 {
+                self.0.load(Ordering::Acquire)
+            }
+
+            fn snapshot(&self) -> Result<RuntimePredicateSnapshot> {
+                Ok(RuntimePredicateSnapshot::new(
+                    Some(Reference::new("id").less_than(Datum::long(10))),
+                    self.generation(),
+                ))
+            }
+        }
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let provider = Arc::new(Provider(AtomicU64::new(1)));
+        let predicates = RuntimePredicates::new(provider.clone());
+        let first = predicates.current(&schema, false, "first").unwrap();
+        provider.0.store(2, Ordering::Release);
+        let second = predicates.current(&schema, false, "second").unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            predicates
+                .cached
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .generation,
+            2
+        );
+        let case_sensitive = predicates.current(&schema, true, "case").unwrap();
+        assert!(!Arc::ptr_eq(&second, &case_sensitive));
+    }
+}

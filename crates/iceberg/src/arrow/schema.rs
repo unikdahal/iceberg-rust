@@ -24,7 +24,7 @@ use arrow_array::types::{Decimal128Type, validate_decimal_precision_and_scale};
 use arrow_array::{
     BinaryArray, BooleanArray, Date32Array, Datum as ArrowDatum, Decimal128Array,
     FixedSizeBinaryArray, Float32Array, Float64Array, Int32Array, Int64Array, Scalar, StringArray,
-    TimestampMicrosecondArray, TimestampNanosecondArray,
+    Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use arrow_schema::extension::ExtensionType;
 use arrow_schema::{
@@ -291,6 +291,11 @@ pub(crate) fn visit_schema<V: ArrowSchemaVisitor>(
 /// Iceberg schema fields require a unique field id, and this function assumes that each field
 /// in the provided Arrow schema contains a field id in its metadata. If the metadata is missing
 /// or the field id is not set, the conversion will fail
+///
+/// Decimal32, Decimal64, and Decimal256 map to Iceberg
+/// decimals with precision at most 38. Cast their arrays to
+/// Decimal128 with the same precision and scale before
+/// passing batches to an Iceberg writer.
 pub fn arrow_schema_to_schema(schema: &ArrowSchema) -> Result<Schema> {
     let mut visitor = ArrowSchemaConverter::new();
     visit_schema(schema, &mut visitor)
@@ -304,12 +309,22 @@ pub fn arrow_schema_to_schema(schema: &ArrowSchema) -> Result<Schema> {
 ///
 /// This is useful when converting Arrow schemas that don't originate from Iceberg tables,
 /// such as schemas from DataFusion or other Arrow-based systems.
+///
+/// Decimal32, Decimal64, and Decimal256 map to Iceberg
+/// decimals with precision at most 38. Cast their arrays to
+/// Decimal128 with the same precision and scale before
+/// passing batches to an Iceberg writer.
 pub fn arrow_schema_to_schema_auto_assign_ids(schema: &ArrowSchema) -> Result<Schema> {
     let mut visitor = ArrowSchemaConverter::new_with_field_ids_from(FIRST_FIELD_ID);
     visit_schema(schema, &mut visitor)
 }
 
 /// Convert Arrow type to iceberg type.
+///
+/// Decimal32, Decimal64, and Decimal256 map to Iceberg
+/// decimals with precision at most 38. Cast their arrays to
+/// Decimal128 with the same precision and scale before
+/// passing batches to an Iceberg writer.
 pub fn arrow_type_to_type(ty: &DataType) -> Result<Type> {
     let mut visitor = ArrowSchemaConverter::new();
     visit_type(ty, &mut visitor)
@@ -499,7 +514,10 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
             }
             DataType::Float32 => Ok(Type::Primitive(PrimitiveType::Float)),
             DataType::Float64 => Ok(Type::Primitive(PrimitiveType::Double)),
-            DataType::Decimal128(p, s) => Type::decimal(*p as u32, *s as u32)
+            DataType::Decimal32(p, s)
+            | DataType::Decimal64(p, s)
+            | DataType::Decimal128(p, s)
+            | DataType::Decimal256(p, s) => Type::decimal(*p as u32, *s as u32)
                 .map_err(|e| invalid_data!("Failed to create decimal type").with_source(e)),
             DataType::Date32 => Ok(Type::Primitive(PrimitiveType::Date)),
             DataType::Time64(unit) if unit == &TimeUnit::Microsecond => {
@@ -782,6 +800,9 @@ pub(crate) fn get_arrow_datum(datum: &Datum) -> Result<Arc<dyn ArrowDatum + Send
         }
         (PrimitiveType::Date, PrimitiveLiteral::Int(value)) => {
             Ok(Arc::new(Date32Array::new_scalar(*value)))
+        }
+        (PrimitiveType::Time, PrimitiveLiteral::Long(value)) => {
+            Ok(Arc::new(Time64MicrosecondArray::new_scalar(*value)))
         }
         (PrimitiveType::Timestamp, PrimitiveLiteral::Long(value)) => {
             Ok(Arc::new(TimestampMicrosecondArray::new_scalar(*value)))
@@ -2319,6 +2340,71 @@ mod tests {
                     .to_string()
                     .contains("UInt64 is not supported")
             );
+        }
+    }
+
+    #[test]
+    fn arrow_decimal32_64_256_convert_to_iceberg_decimal() -> Result<()> {
+        let cases = [
+            (DataType::Decimal32(8, 2), 8),
+            (DataType::Decimal64(15, 2), 15),
+            (DataType::Decimal128(38, 2), 38),
+            (DataType::Decimal256(38, 2), 38),
+        ];
+        for (arrow_type, precision) in cases {
+            let arrow_schema = ArrowSchema::new(vec![simple_field(
+                "decimal",
+                arrow_type.clone(),
+                false,
+                "1",
+            )]);
+            let decimal_type = Type::decimal(precision, 2)?;
+            let expected = Schema::builder()
+                .with_fields([Arc::new(NestedField::required(
+                    1,
+                    "decimal",
+                    decimal_type.clone(),
+                ))])
+                .build()?;
+            assert_eq!(arrow_schema_to_schema(&arrow_schema)?, expected,);
+            assert_eq!(arrow_type_to_type(&arrow_type)?, decimal_type,);
+            let without_ids = ArrowSchema::new(vec![Field::new("decimal", arrow_type, false)]);
+            assert_eq!(
+                arrow_schema_to_schema_auto_assign_ids(&without_ids,)?,
+                expected,
+            );
+            let expected_arrow = ArrowSchema::new(vec![simple_field(
+                "decimal",
+                DataType::Decimal128(precision as u8, 2),
+                false,
+                "1",
+            )]);
+            assert_eq!(schema_to_arrow_schema(&expected)?, expected_arrow,);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn arrow_decimal256_precision_above_38_is_rejected() {
+        for precision in [39, 76] {
+            let arrow_type = DataType::Decimal256(precision, 2);
+            let arrow_schema = ArrowSchema::new(vec![simple_field(
+                "decimal",
+                arrow_type.clone(),
+                false,
+                "1",
+            )]);
+            let without_ids =
+                ArrowSchema::new(vec![Field::new("decimal", arrow_type.clone(), false)]);
+            let errors = [
+                arrow_schema_to_schema(&arrow_schema).unwrap_err(),
+                arrow_schema_to_schema_auto_assign_ids(&without_ids).unwrap_err(),
+                arrow_type_to_type(&arrow_type).unwrap_err(),
+            ];
+            for error in errors {
+                assert_eq!(error.kind(), ErrorKind::DataInvalid,);
+                assert!(error.to_string().contains("Failed to create decimal type",));
+            }
         }
     }
 
